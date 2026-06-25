@@ -1,0 +1,95 @@
+# aruaru-DB 3ノードクラスタ
+# docker compose -f docker/compose.cluster.yml up
+# postgres://root@localhost:5432/aruaru (どのノードにも接続可)
+
+version: "3.9"
+
+services:
+  aruaru-node1:
+    image: ghcr.io/aruaru-db/aruaru-db:latest
+    container_name: aruaru-node1
+    hostname: aruaru-node1
+    command:
+      - --data=/data
+      - --raft-id=1
+      - --pg-port=5432
+      - --gql-port=4000
+      - --peers=aruaru-node2:5432,aruaru-node3:5432
+    volumes:
+      - node1-data:/data
+    ports:
+      - "5432:5432"  # PostgreSQL 互換
+      - "4000:4000"  # GraphQL
+    networks:
+      - aruaru-cluster
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "localhost", "-p", "5432"]
+      interval: 10s
+      retries: 5
+
+  aruaru-node2:
+    image: ghcr.io/aruaru-db/aruaru-db:latest
+    container_name: aruaru-node2
+    hostname: aruaru-node2
+    command:
+      - --data=/data
+      - --raft-id=2
+      - --pg-port=5432
+      - --gql-port=4000
+      - --peers=aruaru-node1:5432,aruaru-node3:5432
+    volumes:
+      - node2-data:/data
+    ports:
+      - "5433:5432"  # ノード2は外部 5433 でアクセス可
+      - "4001:4000"
+    networks:
+      - aruaru-cluster
+    depends_on:
+      aruaru-node1:
+        condition: service_healthy
+
+  aruaru-node3:
+    image: ghcr.io/aruaru-db/aruaru-db:latest
+    container_name: aruaru-node3
+    hostname: aruaru-node3
+    command:
+      - --data=/data
+      - --raft-id=3
+      - --pg-port=5432
+      - --gql-port=4000
+      - --peers=aruaru-node1:5432,aruaru-node2:5432
+    volumes:
+      - node3-data:/data
+    ports:
+      - "5434:5432"
+      - "4002:4000"
+    networks:
+      - aruaru-cluster
+    depends_on:
+      aruaru-node1:
+        condition: service_healthy
+
+  # ── Tauri Admin GUI (Web版) ────────────────────────────────
+  aruaru-admin:
+    image: ghcr.io/aruaru-db/aruaru-admin-web:latest
+    container_name: aruaru-admin
+    ports:
+      - "8080:80"
+    environment:
+      - ARUARU_SERVER=http://aruaru-node1:4000
+    networks:
+      - aruaru-cluster
+    depends_on:
+      - aruaru-node1
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  aruaru-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
