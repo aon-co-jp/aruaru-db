@@ -1,0 +1,229 @@
+name: Cross-Platform Build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Windows / Windows Server (x86_64 + ARM64) ──────────────
+  windows:
+    name: Windows (${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+          - arch: aarch64
+            target: aarch64-pc-windows-msvc
+            ext: ".exe"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p aruaru-server
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aruaru-server-windows-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/aruaru-server${{ matrix.ext }}
+
+  # ── Linux (x86_64 / ARM64 / musl / RHEL 互換) ─────────────
+  linux:
+    name: Linux (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            label: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            label: linux-arm64
+            cross: true
+          - target: x86_64-unknown-linux-musl
+            label: linux-x86_64-musl
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            label: linux-arm64-musl
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: cargo build --release --target ${{ matrix.target }} -p aruaru-server
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }} -p aruaru-server
+
+      - name: Package .deb (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cargo install cargo-deb
+          cargo deb -p aruaru-server --target ${{ matrix.target }}
+
+      - name: Package .rpm (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cargo install cargo-generate-rpm
+          cargo generate-rpm -p crates/aruaru-server --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aruaru-server-${{ matrix.label }}
+          path: target/${{ matrix.target }}/release/aruaru-server
+
+  # ── macOS (Apple Silicon + Intel) ─────────────────────────
+  macos:
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - arch: x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target ${{ matrix.target }} -p aruaru-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aruaru-server-macos-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/aruaru-server
+
+  # ── Android (ARM64 + x86_64) ───────────────────────────────
+  android:
+    name: Android (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - abi: arm64-v8a
+            target: aarch64-linux-android
+            api: 34
+          - abi: x86_64
+            target: x86_64-linux-android
+            api: 34
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Setup Android NDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: ${{ matrix.api }}
+          ndk-version: "27.0.12077973"
+
+      - name: Configure cargo for Android
+        run: |
+          NDK=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+          echo "[target.${{ matrix.target }}]" >> ~/.cargo/config.toml
+          echo "linker = \"$NDK/${{ matrix.target }}${{ matrix.api }}-clang\"" >> ~/.cargo/config.toml
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p aruaru-server
+        env:
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ env.ANDROID_NDK_HOME }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aruaru-server-android-${{ matrix.abi }}
+          path: target/${{ matrix.target }}/release/aruaru-server
+
+  # ── Solaris x86_64 (Tier 3 / ベストエフォート) ──────────────
+  solaris:
+    name: Solaris x86_64 (best-effort)
+    runs-on: ubuntu-latest
+    continue-on-error: true   # Tier 3: 失敗してもブロックしない
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "x86_64-pc-solaris" }
+
+      - name: Build (Solaris cross)
+        run: |
+          # Solaris SDK が必要なため、公式リリースは手動ビルドを推奨
+          # cargo build --release --target x86_64-pc-solaris -p aruaru-server
+          echo "Solaris cross-compile: requires Solaris SDK - see PLATFORMS.md §Tier3"
+
+  # ── Docker マルチアーキ ────────────────────────────────────
+  docker:
+    name: Docker multi-arch
+    runs-on: ubuntu-latest
+    needs: [linux]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: aruaru-server-linux-*
+          path: dist/
+
+      - name: Build & Push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          tags: |
+            ghcr.io/aruaru-db/aruaru-db:latest
+            ghcr.io/aruaru-db/aruaru-db:${{ github.ref_name }}
+
+  # ── GitHub Release ────────────────────────────────────────
+  release:
+    name: GitHub Release
+    needs: [windows, linux, macos, android]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts/ }
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/**/*

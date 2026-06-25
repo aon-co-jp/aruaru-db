@@ -1,0 +1,55 @@
+name: aruaru-admin build
+
+on:
+  push:
+    tags: ["admin-v*"]
+  workflow_dispatch:
+
+jobs:
+  # ── Windows インストーラ (.msi + setup.exe) ──
+  win-installer:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: aruaru-admin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install deps
+        run: pnpm install --no-frozen-lockfile
+      - name: Generate icons (if logo present)
+        run: pnpm --filter aruaru-db-admin-win exec tauri icon ../../branding/logo.png || echo "no logo, using existing icons"
+        continue-on-error: true
+      - name: Build Tauri (msi + nsis)
+        run: pnpm --filter aruaru-db-admin-win tauri:build
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: aruaru-db-admin-win-installers
+          path: |
+            aruaru-admin/aruaru-db-admin-win/src-tauri/target/release/bundle/msi/*.msi
+            aruaru-admin/aruaru-db-admin-win/src-tauri/target/release/bundle/nsis/*.exe
+
+  # ── Web 版 SPA バンドル ──
+  web-bundle:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aruaru-admin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm --filter aruaru-db-admin-web build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aruaru-db-admin-web-dist
+          path: aruaru-admin/aruaru-db-admin-web/dist
