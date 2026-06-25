@@ -1,0 +1,36 @@
+# aruaru-DB を Cosmo Router の背後に置く最小構成
+#
+# 1) スキーマ合成 (ローカル):
+#      wgc router compose -i cosmo/graph.yaml -o cosmo/router-config.json
+# 2) 起動:
+#      docker compose -f cosmo/compose.cosmo.yaml up
+# 3) 統合 GraphQL は http://localhost:3002/graphql
+services:
+  aruaru-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["aruaru-server", "--gql-port", "4000", "--pg-port", "5432", "--data", "/data"]
+    volumes:
+      - aruaru-data:/data
+    ports:
+      - "4000:4000"   # サブグラフ /graphql
+      - "5432:5432"   # pgwire
+
+  cosmo-router:
+    image: ghcr.io/wundergraph/cosmo/router:latest
+    platform: linux/amd64
+    depends_on:
+      - aruaru-server
+    environment:
+      LISTEN_ADDR: "0.0.0.0:3002"
+      # Control Plane 非依存のローカル運用: 合成済み config をマウント
+      EXECUTION_CONFIG_FILE_PATH: "/etc/cosmo/router-config.json"
+    volumes:
+      - ./router-config.json:/etc/cosmo/router-config.json:ro
+      - ./config.yaml:/etc/cosmo/config.yaml:ro
+    ports:
+      - "3002:3002"   # 統合スーパーグラフ
+
+volumes:
+  aruaru-data:

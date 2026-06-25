@@ -1,0 +1,22 @@
+[package]
+name        = "aruaru-migrate"
+description = "aruaru-DB migration tools: Postgres / CockroachDB / Snowflake / CSV"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aruaru-wire  = { path = "../aruaru-wire" }
+arrow.workspace    = true
+parquet.workspace  = true
+tokio.workspace    = true
+serde.workspace    = true
+serde_json.workspace = true
+anyhow.workspace   = true
+tracing.workspace  = true
+clap.workspace     = true
+reqwest = { version = "0.12", features = ["json"] }
+
+[[bin]]
+name = "aruaru-migrate"
+path = "src/main.rs"

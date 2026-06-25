@@ -1,0 +1,19 @@
+[package]
+name        = "aruaru-graphql"
+description = "aruaru-DB Versionless GraphQL API layer (Poem + async-graphql)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aruaru-core   = { path = "../aruaru-core" }
+aruaru-query  = { path = "../aruaru-query" }
+
+poem.workspace             = true
+async-graphql.workspace    = true
+async-graphql-poem.workspace = true
+serde.workspace            = true
+serde_json.workspace       = true
+anyhow.workspace           = true
+tracing.workspace          = true
+hex.workspace              = true

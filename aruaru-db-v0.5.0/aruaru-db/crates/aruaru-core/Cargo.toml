@@ -1,0 +1,19 @@
+[package]
+name        = "aruaru-core"
+description = "aruaru-DB core: Git-on-SQL version control (Prolly Tree) + catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde       = { workspace = true }
+serde_json.workspace = true
+bytes.workspace     = true
+sha2.workspace      = true
+hex.workspace       = true
+chrono.workspace    = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace   = true
+fjall.workspace     = true

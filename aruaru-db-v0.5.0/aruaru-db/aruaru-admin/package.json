@@ -1,0 +1,13 @@
+{
+  "name": "aruaru-admin",
+  "version": "0.5.0",
+  "private": true,
+  "description": "aruaru-DB 監視・管理アプリ (共通core + Windows版 + Web版)",
+  "scripts": {
+    "web:dev": "pnpm --filter aruaru-db-admin-web dev",
+    "web:build": "pnpm --filter aruaru-db-admin-web build",
+    "win:dev": "pnpm --filter aruaru-db-admin-win tauri:dev",
+    "win:build": "pnpm --filter aruaru-db-admin-win tauri:build"
+  },
+  "packageManager": "pnpm@9.0.0"
+}

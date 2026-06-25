@@ -1,0 +1,21 @@
+[package]
+name        = "aruaru-backup"
+description = "aruaru-DB backup, restore, point-in-time recovery, and S3/SFTP export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aruaru-core  = { path = "../aruaru-core" }
+parquet.workspace  = true
+arrow.workspace    = true
+tokio.workspace    = true
+serde.workspace    = true
+serde_json.workspace = true
+anyhow.workspace   = true
+thiserror.workspace = true
+tracing.workspace  = true
+uuid.workspace     = true
+chrono.workspace   = true
+sha2.workspace     = true
+hex.workspace      = true

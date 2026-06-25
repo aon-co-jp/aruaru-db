@@ -1,0 +1,16 @@
+[package]
+name        = "aruaru-wire"
+description = "aruaru-DB PostgreSQL wire protocol server (pgwire)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aruaru-core  = { path = "../aruaru-core" }
+aruaru-query = { path = "../aruaru-query" }
+pgwire.workspace      = true
+tokio.workspace       = true
+futures.workspace     = true
+async-trait           = "0.1"
+tracing.workspace     = true
+anyhow.workspace      = true

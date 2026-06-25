@@ -1,0 +1,28 @@
+[package]
+name        = "aruaru-server"
+description = "aruaru-DB server binary (pgwire + GraphQL + admin REST)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aruaru-server"
+path = "src/main.rs"
+
+[dependencies]
+aruaru-core    = { path = "../aruaru-core" }
+aruaru-dist    = { path = "../aruaru-dist" }
+aruaru-query   = { path = "../aruaru-query" }
+aruaru-wire    = { path = "../aruaru-wire" }
+aruaru-graphql = { path = "../aruaru-graphql" }
+aruaru-registry = { path = "../aruaru-registry" }
+poem.workspace        = true
+tokio.workspace       = true
+anyhow.workspace      = true
+tracing.workspace     = true
+tracing-subscriber.workspace = true
+clap.workspace        = true
+serde.workspace       = true
+serde_json.workspace  = true
+parking_lot.workspace = true
+chrono.workspace      = true

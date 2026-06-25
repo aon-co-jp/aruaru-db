@@ -1,0 +1,21 @@
+{
+  "name": "@aruaru/admin-core",
+  "version": "0.5.0",
+  "private": true,
+  "description": "aruaru-DB 管理UIの共通コア (win/web 共有)。Tauri 非依存。",
+  "type": "module",
+  "main": "src/index.ts",
+  "module": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./styles.css": "./src/styles.css"
+  },
+  "peerDependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

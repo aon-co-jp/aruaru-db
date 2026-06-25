@@ -1,0 +1,28 @@
+{
+  "name": "aruaru-db-admin-win",
+  "version": "0.5.0",
+  "private": true,
+  "description": "aruaru-DB 監視・管理アプリ (Windows インストール型 PWA)。Tauri を廃止し、Web コアを共有する installable PWA。",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --port 5173",
+    "installer": "node ./installer/build-installers.mjs"
+  },
+  "dependencies": {
+    "@aruaru/admin-core": "workspace:*",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.0",
+    "vite-plugin-pwa": "^0.20.0",
+    "workbox-window": "^7.1.0",
+    "autoprefixer": "^10.4.0",
+    "postcss": "^8.4.0",
+    "tailwindcss": "^3.4.0",
+    "typescript": "^5.4.0",
+    "vite": "^5.2.0"
+  }
+}

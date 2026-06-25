@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  aruaru-DB Admin — WiX v4 MSI インストーラ定義
+  ビルド:
+    wix build setup.wxs -out aruaru-db-admin-0.5.0.msi
+  前提: web-dist/ に aruaru-db-admin-web の dist/ をコピーしてから実行
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="aruaru-DB Admin"
+    Version="0.5.0.0"
+    Manufacturer="aruaru Project"
+    UpgradeCode="A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
+    Language="1041"
+    Codepage="932"
+    InstallerVersion="500">
+
+    <MajorUpgrade DowngradeErrorMessage="新しいバージョンが既にインストールされています。" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Feature Id="ProductFeature" Title="aruaru-DB Admin" Level="1">
+      <ComponentGroupRef Id="WebAssets" />
+      <ComponentGroupRef Id="Launcher" />
+      <ComponentGroupRef Id="Shortcuts" />
+    </Feature>
+  </Package>
+
+  <!-- Web アセット -->
+  <Fragment>
+    <ComponentGroup Id="WebAssets" Directory="INSTALLDIR">
+      <!-- harvest で自動生成する想定: wix harvest web-dist -cg WebAssets -dr INSTALLDIR -->
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- ランチャー -->
+  <Fragment>
+    <ComponentGroup Id="Launcher" Directory="INSTALLDIR">
+      <Component>
+        <File Source="aruaru-admin.vbs" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- ショートカット -->
+  <Fragment>
+    <ComponentGroup Id="Shortcuts">
+      <Component Directory="DesktopFolder">
+        <Shortcut
+          Id="DesktopShortcut"
+          Name="aruaru-DB Admin"
+          Target="[INSTALLDIR]aruaru-admin.vbs"
+          WorkingDirectory="INSTALLDIR" />
+        <RegistryValue Root="HKCU"
+          Key="Software\aruaru\Admin"
+          Name="installed" Type="integer" Value="1"
+          KeyPath="yes" />
+      </Component>
+      <Component Directory="ProgramMenuFolder">
+        <Shortcut
+          Id="StartMenuShortcut"
+          Name="aruaru-DB Admin"
+          Target="[INSTALLDIR]aruaru-admin.vbs"
+          WorkingDirectory="INSTALLDIR" />
+        <RemoveFolder Id="CleanupStartMenu" Directory="ProgramMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKCU"
+          Key="Software\aruaru\Admin"
+          Name="startmenu" Type="integer" Value="1"
+          KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- ディレクトリ構造 -->
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLDIR" Name="aruaru-DB Admin" />
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
+    <StandardDirectory Id="ProgramMenuFolder" />
+  </Fragment>
+</Wix>
