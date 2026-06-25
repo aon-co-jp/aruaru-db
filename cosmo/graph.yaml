@@ -1,0 +1,14 @@
+# wgc 用のローカル・コンポジション定義
+# aruaru-DB サブグラフを束ねて Cosmo Router 実行用の config を生成する。
+#
+#   wgc router compose -i cosmo/graph.yaml -o cosmo/router-config.json
+#
+version: 1
+subgraphs:
+  - name: aruaru-db
+    # 開発時はローカルの aruaru-server を指す
+    routing_url: http://localhost:4000/graphql
+    # スキーマはサーバの SDL エンドポイントから取得 (or schema.graphql ファイル)
+    introspection:
+      url: http://localhost:4000/graphql/sdl
+    # 代替: schema: ./cosmo/aruaru-db.graphql

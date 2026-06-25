@@ -122,7 +122,7 @@ docker compose -f docker/compose.cluster.yml up
 | C / C++ | `libpq` | `libaruaru.h` C header |
 | Kotlin | PostgreSQL JDBC | `aruaru-kotlin` |
 | Swift | `PostgresNIO` | `aruaru-swift` Swift Package |
-| Rust | `sqlx` / `tokio-postgres` | `aruaru-client` (ネイティブ) |
+| Rust | `sqlx` / `tokio-postgres` | `aruaru-rs` (ネイティブ) |
 | R | `RPostgres` | 設定のみ |
 | ODBC | psqlODBC | Windows/Linux ODBC |
 | JDBC | PostgreSQL JDBC 42+ | Java/Scala/Kotlin |

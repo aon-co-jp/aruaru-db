@@ -1,0 +1,4 @@
+packages:
+  - "core"
+  - "aruaru-db-admin-web"
+  - "aruaru-db-admin-win"

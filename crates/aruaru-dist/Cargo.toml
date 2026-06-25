@@ -1,0 +1,21 @@
+[package]
+name        = "aruaru-dist"
+description = "aruaru-DB distributed layer: openraft consensus + range sharding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aruaru-core  = { path = "../aruaru-core" }
+openraft      = { workspace = true }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+async-trait   = "0.1"
+reqwest.workspace = true
+futures.workspace = true
