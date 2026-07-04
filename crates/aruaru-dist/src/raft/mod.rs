@@ -26,6 +26,7 @@ pub mod log;
 pub mod node;
 pub mod rpc;
 pub mod transport;
+pub mod writer;
 
 pub use command::{Command, CommandResponse};
 pub use driver::RaftDriver;
@@ -33,6 +34,7 @@ pub use log::ReplicatedLog;
 pub use node::{AppendResult, Applier, RaftNode, VoteResult};
 pub use rpc::{AppendEntriesReq, AppendEntriesResp, RequestVoteReq, RequestVoteResp};
 pub use transport::{HttpTransport, Transport};
+pub use writer::{RaftWriter, ReplicatedWriter, DEFAULT_COMMIT_TIMEOUT};
 
 use serde::{Deserialize, Serialize};
 

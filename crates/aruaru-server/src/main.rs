@@ -42,6 +42,22 @@ struct Cli {
     /// ログレベル (trace/debug/info/warn/error)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// 【第1層】TLS証明書 (PEM)。未指定時は平文TCP (開発用)
+    #[arg(long)]
+    tls_cert: Option<String>,
+
+    /// 【第1層】TLS秘密鍵 (PEM, PKCS8)
+    #[arg(long)]
+    tls_key: Option<String>,
+
+    /// 【第2層】mTLS: クライアント証明書検証用CA証明書 (指定時はクライアント証明書必須)
+    #[arg(long)]
+    require_client_cert: Option<String>,
+
+    /// 【UDP経路】QUICリスナーのポート (未指定時はQUIC無効)
+    #[arg(long)]
+    quic_port: Option<u16>,
 }
 
 #[tokio::main]
@@ -99,14 +115,26 @@ async fn main() -> anyhow::Result<()> {
         .map(cluster::parse_peers)
         .unwrap_or_default();
     let admin_state = admin::AdminState::new(engine.clone(), registry.clone());
+    // 【課金アイテムの権利消失防止】書き込みをRaft経由で複製するレプリケータ。
+    // クラスタ構築に成功した場合のみ設定される (推奨構成: 自ノード+peers 2台=計3ノード)。
+    let mut replicator: Option<std::sync::Arc<dyn aruaru_dist::ReplicatedWriter>> = None;
     match cluster::build_cluster(cli.raft_id, &peers, engine.clone()) {
         Ok((node, driver)) => {
             admin_state.attach_cluster(node.clone());
             if peers.is_empty() {
-                tracing::info!(node_id = cli.raft_id, "Raft: single-node mode (leader)");
+                tracing::info!(
+                    node_id = cli.raft_id,
+                    "Raft: single-node mode (leader). 本番運用では --peers で他2ノードを指定し、\
+                     レプリケーション因子3(自ノード+2)にすることを推奨"
+                );
             } else {
-                tracing::info!(node_id = cli.raft_id, peers = peers.len(), "Raft: multi-node cluster; consensus driver started");
+                tracing::info!(
+                    node_id = cli.raft_id,
+                    cluster_size = peers.len() + 1,
+                    "Raft: multi-node cluster; consensus driver started (過半数コミットで書き込み確定)"
+                );
             }
+            replicator = Some(std::sync::Arc::new(aruaru_dist::RaftWriter::new(node)));
             // 合意ランタイムを常駐
             let _raft_handle = tokio::spawn(async move {
                 driver.run().await;
@@ -148,9 +176,19 @@ async fn main() -> anyhow::Result<()> {
 
     // ── pgwire サーバ ───────────────────────────────────
     let pg_addr = format!("0.0.0.0:{}", cli.pg_port);
+    let tls_config = match (&cli.tls_cert, &cli.tls_key) {
+        (Some(cert_path), Some(key_path)) => Some(aruaru_wire::tls::TlsConfig {
+            cert_path: cert_path.clone(),
+            key_path: key_path.clone(),
+            client_ca_path: cli.require_client_cert.clone(),
+        }),
+        _ => None,
+    };
     let wire_config = aruaru_wire::WireServerConfig {
         bind_addr: pg_addr,
         database_name: "aruaru".to_string(),
+        tls: tls_config,
+        replicator,
     };
     let wire_engine = engine.clone();
     let wire_handle = tokio::spawn(async move {

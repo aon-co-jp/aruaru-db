@@ -77,6 +77,7 @@ pub struct ClusterNodeInput {
 
 // ── Admin Query ───────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct AdminQuery;
 
 #[Object]
@@ -96,7 +97,7 @@ impl AdminQuery {
                 status: e.status.label().to_string(),
                 rank: e.rank.map(|r| r as i32),
                 score: e.score,
-                updated_at: e.updated_at.to_rfc3339(),
+                updated_at: e.updated_at.unwrap_or_default(),
             })
             .collect())
     }
@@ -106,7 +107,7 @@ impl AdminQuery {
         let s = a.registry.summary();
         Ok(RegistrySummaryGql {
             total: s.total as i32,
-            connectable: s.connectable as i32,
+            connectable: s.postgres_wire as i32,
             ga: s.ga as i32,
             beta: s.beta as i32,
             pg_compatible: s.pg_compatible as i32,
@@ -210,6 +211,7 @@ impl AdminQuery {
 
 // ── Admin Mutation ────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct AdminMutation;
 
 #[Object]
@@ -218,12 +220,18 @@ impl AdminMutation {
 
     async fn crawl_registry(&self, ctx: &Context<'_>) -> Result<CrawlResultGql> {
         let a = admin(ctx)?;
-        let report = a.registry.crawl_now().await;
-        Ok(CrawlResultGql {
-            ok: true,
-            updated: report.updated as i32,
-            message: format!("クロール完了: {} 件更新", report.updated),
-        })
+        match a.registry.crawl_now().await {
+            Ok(report) => Ok(CrawlResultGql {
+                ok: true,
+                updated: report.matched as i32,
+                message: format!("クロール完了: {} 件更新", report.matched),
+            }),
+            Err(e) => Ok(CrawlResultGql {
+                ok: false,
+                updated: 0,
+                message: e.to_string(),
+            }),
+        }
     }
 
     async fn test_registry_connection(

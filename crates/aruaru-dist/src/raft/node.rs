@@ -45,6 +45,10 @@ pub struct RaftNode<A: Applier> {
     peers: Vec<u64>,
     /// Leader 用: peer → 複製済み最大インデックス
     match_index: RwLock<HashMap<u64, u64>>,
+    /// commit+適用が完了したログインデックス → 適用結果。
+    /// 【課金アイテムの権利消失防止】書き込みクライアントが
+    /// 過半数コミット+適用の完了を待ち合わせるために使う (`wait_for_commit`)。
+    pending_results: RwLock<HashMap<u64, CommandResponse>>,
 }
 
 impl<A: Applier> RaftNode<A> {
@@ -55,6 +59,7 @@ impl<A: Applier> RaftNode<A> {
             applier,
             peers,
             match_index: RwLock::new(HashMap::new()),
+            pending_results: RwLock::new(HashMap::new()),
         }
     }
 
@@ -298,6 +303,7 @@ impl<A: Applier> RaftNode<A> {
             if !resp.ok {
                 tracing::warn!(index = idx, msg = %resp.message, "apply failed");
             }
+            self.pending_results.write().insert(*idx, resp);
             last = *idx;
             applied += 1;
         }
@@ -308,6 +314,29 @@ impl<A: Applier> RaftNode<A> {
             s.commit_index = self.log.read().commit_index();
         }
         applied
+    }
+
+    /// 【課金アイテムの権利消失防止】指定インデックスが過半数コミット+適用
+    /// されるまで待つ。Leader は `RaftDriver::run` のハートビートループで
+    /// 定期的に `maybe_commit`/`apply_committed` を進めるため、ここでは
+    /// 短い間隔でポーリングする(単一ノードでは呼び出し側が即時 apply 済み)。
+    pub async fn wait_for_commit(
+        &self,
+        index: u64,
+        timeout: std::time::Duration,
+    ) -> Result<CommandResponse, String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(resp) = self.pending_results.write().remove(&index) {
+                return Ok(resp);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "timeout waiting for raft commit of index {index} (quorum not reached)"
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     /// 現在の Raft 状態スナップショット

@@ -17,7 +17,7 @@ use aruaru_core::version::VersionController;
 use crate::parser::{self, ColumnDef, Statement};
 
 /// 値の型 (pgwire への変換用)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Text(String),
     Int(i64),
@@ -35,7 +35,7 @@ impl Value {
 }
 
 /// クエリの応答
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum QueryResponse {
     /// 行を返すクエリ (SELECT)
     Rows {
@@ -75,6 +75,9 @@ struct TxnState {
     /// COMMIT 時に永続ストアへ適用する操作ログ
     log: Vec<PersistOp>,
 }
+
+/// 冪等性ログを保持する内部テーブル名 (通常のSQL経路からは不可視の予約名)
+const IDEMPOTENCY_TABLE: &str = "__idempotency_log";
 
 /// クエリエンジン
 pub struct QueryEngine {
@@ -368,6 +371,88 @@ impl QueryEngine {
             Statement::AruaruFn { name, arg } => self.aruaru_fn(&name, arg),
             Statement::AruaruLog { limit } => self.aruaru_log(limit),
         }
+    }
+
+    /// 【課金アイテムの権利消失防止】冪等性キー付きで書き込みSQLを実行する。
+    /// 同じ `idempotency_key` で再度呼ばれた場合は再実行せず前回の結果を
+    /// そのまま返す (ネットワーク切断後のクライアント自動リトライによる
+    /// 二重課金・二重付与を防ぐ)。成功時は Git-on-SQL コミットとして記録され、
+    /// 「いつ・何が実行されたか」を後から追跡・検証できる監査証跡になる。
+    ///
+    /// 冪等性ログは通常のテーブルと同じ write-through 永続化パス
+    /// (`persist_row`) に載るため、`PersistentStore` 設定時はプロセス再起動を
+    /// 跨いで保持される。
+    pub fn execute_idempotent(
+        &self,
+        idempotency_key: &str,
+        sql: &str,
+        commit_message: &str,
+    ) -> Result<QueryResponse, String> {
+        self.ensure_idempotency_table();
+        let pk = idempotency_key.as_bytes().to_vec();
+
+        if let Some(row) = self
+            .tables
+            .read()
+            .get(IDEMPOTENCY_TABLE)
+            .and_then(|t| t.rows.get(&pk).cloned())
+        {
+            if let Some(json) = row.get(1) {
+                if let Ok(resp) = serde_json::from_str::<QueryResponse>(json) {
+                    tracing::info!(
+                        key = idempotency_key,
+                        "idempotent replay: returning cached result (not re-executed)"
+                    );
+                    return Ok(resp);
+                }
+            }
+        }
+
+        let resp = self.execute(sql)?;
+
+        let json = serde_json::to_string(&resp).map_err(|e| e.to_string())?;
+        let row = vec![idempotency_key.to_string(), json];
+        {
+            let mut tables = self.tables.write();
+            let t = tables
+                .get_mut(IDEMPOTENCY_TABLE)
+                .expect("idempotency table ensured by ensure_idempotency_table");
+            t.rows.insert(pk.clone(), row.clone());
+        }
+        self.persist_row(IDEMPOTENCY_TABLE, &pk, &row);
+
+        // Git-on-SQL 監査証跡: 1トランザクション = 1コミット
+        let safe_msg = commit_message.replace('\'', "''");
+        let safe_key = idempotency_key.replace('\'', "''");
+        self.execute(&format!(
+            "SELECT aruaru_commit('{safe_msg} [idempotency_key={safe_key}]')"
+        ))?;
+
+        Ok(resp)
+    }
+
+    fn ensure_idempotency_table(&self) {
+        let exists = self.tables.read().contains_key(IDEMPOTENCY_TABLE);
+        if exists {
+            return;
+        }
+        {
+            let mut tables = self.tables.write();
+            tables
+                .entry(IDEMPOTENCY_TABLE.to_string())
+                .or_insert_with(|| TableData {
+                    columns: vec!["key".to_string(), "result_json".to_string()],
+                    types: vec![ColumnType::Text, ColumnType::Text],
+                    rows: BTreeMap::new(),
+                });
+        }
+        self.persist_schema(
+            IDEMPOTENCY_TABLE,
+            &[
+                ("key".to_string(), ColumnType::Text),
+                ("result_json".to_string(), ColumnType::Text),
+            ],
+        );
     }
 
     // ── write-through 永続化ヘルパ (txn中は遅延、ストア未設定なら no-op) ──
@@ -700,11 +785,12 @@ impl QueryEngine {
         let rows = commits
             .into_iter()
             .map(|c| {
+                let timestamp = c.timestamp_rfc3339();
                 vec![
                     Value::Text(c.id.short().to_string()),
                     Value::Text(c.author),
                     Value::Text(c.message),
-                    Value::Text(c.timestamp_rfc3339()),
+                    Value::Text(timestamp),
                 ]
             })
             .collect();
@@ -972,6 +1058,9 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_diff_branches() {
         let eng = QueryEngine::new();
         eng.execute("CREATE TABLE t (id INT, val TEXT)").unwrap();
         eng.execute("INSERT INTO t (id, val) VALUES (1, 'a')").unwrap();
