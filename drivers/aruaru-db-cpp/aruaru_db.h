@@ -1,6 +1,6 @@
 /**
- * aruaru-DB C/C++ Client
- * libaruaru: libpq ラッパー (PostgreSQL クライアントライブラリ)
+ * aruaru-db-cpp: C/C++ Client for aruaru-DB
+ * aruaru-db-cpp (libaruaru): libpq ラッパー (PostgreSQL クライアントライブラリ)
  * 
  * コンパイル: cc -o app app.c -laruaru -lpq
  *            c++ -o app app.cpp -laruaru -lpq -std=c++17

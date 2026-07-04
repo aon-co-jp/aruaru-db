@@ -1,5 +1,5 @@
 // aruaru-DB .NET Client
-// NuGet: Aruaru.Client 0.2.0
+// NuGet: AruaruDB.Dotnet 0.5.0 (aruaru-db-dotnet)
 // 内部依存: Npgsql 9+
 // dotnet add package Npgsql
 
