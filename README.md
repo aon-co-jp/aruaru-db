@@ -81,7 +81,9 @@ npm run tauri dev
 | `aruaru-query` | SQL パーサ・HTAP ルーター・DataFusion 統合 |
 | `aruaru-wire` | PostgreSQL ワイヤプロトコル (pgwire) |
 | `aruaru-graphql` | Versionless GraphQL + Poem HTTP サーバ |
-| `aruaru-migrate` | Postgres / CockroachDB / Snowflake / CSV 移行ツール |
+| `aruaru-registry` | 対応DBレジストリ (150+件) + 毎日クロール + 取り込みアダプタ |
+| `aruaru-migrate` | Postgres / CockroachDB / Snowflake / MySQL / CSV 移行ツール |
+| `aruaru-backup` | バックアップ・リストア・ポイントインタイムリカバリ (Parquet) |
 | `aruaru-server` | メインバイナリ (全クレートの統合エントリポイント) |
 
 ---

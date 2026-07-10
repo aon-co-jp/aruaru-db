@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use async_graphql::{Context, InputObject, Object, Result};
-use chrono::Utc;
 
+use aruaru_backup::BackupEngine;
 use aruaru_query::QueryEngine;
 use aruaru_registry::Registry;
 
@@ -17,6 +17,7 @@ use crate::admin_types::*;
 pub struct AdminCtx {
     pub engine: Arc<QueryEngine>,
     pub registry: Arc<Registry>,
+    pub backup: Arc<BackupEngine>,
 }
 
 fn admin<'a>(ctx: &Context<'a>) -> Result<&'a AdminCtx> {
@@ -77,6 +78,7 @@ pub struct ClusterNodeInput {
 
 // ── Admin Query ───────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct AdminQuery;
 
 #[Object]
@@ -96,7 +98,7 @@ impl AdminQuery {
                 status: e.status.label().to_string(),
                 rank: e.rank.map(|r| r as i32),
                 score: e.score,
-                updated_at: e.updated_at.to_rfc3339(),
+                updated_at: e.updated_at.unwrap_or_default(),
             })
             .collect())
     }
@@ -106,7 +108,7 @@ impl AdminQuery {
         let s = a.registry.summary();
         Ok(RegistrySummaryGql {
             total: s.total as i32,
-            connectable: s.connectable as i32,
+            connectable: s.postgres_wire as i32,
             ga: s.ga as i32,
             beta: s.beta as i32,
             pg_compatible: s.pg_compatible as i32,
@@ -116,9 +118,14 @@ impl AdminQuery {
 
     // ── バックアップ ────────────────────────────────────────
 
-    async fn backups(&self, _ctx: &Context<'_>) -> Result<Vec<BackupGql>> {
-        // TODO: バックアップストレージから一覧を読む
-        Ok(vec![])
+    async fn backups(&self, ctx: &Context<'_>) -> Result<Vec<BackupGql>> {
+        let a = admin(ctx)?;
+        let manifests = a
+            .backup
+            .list_backups()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(manifests.into_iter().map(manifest_to_gql).collect())
     }
 
     async fn backup_schedule(&self, _ctx: &Context<'_>) -> Result<Option<ScheduleGql>> {
@@ -210,6 +217,7 @@ impl AdminQuery {
 
 // ── Admin Mutation ────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct AdminMutation;
 
 #[Object]
@@ -218,12 +226,18 @@ impl AdminMutation {
 
     async fn crawl_registry(&self, ctx: &Context<'_>) -> Result<CrawlResultGql> {
         let a = admin(ctx)?;
-        let report = a.registry.crawl_now().await;
-        Ok(CrawlResultGql {
-            ok: true,
-            updated: report.updated as i32,
-            message: format!("クロール完了: {} 件更新", report.updated),
-        })
+        match a.registry.crawl_now().await {
+            Ok(report) => Ok(CrawlResultGql {
+                ok: true,
+                updated: report.matched as i32,
+                message: format!("クロール完了: {} 件更新", report.matched),
+            }),
+            Err(e) => Ok(CrawlResultGql {
+                ok: false,
+                updated: 0,
+                message: e.to_string(),
+            }),
+        }
     }
 
     async fn test_registry_connection(
@@ -255,33 +269,52 @@ impl AdminMutation {
 
     async fn create_backup(
         &self,
-        _ctx: &Context<'_>,
+        ctx: &Context<'_>,
         config: Option<BackupConfigInput>,
     ) -> Result<BackupGql> {
-        let now = Utc::now();
+        let a = admin(ctx)?;
         let kind = config.as_ref().and_then(|c| c.kind.clone()).unwrap_or_else(|| "full".into());
-        Ok(BackupGql {
-            id: format!("bak_{}", now.timestamp()),
-            created_at: now.to_rfc3339(),
-            branch: config.and_then(|c| c.branch).unwrap_or_else(|| "main".into()),
-            commit_id: String::new(),
-            kind,
-            size_mb: 0.0,
-            path: String::new(),
-            status: "queued".into(),
-        })
+
+        let manifest = if kind.eq_ignore_ascii_case("snapshot") {
+            let commit_id = a
+                .engine
+                .version()
+                .head()
+                .map(|c| c.id.as_str().to_string())
+                .unwrap_or_default();
+            a.backup.snapshot(&commit_id).await
+        } else {
+            a.backup.run_full(|_| {}).await
+        }
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        Ok(manifest_to_gql(manifest))
     }
 
     async fn restore_backup(
         &self,
-        _ctx: &Context<'_>,
+        ctx: &Context<'_>,
         input: RestoreInput,
     ) -> Result<MutationResult> {
-        Ok(MutationResult {
-            success: true,
-            commit_id: None,
-            message: format!("バックアップ {} のリストアをキューに追加しました。", input.backup_id),
-        })
+        let a = admin(ctx)?;
+        // restore() は宛先ディレクトリではなく QueryEngine へ直接 ingest するため未使用
+        let unused_target_dir = std::path::PathBuf::new();
+        match a
+            .backup
+            .restore(&input.backup_id, &unused_target_dir, |_| {})
+            .await
+        {
+            Ok(()) => Ok(MutationResult {
+                success: true,
+                commit_id: None,
+                message: format!("バックアップ {} からリストアしました。", input.backup_id),
+            }),
+            Err(e) => Ok(MutationResult {
+                success: false,
+                commit_id: None,
+                message: e.to_string(),
+            }),
+        }
     }
 
     async fn set_backup_schedule(
@@ -467,6 +500,25 @@ impl AdminMutation {
 }
 
 // ── 共通ヘルパ ────────────────────────────────────────────────
+
+/// `aruaru_backup::BackupManifest` → GraphQL 型
+fn manifest_to_gql(m: aruaru_backup::BackupManifest) -> BackupGql {
+    let kind = match &m.kind {
+        aruaru_backup::BackupKind::Full => "full".to_string(),
+        aruaru_backup::BackupKind::Incremental => "incremental".to_string(),
+        aruaru_backup::BackupKind::Snapshot { .. } => "snapshot".to_string(),
+    };
+    BackupGql {
+        id: m.id,
+        created_at: m.started_at,
+        branch: m.branch,
+        commit_id: m.commit_id,
+        kind,
+        size_mb: (m.size_bytes as f64) / 1e6,
+        path: String::new(),
+        status: "completed".to_string(),
+    }
+}
 
 fn wire_for_source(source: &str) -> Option<aruaru_registry::Wire> {
     use aruaru_registry::Wire;

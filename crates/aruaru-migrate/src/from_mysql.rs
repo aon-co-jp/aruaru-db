@@ -1,19 +1,20 @@
-//! PostgreSQL / CockroachDB 移行 (ワイヤ互換読み出し → aruaru-DB へ INSERT)
+//! MySQL / MariaDB 移行 (ワイヤ互換読み出し → aruaru-DB へ INSERT)
 //!
-//! 読み出しは aruaru-registry の `PgWireAdapter` (tokio-postgres 実接続) を
-//! 再利用する。書き込みは `crate::target::TargetClient` で移行先へ
-//! `CREATE TABLE IF NOT EXISTS` + 行単位 `INSERT` を発行する。
+//! 読み出しは aruaru-registry の `MySqlAdapter` (mysql_async 実接続) を
+//! 再利用する。DDL の型差異 (`schema_convert::mysql_to_aruaru`) は、この
+//! エンジンが全列 TEXT を前提とする v0.5 時点では列名のみを使うため
+//! 直接は適用しないが、将来型付きスキーマへ拡張する際の変換先として残す。
 use crate::target::TargetClient;
 use crate::{MigrateConfig, MigrateProgress, MigrateStatus};
-use aruaru_registry::adapter::{PgWireAdapter, SourceAdapter};
+use aruaru_registry::adapter::{MySqlAdapter, SourceAdapter};
 
 pub async fn migrate(
     config: &MigrateConfig,
     progress_cb: impl Fn(MigrateProgress) + Send + 'static,
 ) -> anyhow::Result<()> {
-    tracing::info!(uri = %config.source_uri, "Postgres migration: starting");
+    tracing::info!(uri = %config.source_uri, "MySQL migration: starting");
 
-    let adapter = PgWireAdapter;
+    let adapter = MySqlAdapter;
     let tables = adapter.list_tables(&config.source_uri).await?;
     let target = TargetClient::connect(&config.target_uri).await?;
 
@@ -48,6 +49,6 @@ pub async fn migrate(
         });
     }
 
-    tracing::info!(tables = tables.len(), "Postgres migration: done");
+    tracing::info!(tables = tables.len(), "MySQL migration: done");
     Ok(())
 }

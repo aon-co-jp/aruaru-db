@@ -8,8 +8,12 @@
 //! - CSV / NDJSON
 
 pub mod from_csv;
+pub mod from_mysql;
+pub mod from_parquet;
 pub mod from_postgres;
 pub mod schema_convert;
+pub mod sql_build;
+pub mod target;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -88,13 +92,13 @@ pub async fn run_migration(
         SourceKind::Postgres | SourceKind::Cockroach => {
             from_postgres::migrate(&config, progress_cb).await?;
         }
+        // Snowflake は Parquet エクスポート経由での移行を前提とする
+        // (`SourceKind::Parquet` と同じ読み込み経路を共有する)。
         SourceKind::Parquet | SourceKind::Snowflake => {
-            // TODO: DataFusion で Parquet を読み込み → aruaru-wire 経由で ingest
-            tracing::info!("Parquet/Snowflake migration: TODO");
+            from_parquet::migrate(&config, progress_cb).await?;
         }
         SourceKind::Mysql => {
-            // TODO: mysql_async crate で接続 → schema_convert → ingest
-            tracing::info!("MySQL migration: TODO");
+            from_mysql::migrate(&config, progress_cb).await?;
         }
     }
 

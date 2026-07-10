@@ -1,0 +1,33 @@
+[package]
+name        = "aruaru-wire"
+description = "aruaru-DB PostgreSQL wire protocol server (pgwire)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aruaru-core  = { path = "../aruaru-core" }
+aruaru-query = { path = "../aruaru-query" }
+aruaru-dist  = { path = "../aruaru-dist" }
+pgwire.workspace      = true
+tokio.workspace       = true
+futures.workspace     = true
+async-trait           = "0.1"
+tracing.workspace     = true
+anyhow.workspace      = true
+bytes.workspace       = true
+
+# 第1層: 伝送路暗号化 (TCP+TLS / QUIC)
+rustls.workspace          = true
+tokio-rustls.workspace    = true
+rustls-pemfile.workspace  = true
+rustls-pki-types.workspace = true
+quinn.workspace           = true
+
+# 第2層: 相互認証 (SCRAM-SHA-256 / mTLS)
+rand.workspace            = true
+
+# 第3層: アプリケーション層ペイロード暗号化
+chacha20poly1305.workspace = true
+hkdf.workspace             = true
+sha2.workspace             = true

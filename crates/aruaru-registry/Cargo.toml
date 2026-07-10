@@ -1,0 +1,23 @@
+[package]
+name        = "aruaru-registry"
+description = "Supported-database registry (150+), daily ranking crawler, and ingestion adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace      = true
+serde_json.workspace = true
+chrono.workspace     = true
+parking_lot.workspace = true
+tracing.workspace    = true
+anyhow.workspace     = true
+tokio.workspace      = true
+async-trait          = "0.1"
+reqwest.workspace    = true
+regex.workspace      = true
+tokio-postgres.workspace = true
+mysql_async.workspace = true
+mongodb.workspace    = true
+scylla.workspace     = true
+futures.workspace    = true

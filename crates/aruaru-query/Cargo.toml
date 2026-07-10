@@ -1,0 +1,23 @@
+[package]
+name        = "aruaru-query"
+description = "aruaru-DB query engine: SQL subset executor + Git-on-SQL wiring + DataFusion OLAP (HTAP)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aruaru-core  = { path = "../aruaru-core" }
+parking_lot.workspace = true
+serde.workspace      = true
+serde_json.workspace = true
+anyhow.workspace     = true
+thiserror.workspace  = true
+tracing.workspace    = true
+sqlparser.workspace  = true
+
+# OLAP 実行エンジン (HTAP の OLAP 側)
+datafusion.workspace = true
+arrow.workspace      = true
+
+[dev-dependencies]
+tokio.workspace = true

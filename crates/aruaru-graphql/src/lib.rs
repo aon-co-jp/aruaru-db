@@ -74,6 +74,7 @@ fn engine<'a>(ctx: &Context<'a>) -> Result<&'a Arc<QueryEngine>> {
 
 // ── バージョン管理 Query ──────────────────────────────────────
 
+#[derive(Default)]
 pub struct VcsQuery;
 
 #[Object]
@@ -124,6 +125,7 @@ impl VcsQuery {
 
 // ── バージョン管理 Mutation ───────────────────────────────────
 
+#[derive(Default)]
 pub struct VcsMutation;
 
 #[Object]
@@ -210,12 +212,13 @@ pub fn graphql_endpoint(engine: Arc<QueryEngine>, admin_ctx: AdminCtx) -> impl p
 // ── 変換ヘルパ ────────────────────────────────────────────────
 
 fn commit_to_gql(c: aruaru_core::Commit) -> CommitGql {
+    let timestamp = c.timestamp_rfc3339();
     CommitGql {
         id: ID(c.id.as_str().to_string()),
         short_id: c.id.short().to_string(),
         author: c.author,
         message: c.message,
-        timestamp: c.timestamp_rfc3339(),
+        timestamp,
         root_hash: hex::encode(c.root_hash),
     }
 }
