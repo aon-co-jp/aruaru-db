@@ -27,6 +27,13 @@
 > PostgreSQL ワイヤプロトコル互換を提供するためのものであり、Poem/Cosmo の
 > 置き換え対象(HTTPフレームワーク層)とは別軸の依存である点に注意。
 
+**poem-cosmo-tauri と open-runo の違い(2026-07-11、ユーザー確認済み、
+open-raid-z正本より転記)**: 両者は共通コア(Cosmo有料版機能のOSS Rust
+再実装)を持つが**全く違うリポジトリのプロジェクト**であり統合対象では
+ない。poem-cosmo-tauri はさらに範囲が広く、Poem/Tauriの**全機能を
+AI駆動開発で一から自作・再現する**という上乗せ目標を持つ(open-runoには
+ない)。詳細は open-raid-z の `CLAUDE.md` を参照。
+
 ## フロントエンド
 
 - Tauriパッケージには直接依存しない。ただしTauriのデスクトップUI体験・
