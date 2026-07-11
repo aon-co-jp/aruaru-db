@@ -34,6 +34,15 @@ open-raid-z正本より転記)**: 両者は共通コア(Cosmo有料版機能のO
 AI駆動開発で一から自作・再現する**という上乗せ目標を持つ(open-runoには
 ない)。詳細は open-raid-z の `CLAUDE.md` を参照。
 
+**open-web-server 拡張要件との関わり(2026-07-11、ユーザー指示)**:
+`open-web-server` リポジトリが、poem-cosmo-tauri/open-runo・PostgreSQL・
+このリポジトリ(`aruaru-db`)・`open-raid-z`と組み合わせて、3Dオンライン
+ゲームの課金アイテム・金融/証券データをネットワーク上で紛失しないための
+TCP-IP/UDP-IP三層三重通信・VersionLessAPIとGit管理(このリポジトリの
+Git-on-SQL特性を利用)のハイブリッド版管理を実装する目標アーキテクチャの
+詳細・進捗は `open-web-server/CLAUDE.md`(および正本の open-raid-z
+`CLAUDE.md`)を参照。このリポジトリは分散Git-on-SQLデータ層として関与する。
+
 ## フロントエンド
 
 - Tauriパッケージには直接依存しない。ただしTauriのデスクトップUI体験・
