@@ -120,10 +120,13 @@ SELECT aruaru_merge('feature/new-schema', 'main');
 ## 🔗 相关项目
 
 存在一个将 `open-web-server` 与 `poem-cosmo-tauri`/`open-runo`、PostgreSQL、
-`open-raid-z` 组合起来的目标架构:通过三重冗余的 TCP-IP/UDP-IP 传输,
-实现 VersionLess API 与 Git 版本管理的混合方案,用于防止 3D 网络游戏中
-付费道具及金融/证券数据的丢失。aruaru-db 在其中承担分布式 Git-on-SQL
-数据层的角色(详见 `CLAUDE.md`)。
+`open-raid-z` 组合起来的目标架构(2026-07-11修订):通信层采用
+TCP-IP/UDP-IP/QUIC(MPQUIC)/MPTCP(或SCTP)四重冗余,数据库写入采用
+PostgreSQL/aruaru-db/多区域同步复制/独立审计日志四重冗余,用于防止
+3D 网络游戏中付费道具及金融/证券数据的丢失。aruaru-db 在其中承担
+分布式 Git-on-SQL 数据层的角色,并参与 VersionLess API 与 Git 版本
+管理的混合方案。目前仅实现了 TCP-IP/UDP-IP,其余尚未开始(详见
+`open-web-server` 的 `README.md`/`CLAUDE.md`)。
 
 ---
 

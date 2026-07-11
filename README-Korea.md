@@ -120,11 +120,13 @@ SELECT aruaru_merge('feature/new-schema', 'main');
 ## 🔗 관련 프로젝트
 
 `open-web-server`를 중심으로 `poem-cosmo-tauri`/`open-runo`, PostgreSQL,
-`open-raid-z`를 결합한 목표 아키텍처가 있다: 3중 이중화된 TCP-IP/UDP-IP
-전송 위에서 VersionLess API와 Git 기반 버전 관리를 결합해, 3D 온라인
-게임의 유료 아이템 및 금융/증권 데이터 손실을 방지하는 구조다. aruaru-db는
-그 안에서 분산 Git-on-SQL 데이터 계층 역할을 담당한다(자세한 내용은
-`CLAUDE.md` 참조).
+`open-raid-z`를 결합한 목표 아키텍처가 있다(2026-07-11 개정): 통신층은
+TCP-IP·UDP-IP·QUIC/MPQUIC·MPTCP/SCTP 4중화, DB 쓰기는 PostgreSQL·
+aruaru-db·다중 리전 동기 복제·독립 감사 로그 4중화를 목표로 한다.
+aruaru-db는 그 안에서 분산 Git-on-SQL 데이터 계층 역할을 담당하며,
+VersionLessAPI와 Git 기반 버전 관리의 하이브리드에도 관여한다. 현재는
+TCP-IP·UDP-IP만 구현되어 있고 나머지는 착수 전이다(자세한 내용은
+`open-web-server`의 `README.md`/`CLAUDE.md` 참조).
 
 ---
 

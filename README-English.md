@@ -120,11 +120,16 @@ SELECT aruaru_merge('feature/new-schema', 'main');
 ## 🔗 Related projects
 
 There is a target architecture combining `open-web-server` with
-`poem-cosmo-tauri`/`open-runo`, PostgreSQL, and `open-raid-z`: a hybrid of
-VersionLess API and Git-managed versioning over triple-redundant
-TCP-IP/UDP-IP transport, designed to prevent loss of paid-item and
-financial/securities data in 3D online games. aruaru-db participates as the
-distributed Git-on-SQL data layer (see `CLAUDE.md` for details).
+`poem-cosmo-tauri`/`open-runo`, PostgreSQL, and `open-raid-z` (revised
+2026-07-11): quadruple-redundant transport (TCP-IP/UDP-IP/QUIC
+(MPQUIC)/MPTCP or SCTP) and quadruple-redundant DB writes
+(PostgreSQL/aruaru-db/multi-region synchronous replication/an independent
+audit log), designed to prevent loss of paid-item and financial/securities
+data in 3D online games. aruaru-db participates as the distributed
+Git-on-SQL data layer, and in the hybrid of VersionLess API and
+Git-managed versioning. Currently only TCP-IP/UDP-IP are implemented; the
+rest has not been started yet (see `open-web-server`'s
+`README.md`/`CLAUDE.md` for details).
 
 ---
 
