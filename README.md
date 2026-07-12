@@ -95,25 +95,65 @@ npm run tauri dev
 
 ## 🌿 Git-on-SQL の使い方
 
-```sql
--- ブランチ作成
-SELECT aruaru_branch('feature/new-schema');
+> ⚠️ 以前の版に載っていた `ALTER TABLE` と `SELECT aruaru_diff(...)` は
+> **現在のSQLパーサーには実装されていません**(コード確認済み、2026-07-12)。
+> 以下は実際に動作する構文のみで置き換えたものです。
 
--- 現在のブランチでテーブル変更
-ALTER TABLE users ADD COLUMN score INT DEFAULT 0;
+```sql
+-- ブランチ作成 → 切り替え
+SELECT aruaru_branch('feature/new-schema');
+SELECT aruaru_checkout('feature/new-schema');
+
+-- このブランチでデータ変更 (テーブル自体は事前に CREATE TABLE 済みとする)
+INSERT INTO users (id, name, score) VALUES (1, 'Alice', 100);
 
 -- コミット
-SELECT aruaru_commit('Add score column to users');
+SELECT aruaru_commit('Add score for Alice');
 
 -- ログ確認
 SELECT * FROM aruaru_log LIMIT 10;
 
--- diff
-SELECT * FROM aruaru_diff('main', 'feature/new-schema');
-
--- マージ
-SELECT aruaru_merge('feature/new-schema', 'main');
+-- main へ戻ってから feature をマージ (fast-forward)
+-- 注意: aruaru_merge は引数を1つだけ取り、「現在のブランチ」に
+-- 指定ブランチをマージする。旧版README にあった
+-- aruaru_merge('feature/new-schema', 'main') という2引数呼び出しは
+-- 実装(1引数のみ受け付ける)と一致しておらず、動作しません。
+SELECT aruaru_checkout('main');
+SELECT aruaru_merge('feature/new-schema');
 ```
+
+ブランチ間の diff は SQL 関数としては提供されていません。`aruaru-graphql` の
+GraphQL API 経由で取得します:
+
+```graphql
+query {
+  diff(from: "main", to: "feature/new-schema") {
+    added
+    removed
+    modified
+  }
+}
+```
+
+### UPSERT (2026-07-12 追加)
+
+`ON CONFLICT ... DO UPDATE` / `DO NOTHING` に対応しています
+(open-runo が生成するUPSERT文との互換性のために追加):
+
+```sql
+-- 初回は新規行としてINSERT、2回目以降(同じidが既にあれば)は
+-- balance列だけをEXCLUDED(今回渡した新しい値)で上書き更新
+INSERT INTO wallets (id, balance) VALUES (1, '500')
+  ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance;
+
+-- 既に存在する場合は何もしない (「無ければ作る」の冪等パターン)
+INSERT INTO wallets (id, balance) VALUES (1, '500')
+  ON CONFLICT (id) DO NOTHING;
+```
+
+> 現在の実装では、衝突判定はテーブルの**先頭列(=PK)**の重複でのみ行われます。
+> `ON CONFLICT (col)` の `col` は先頭列と一致している必要があります(異なる列を
+> 指定するとエラーになります)。
 
 ---
 
