@@ -12,6 +12,23 @@ pub struct ColumnDef {
     pub ty: ColumnType,
 }
 
+/// `ON CONFLICT ... DO ...` の挙動
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictAction {
+    /// DO NOTHING — 既存行があれば何もしない (冪等な「無ければ作る」)
+    DoNothing,
+    /// DO UPDATE SET col = value [, ...] — 既存行のみ指定列を更新
+    DoUpdate(Vec<(String, ConflictValue)>),
+}
+
+/// DO UPDATE SET の右辺値。リテラルか、`EXCLUDED.col`(INSERTしようとした新しい値)か。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictValue {
+    Literal(String),
+    /// `EXCLUDED.col_name` — INSERT側の新しい値を使う (PostgreSQL互換)
+    Excluded(String),
+}
+
 /// パース結果の文
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -23,6 +40,19 @@ pub enum Statement {
         table: String,
         columns: Vec<String>,
         values: Vec<String>,
+    },
+    /// INSERT ... ON CONFLICT (col) DO UPDATE SET ... / DO NOTHING
+    ///
+    /// open-runo 互換のUPSERT構文。`aruaru-db` はテーブルの先頭列を常にPKとして
+    /// 扱うため、`conflict_column` はドキュメント目的の検証にのみ使い、実際の
+    /// 衝突判定は行(row)の先頭列(PK)の重複で行う。
+    Upsert {
+        table: String,
+        columns: Vec<String>,
+        values: Vec<String>,
+        /// ON CONFLICT (col) の col。省略時 (`ON CONFLICT DO ...`) は None。
+        conflict_column: Option<String>,
+        action: ConflictAction,
     },
     Select {
         table: String,
@@ -191,7 +221,7 @@ fn parse_create_table(sql: &str) -> Result<Statement, String> {
 }
 
 fn parse_insert(sql: &str) -> Result<Statement, String> {
-    // INSERT INTO name (c1, c2) VALUES (v1, v2)
+    // INSERT INTO name (c1, c2) VALUES (v1, v2) [ON CONFLICT (c) DO UPDATE SET .../DO NOTHING]
     let after = sql[11..].trim(); // "INSERT INTO".len() == 11
     let paren = after
         .find('(')
@@ -215,7 +245,7 @@ fn parse_insert(sql: &str) -> Result<Statement, String> {
         .find('(')
         .ok_or_else(|| "INSERT: missing values '('".to_string())?;
     let vclose = values_part
-        .rfind(')')
+        .find(')')
         .ok_or_else(|| "INSERT: missing values ')'".to_string())?;
     let values: Vec<String> = values_part[vopen + 1..vclose]
         .split(',')
@@ -230,11 +260,82 @@ fn parse_insert(sql: &str) -> Result<Statement, String> {
         ));
     }
 
+    // ── ON CONFLICT (省略可) ─────────────────────────────────
+    let remainder = values_part[vclose + 1..].trim();
+    if remainder.to_uppercase().starts_with("ON CONFLICT") {
+        let (conflict_column, action) = parse_on_conflict(remainder)?;
+        return Ok(Statement::Upsert {
+            table,
+            columns,
+            values,
+            conflict_column,
+            action,
+        });
+    }
+
     Ok(Statement::Insert {
         table,
         columns,
         values,
     })
+}
+
+/// `ON CONFLICT [(col)] DO NOTHING` / `ON CONFLICT [(col)] DO UPDATE SET c1 = v1 [, c2 = v2 ...]`
+fn parse_on_conflict(sql: &str) -> Result<(Option<String>, ConflictAction), String> {
+    // "ON CONFLICT".len() == 11
+    let after = sql[11..].trim();
+
+    let (conflict_column, after_target) = if let Some(rest) = after.strip_prefix('(') {
+        let close = rest
+            .find(')')
+            .ok_or_else(|| "ON CONFLICT: missing ')' in conflict target".to_string())?;
+        let col = rest[..close].trim().to_string();
+        (Some(col), rest[close + 1..].trim())
+    } else {
+        (None, after)
+    };
+
+    let upper = after_target.to_uppercase();
+    if upper.starts_with("DO NOTHING") {
+        return Ok((conflict_column, ConflictAction::DoNothing));
+    }
+
+    if !upper.starts_with("DO UPDATE SET") {
+        return Err(format!(
+            "ON CONFLICT: expected DO NOTHING or DO UPDATE SET, got: {}",
+            after_target
+        ));
+    }
+    // "DO UPDATE SET".len() == 13
+    let set_list = after_target[13..].trim();
+    let assignments: Vec<(String, ConflictValue)> = set_list
+        .split(',')
+        .map(|clause| {
+            let eq = clause
+                .find('=')
+                .ok_or_else(|| format!("ON CONFLICT DO UPDATE: invalid assignment: {}", clause))?;
+            let col = clause[..eq].trim().to_string();
+            let raw_val = clause[eq + 1..].trim();
+            let val = if let Some(excl_col) = raw_val
+                .to_uppercase()
+                .strip_prefix("EXCLUDED.")
+                .map(|_| raw_val[9..].trim().to_string())
+            {
+                ConflictValue::Excluded(excl_col)
+            } else {
+                ConflictValue::Literal(
+                    raw_val.trim_matches(|c| c == '\'' || c == '"').to_string(),
+                )
+            };
+            Ok::<_, String>((col, val))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    if assignments.is_empty() {
+        return Err("ON CONFLICT DO UPDATE SET: empty assignment list".to_string());
+    }
+
+    Ok((conflict_column, ConflictAction::DoUpdate(assignments)))
 }
 
 fn parse_select(sql: &str) -> Result<Statement, String> {
@@ -458,6 +559,97 @@ mod tests {
         assert_eq!(
             parse("DROP TABLE IF EXISTS t").unwrap(),
             Statement::DropTable { table: "t".into() }
+        );
+    }
+
+    #[test]
+    fn test_insert_on_conflict_do_nothing() {
+        let s = parse(
+            "INSERT INTO users (id, name) VALUES (1, 'Alice') ON CONFLICT (id) DO NOTHING",
+        )
+        .unwrap();
+        assert_eq!(
+            s,
+            Statement::Upsert {
+                table: "users".into(),
+                columns: vec!["id".into(), "name".into()],
+                values: vec!["1".into(), "Alice".into()],
+                conflict_column: Some("id".into()),
+                action: ConflictAction::DoNothing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_insert_on_conflict_do_update() {
+        let s = parse(
+            "INSERT INTO wallets (id, balance) VALUES (1, '100') ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance",
+        )
+        .unwrap();
+        assert_eq!(
+            s,
+            Statement::Upsert {
+                table: "wallets".into(),
+                columns: vec!["id".into(), "balance".into()],
+                values: vec!["1".into(), "100".into()],
+                conflict_column: Some("id".into()),
+                action: ConflictAction::DoUpdate(vec![(
+                    "balance".into(),
+                    ConflictValue::Excluded("balance".into())
+                )]),
+            }
+        );
+    }
+
+    #[test]
+    fn test_insert_on_conflict_do_update_literal_and_multi() {
+        let s = parse(
+            "INSERT INTO items (id, qty) VALUES (1, '5') ON CONFLICT (id) DO UPDATE SET qty = '5', status = 'granted'",
+        )
+        .unwrap();
+        assert_eq!(
+            s,
+            Statement::Upsert {
+                table: "items".into(),
+                columns: vec!["id".into(), "qty".into()],
+                values: vec!["1".into(), "5".into()],
+                conflict_column: Some("id".into()),
+                action: ConflictAction::DoUpdate(vec![
+                    ("qty".into(), ConflictValue::Literal("5".into())),
+                    ("status".into(), ConflictValue::Literal("granted".into())),
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn test_insert_on_conflict_no_target_column() {
+        // ON CONFLICT DO NOTHING (衝突対象列を明示しない open-runo 生成SQLにも対応)
+        let s = parse("INSERT INTO users (id, name) VALUES (1, 'Bob') ON CONFLICT DO NOTHING")
+            .unwrap();
+        assert_eq!(
+            s,
+            Statement::Upsert {
+                table: "users".into(),
+                columns: vec!["id".into(), "name".into()],
+                values: vec!["1".into(), "Bob".into()],
+                conflict_column: None,
+                action: ConflictAction::DoNothing,
+            }
+        );
+    }
+
+    #[test]
+    fn test_insert_plain_still_works_without_on_conflict() {
+        // 既存の非UPSERT INSERTが壊れていないことの回帰確認
+        let s = parse("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
+        assert_eq!(
+            s,
+            Statement::Insert {
+                table: "users".into(),
+                columns: vec!["id".into(), "name".into()],
+                values: vec!["1".into(), "Alice".into()],
+            }
         );
     }
 }
