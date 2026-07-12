@@ -121,6 +121,28 @@ open-raid-z
 
 ## 現状(このリポジトリ固有)・重要な引き継ぎ事項
 
+- **2026-07-12: ZFS互換チェックサム層を追加(ZFS互換 + ACID互換のハイブリッド、
+  ユーザー指示)**: `crates/aruaru-core/src/storage/mod.rs`に、open-raid-z
+  (`open_raid_z_core::checksum`)と**アルゴリズム・型ともに完全同一**の
+  SHA-256チェックサム(`compute_checksum`)を追加。`PersistentStore`に
+  新パーティション`__checksums`を追加し、`save_row`で書き込みバイト列の
+  チェックサムを必ず記録、`scan_table`で読み込み時に再検証(不一致は
+  `StorageError::ChecksumMismatch`、黙って壊れたデータを返さない)。
+  ZFSの`zpool scrub`に相当する`scrub()`メソッドも追加(全行を検証し
+  破損箇所の一覧を返す、最初の不一致で打ち切らない)。既存のACID
+  トランザクション層(BEGIN/COMMIT/ROLLBACK、Git-on-SQLコミット)とは
+  直交する保証(ACID=正しい順序で確定、チェックサム=保存後にバイトが
+  破損していない)。チェックサム未記録の既存データは検証をスキップし
+  後方互換を維持。単体テスト4件追加(破損検出・scrub複数破損検出・
+  後方互換)。**検証**: `compute_checksum`単体は分離クレートで実行し
+  標準SHA-256テストベクタ(空文字列)と一致することを確認済み。
+  `PersistentStore`本体(fjall統合部分)は、このサンドボックスの
+  rustc 1.75では`fjall`自体がrustc 1.76+を要求するため(edition2024とは
+  別の、より根本的なツールチェーン制約)実ビルド確認ができなかった。
+  既存の動作実績あるパターン(`data.insert`/`data.prefix`等)を踏襲した
+  最小限の追加のため目視レビューでは問題なしと判断したが、実CI/実
+  ツールチェーンでの`cargo test -p aruaru-core`確認を推奨。
+
 - **2026-07-10 に重大な問題を発見・修正**: `main`ブランチの`Cargo.toml`が
   ワークスペースメンバーとして `crates/aruaru-query` / `aruaru-wire` /
   `aruaru-registry` / `aruaru-server`(サーバー本体バイナリ)を参照していたが、
@@ -248,7 +270,16 @@ open-raid-z
   2. `aruaru-backup` の真のCoWスナップショット(Prolly Tree reference
      counting による差分のみ保存)は未実装。現状は毎回全データをParquetへ
      フルダンプする簡易実装。大規模データでの性能が問題になれば対応する。
-  3. `aruaru-backup` のS3/SFTP宛先は未接続(`local_dest()`がエラーを返す)。
-     実際のオブジェクトストレージ/SFTPクライアント接続は未実装。
+  3. ~~`aruaru-backup` のS3/SFTP宛先は未接続~~ **2026-07-12実装済み(S3のみ)**:
+     `crates/aruaru-backup/src/s3.rs`新設。`rusty-s3`でSigV4署名付きURLを
+     生成し`reqwest`で実PUT/GET/ListObjectsV2する設計(認証情報は
+     `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`環境変数から取得、
+     `BackupConfig`には持たせない)。`local_dest()`をS3宛先向けローカル
+     ステージングディレクトリ方式に変更し、既存のParquet書き込みロジックは
+     無変更のまま`write_snapshot`後にS3へアップロード、`restore`前に
+     S3からダウンロードする形で配線。SFTPは今回のパスでは引き続き未接続
+     (真に不可能ではなく単に見送り——次回対応)。署名付きURL生成ロジックは
+     分離クレートでの実ビルド・実行テスト7件で検証済み(実S3/MinIOサーバー
+     への到達確認はこの環境に無いため未実施)。
   4. `origin/backup-before-github-merge-20260705` ブランチは引き続き
      用済みだが削除しないこと(履歴保全のため)。
