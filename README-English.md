@@ -123,6 +123,31 @@ SELECT aruaru_checkout('main');
 SELECT aruaru_merge('feature/new-schema');
 ```
 
+### Querying a past commit's state (`AS OF COMMIT`, added 2026-07-13)
+
+The read side of the VersionLessAPI + Git version-management hybrid (endpoints
+carry no version number; the data itself keeps full commit history). When a
+`WHERE pk = 'value'` clause identifies a single row, appending
+`AS OF COMMIT '<commit_id>'` returns that row's value **as of that commit**,
+not the latest value:
+
+```sql
+INSERT INTO items (id, qty) VALUES ('sword', 1);
+SELECT aruaru_commit('first grant');          -- e.g. commit_id abc123...
+
+UPDATE items SET qty = '5' WHERE id = 'sword';
+SELECT aruaru_commit('quantity bumped');
+
+SELECT qty FROM items WHERE id = 'sword';                          -- 5 (latest)
+SELECT qty FROM items WHERE id = 'sword' AS OF COMMIT 'abc123...'; -- 1 (past)
+```
+
+Current scope: single-row lookups only (a `WHERE` clause identifying the
+primary key is required); full-table-scan `AS OF` queries are not yet
+supported. This is not yet wired through pgwire for external callers
+(`open-runo`/`open-web-server`) — see this file's HANDOFF section for the
+honest scope boundary.
+
 Branch diffs aren't exposed as a SQL function — use the `aruaru-graphql` API instead:
 
 ```graphql

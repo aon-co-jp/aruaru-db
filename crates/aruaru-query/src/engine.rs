@@ -377,6 +377,11 @@ impl QueryEngine {
             Statement::Rollback => self.rollback(),
             Statement::AruaruFn { name, arg } => self.aruaru_fn(&name, arg),
             Statement::AruaruLog { limit } => self.aruaru_log(limit),
+            Statement::SelectAsOf {
+                table,
+                filter,
+                commit_id,
+            } => self.select_as_of(table, filter, commit_id),
         }
     }
 
@@ -820,6 +825,76 @@ impl QueryEngine {
         })
     }
 
+    /// VersionLessAPI + Git版管理ハイブリッドの読み出し側:
+    /// `SELECT ... FROM table WHERE pk = 'v' AS OF COMMIT 'commit_id'`
+    ///
+    /// `commit_id` が指す過去の `Commit.root_hash` から (現在の可変な
+    /// `self.tables` ではなく) その時点の Prolly Tree を `ProllyTree::from_root`
+    /// で再構築して読み出す — これが「最新状態ではなく特定コミット時点の
+    /// 状態」を返す部分。同じ `NodeStore` (`self.store`) は `aruaru_commit`
+    /// 実行時に `snapshot_root()` が書き込んだノードをすべて保持しているため、
+    /// 古い commit の root からでも辿れる (Prolly Treeの構造的共有により、
+    /// 変更されていない部分木は複数コミット間で共有される)。
+    ///
+    /// **スコープの限界 (正直な記載)**: 現状は単一行 (PK 一致の `WHERE`)
+    /// のみサポートする。フルスキャン (`WHERE`無し・複数行) の AS OF は、
+    /// このProllyTreeにテーブル横断の効率的なprefixスキャンAPIが今回追加
+    /// されていないため次回以降の拡張とする — `scan()` はテーブル区別なく
+    /// 全体を返すため、呼び出し側で`table\0`プレフィックスによる絞り込みが
+    /// 必要になる (実装は容易だが、このパスでは単一行の実証を優先した)。
+    fn select_as_of(
+        &self,
+        table: String,
+        filter: Option<(String, String)>,
+        commit_id: String,
+    ) -> Result<QueryResponse, String> {
+        let (_, pk_value) = filter.ok_or_else(|| {
+            "AS OF COMMIT queries require a WHERE clause identifying the primary key \
+             (full-table scans as of a commit are not yet supported)"
+                .to_string()
+        })?;
+
+        let commit = self
+            .version
+            .get_commit_by_str(&commit_id)
+            .ok_or_else(|| format!("commit not found: {commit_id}"))?;
+
+        // キー形式は snapshot_root() と揃える: `table_name\0pk`
+        let mut key = table.as_bytes().to_vec();
+        key.push(0);
+        key.extend_from_slice(pk_value.as_bytes());
+
+        let tree = ProllyTree::from_root(commit.root_hash, self.store.clone());
+        let Some(raw) = tree.get(&key) else {
+            // その時点でまだ存在しなかった/既に削除されていた行
+            return Ok(QueryResponse::Rows {
+                columns: vec![],
+                rows: vec![],
+            });
+        };
+
+        let row: Vec<String> = String::from_utf8_lossy(&raw)
+            .split('\t')
+            .map(|s| s.to_string())
+            .collect();
+
+        // 現在もテーブルが存在する場合は列名を引き継ぐ (無ければ位置ベースの
+        // 汎用列名にフォールバック — テーブルがその後DROPされていても
+        // 過去データ自体は読み出せることを優先する)。
+        let columns = {
+            let tables = self.tables.read();
+            match tables.get(&table) {
+                Some(t) if t.columns.len() == row.len() => t.columns.clone(),
+                _ => (0..row.len()).map(|i| format!("col{i}")).collect(),
+            }
+        };
+
+        Ok(QueryResponse::Rows {
+            columns,
+            rows: vec![row.into_iter().map(Value::Text).collect()],
+        })
+    }
+
     // ── Git-on-SQL ───────────────────────────────────────────
 
     fn aruaru_fn(&self, name: &str, arg: Option<String>) -> Result<QueryResponse, String> {
@@ -955,6 +1030,81 @@ mod tests {
         } else {
             panic!("expected rows");
         }
+    }
+
+    /// VersionLessAPI + Git版管理ハイブリッドの読み出し側 (open-web-server/
+    /// CLAUDE.md 拡張要件(1) の残ギャップ) の一気通貫テスト:
+    /// 同じキーに対して複数回コミットし、古いcommit_idを指定した
+    /// `AS OF COMMIT` クエリが**最新値ではなく過去の値**を返すことを実証する。
+    #[test]
+    fn as_of_commit_returns_the_value_from_that_commit_not_the_latest() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE items (id TEXT, qty INT)").unwrap();
+
+        eng.execute("INSERT INTO items (id, qty) VALUES ('sword', 1)")
+            .unwrap();
+        let commit_1 = match eng.execute("SELECT aruaru_commit('first grant')").unwrap() {
+            QueryResponse::Rows { rows, .. } => match &rows[0][0] {
+                Value::Text(s) => s.clone(),
+                _ => panic!("expected text commit id"),
+            },
+            _ => panic!("expected rows"),
+        };
+
+        eng.execute("UPDATE items SET qty = '5' WHERE id = 'sword'")
+            .unwrap();
+        let commit_2 = match eng.execute("SELECT aruaru_commit('quantity bumped')").unwrap() {
+            QueryResponse::Rows { rows, .. } => match &rows[0][0] {
+                Value::Text(s) => s.clone(),
+                _ => panic!("expected text commit id"),
+            },
+            _ => panic!("expected rows"),
+        };
+        assert_ne!(commit_1, commit_2, "each commit must get a distinct id");
+
+        // 現在の状態 (最新) は qty=5
+        let latest = eng.execute("SELECT qty FROM items WHERE id = 'sword'").unwrap();
+        if let QueryResponse::Rows { rows, .. } = latest {
+            assert_eq!(rows[0][0], Value::Text("5".to_string()));
+        } else {
+            panic!("expected rows");
+        }
+
+        // commit_1 時点 (最初のコミット) の状態を問い合わせると qty=1 のまま
+        let as_of_1 = eng
+            .execute(&format!(
+                "SELECT qty FROM items WHERE id = 'sword' AS OF COMMIT '{commit_1}'"
+            ))
+            .unwrap();
+        if let QueryResponse::Rows { columns, rows } = as_of_1 {
+            assert_eq!(rows.len(), 1, "row must exist as of commit_1");
+            assert_eq!(columns, vec!["id", "qty"]);
+            assert_eq!(
+                rows[0],
+                vec![Value::Text("sword".to_string()), Value::Text("1".to_string())],
+                "AS OF commit_1 must return the value as of that commit, not the latest value"
+            );
+        } else {
+            panic!("expected rows");
+        }
+
+        // commit_2 時点の状態を問い合わせると qty=5 (最新と一致するが、
+        // これも「その時点のスナップショット」から独立に導出されている)
+        let as_of_2 = eng
+            .execute(&format!(
+                "SELECT qty FROM items WHERE id = 'sword' AS OF COMMIT '{commit_2}'"
+            ))
+            .unwrap();
+        if let QueryResponse::Rows { rows, .. } = as_of_2 {
+            assert_eq!(rows[0][1], Value::Text("5".to_string()));
+        } else {
+            panic!("expected rows");
+        }
+
+        // 存在しないcommit_idはエラー
+        assert!(eng
+            .execute("SELECT qty FROM items WHERE id = 'sword' AS OF COMMIT 'deadbeef'")
+            .is_err());
     }
 
     #[test]

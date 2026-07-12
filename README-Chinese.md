@@ -115,6 +115,10 @@ SELECT * FROM aruaru_diff('main', 'feature/new-schema');
 SELECT aruaru_merge('feature/new-schema', 'main');
 ```
 
+> **新增 (2026-07-13)**: 支持 `SELECT col FROM t WHERE pk = 'v' AS OF COMMIT
+> '<commit_id>'`,可按 PK 查询某个历史 commit 时点的值而非最新值(单行
+> 查询,尚不支持全表扫描;尚未通过 pgwire 对外部调用方开放)。
+
 ---
 
 ## 🔗 相关项目

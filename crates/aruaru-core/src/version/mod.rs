@@ -137,6 +137,19 @@ impl VersionController {
         Ok(commit_id)
     }
 
+    /// commit_id (hex文字列) から `Commit` を直接引く (VersionLessAPI +
+    /// Git版管理ハイブリッドの読み出し側 — 「commit_id を指定して過去状態を
+    /// 問い合わせる」ために必要な最小のアクセサ。従来は `log()`/`head()`
+    /// 経由の間接参照しかなかった)。`CommitId` は内部フィールドが非公開の
+    /// ため、SQL/HTTP経由で渡ってくる生の16進文字列と直接比較する。
+    pub fn get_commit_by_str(&self, id: &str) -> Option<Commit> {
+        self.commits
+            .read()
+            .values()
+            .find(|c| c.id.as_str() == id)
+            .cloned()
+    }
+
     /// コミットログ (HEAD から祖先方向)
     pub fn log(&self, limit: usize) -> Vec<Commit> {
         let mut result = Vec::new();

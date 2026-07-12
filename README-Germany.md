@@ -115,6 +115,12 @@ SELECT * FROM aruaru_diff('main', 'feature/new-schema');
 SELECT aruaru_merge('feature/new-schema', 'main');
 ```
 
+> **Neu (2026-07-13)**: `SELECT col FROM t WHERE pk = 'v' AS OF COMMIT
+> '<commit_id>'` wird unterstützt — liefert den Zeilenwert zum Zeitpunkt
+> eines vergangenen Commits (per PK identifiziert), nicht den aktuellsten
+> Wert (nur Einzelzeilenabfragen; vollständige Tabellenscans werden noch
+> nicht unterstützt; noch nicht über pgwire für externe Aufrufer freigegeben).
+
 ---
 
 ## 🔗 Verwandte Projekte

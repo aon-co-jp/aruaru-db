@@ -121,6 +121,59 @@ open-raid-z
 
 ## 現状(このリポジトリ固有)・重要な引き継ぎ事項
 
+- **2026-07-13: `AS OF COMMIT` 読み出しクエリを追加(open-web-server拡張要件(1)
+  「VersionLessAPI + Git版管理ハイブリッド」の読み出し側、`open-web-server`
+  側から依頼された調査・実装)**: `open-web-server/CLAUDE.md`が指摘していた
+  「commit_idを指定して過去状態を問い合わせるAPIがopen-web-server側に無い」
+  というギャップの、**このリポジトリの責務範囲(ストレージ/SQL層)における
+  実装**。既存の`aruaru_commit`(`aruaru-query::engine::QueryEngine`)が
+  `snapshot_root()`で全テーブルをProlly Treeへスナップショットし
+  `VersionController::commit`でcommit_idを発行する仕組みに対し、対応する
+  **読み出し**が存在しなかった。
+  - `crates/aruaru-core/src/version/mod.rs`: `VersionController::get_commit_by_str(id: &str) -> Option<Commit>`
+    を新設(従来は`log()`/`head()`経由の間接参照しかなかった)。
+  - `crates/aruaru-query/src/parser.rs`: `Statement::SelectAsOf { table, filter,
+    commit_id }`を新設。`SELECT col FROM t WHERE pk = 'v' AS OF COMMIT
+    '<commit_id>'`をパースする(内部のSELECT部分は既存`parse_select`を再帰
+    呼び出しして流用)。
+  - `crates/aruaru-query/src/engine.rs`: `select_as_of`を実装。
+    `version.get_commit_by_str(commit_id)`でcommitの`root_hash`を取得し、
+    `ProllyTree::from_root(root_hash, self.store.clone())`(**既存のAPI**
+    ——`ProllyTree`は元々任意のroot_hashから開けるようになっていたが、
+    `QueryEngine`側でそれを使う経路が無かった)でその時点のツリーを再構築、
+    `table\0pk`キーで`get()`する。キー形式は`snapshot_root()`と完全に
+    揃えてある。テーブルが現存すれば列名を引き継ぎ、無ければ`col0`/`col1`.. の
+    汎用列名にフォールバックする(過去データの読み出し自体は優先)。
+  - **検証(実データでの一気通貫テスト)**: `as_of_commit_returns_the_value_from_that_commit_not_the_latest`
+    (`engine.rs`)。同一キー(`sword`)に対し `qty=1`でコミット→`qty=5`に更新して
+    再コミット→最新状態は`qty=5`だが、**最初のcommit_idを指定した`AS OF
+    COMMIT`クエリは`qty=1`を返す**ことを実証(型チェックのみでの「完了」
+    報告ではなく、実際に異なる値が返ることを確認)。存在しないcommit_idは
+    エラーになることも確認。`cargo test -p aruaru-query`は新規1件を含む
+    全37件green。
+  - **正直なスコープの限界**:
+    1. **単一行のみ**: `WHERE`句でPKを特定できる場合のみ対応。全表スキャンの
+       `AS OF`(`WHERE`無し)は今回未対応(`ProllyTree`にテーブル横断の
+       効率的prefixスキャンAPIが今回追加されていないため)。
+    2. **pgwireへの配線は未実施**: `open-runo`は`aruaru-db`に対して
+       pgwire(:5433)経由の汎用KVテーブル操作(`open-runo-db::aruaru::
+       AruaruDbBackend`、`put`/`get`/`delete`/`list`のみ)で通信しており、
+       commit/バージョンという概念自体をpgwireプロトコル越しには一切
+       やり取りしていない。今回追加した`AS OF COMMIT`構文はSQLパーサー
+       レベル(`aruaru-query`)の機能であり、`aruaru-server`のpgwireハンドラ
+       (`aruaru-wire`)がこの新構文のクエリをそのまま透過させるかどうかは
+       未検証(pgwireは基本的に任意のSQL文字列をクライアントから受け取り
+       `QueryEngine::execute`に渡す設計のため、原理上は動くはずだが実際の
+       pgwireクライアント(psql等)からの実行確認はしていない)。
+    3. **open-runo/open-web-server側の配線は未着手**: `open-runo-router`に
+       `GET /api/db/:table/:key/at/:commit_id`相当のハンドラを追加し、内部で
+       上記SQLを組み立てて`aruaru`バックエンドへ投げる、という配線は
+       このパスでは実施していない(cross-repo作業であり、`open-web-server`
+       側のCLAUDE.md HANDOFFに詳細判断根拠を記載)。
+  - 次回以降の候補: (a) pgwire実クライアントからの`AS OF COMMIT`クエリの
+    実行確認、(b) `open-runo-router`への`GET .../at/:commit_id`ハンドラ追加、
+    (c) 全表スキャンの`AS OF`対応。
+
 - **2026-07-12: ZFS互換チェックサム層を追加(ZFS互換 + ACID互換のハイブリッド、
   ユーザー指示)**: `crates/aruaru-core/src/storage/mod.rs`に、open-raid-z
   (`open_raid_z_core::checksum`)と**アルゴリズム・型ともに完全同一**の

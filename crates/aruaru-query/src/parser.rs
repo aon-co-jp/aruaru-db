@@ -89,6 +89,18 @@ pub enum Statement {
     AruaruLog {
         limit: Option<usize>,
     },
+    /// `SELECT ... FROM table WHERE pk = 'v' AS OF COMMIT 'commit_id'`
+    ///
+    /// VersionLessAPI + Git 版管理ハイブリッドの読み出し側 (open-web-server/
+    /// CLAUDE.md 拡張要件(1) の残ギャップ)。通常の `Select` と同じ
+    /// `table`/`filter` に加え、参照する過去コミットのIDを持つ。
+    /// 現状は単一行 (PK 一致) の読み出しのみサポート (フルスキャン AS OF は
+    /// 将来の拡張、下記 engine.rs のドキュコメント参照)。
+    SelectAsOf {
+        table: String,
+        filter: Option<(String, String)>,
+        commit_id: String,
+    },
 }
 
 /// SQL 文字列をパースする
@@ -339,8 +351,30 @@ fn parse_on_conflict(sql: &str) -> Result<(Option<String>, ConflictAction), Stri
 }
 
 fn parse_select(sql: &str) -> Result<Statement, String> {
-    // SELECT cols FROM table [WHERE col = 'val']
-    let upper = sql.to_uppercase();
+    // SELECT cols FROM table [WHERE col = 'val'] [AS OF COMMIT 'commit_id']
+    let upper_full = sql.to_uppercase();
+    if let Some(as_of_pos) = upper_full.find(" AS OF COMMIT ") {
+        let head = sql[..as_of_pos].trim();
+        let commit_part = sql[as_of_pos + " AS OF COMMIT ".len()..].trim();
+        let commit_id = commit_part
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_string();
+        if commit_id.is_empty() {
+            return Err("AS OF COMMIT requires a commit id".to_string());
+        }
+        // 残りは普通の SELECT として再パースし、table/filterを流用する。
+        let inner = match parse_select(head)? {
+            Statement::Select { table, filter, .. } => (table, filter),
+            other => return Err(format!("AS OF COMMIT: unsupported inner statement {other:?}")),
+        };
+        return Ok(Statement::SelectAsOf {
+            table: inner.0,
+            filter: inner.1,
+            commit_id,
+        });
+    }
+
+    let upper = upper_full;
     let from_pos = upper
         .find(" FROM ")
         .ok_or_else(|| "SELECT: missing FROM".to_string())?;
