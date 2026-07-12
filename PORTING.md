@@ -135,15 +135,24 @@ Snowflake へのエクスポートは Parquet 経路を共有(`docs/DATABASE.md`
 ### 4.4 バックアップ・復元
 
 ```rust
-use aruaru_backup::BackupEngine;
+use aruaru_backup::{BackupEngine, BackupConfig, BackupDestination, BackupKind, BackupCompression};
 
-let engine = BackupEngine::new(query_engine.clone(), "./backups")?;
-engine.run_full()?;                 // フルスナップショット(Parquet + SHA-256)
-engine.restore("2026-07-11T00-00Z")?;
+let config = BackupConfig {
+    destination: BackupDestination::Local { path: "./backups".into() },
+    kind: BackupKind::Full,
+    compression: BackupCompression::None,
+    encrypt: false,
+    retention_days: 7,
+};
+let engine = BackupEngine::new(config, query_engine.clone());
+engine.run_full(|_progress| {}).await?;   // フルスナップショット(Parquet + SHA-256)
+engine.restore("2026-07-11T00-00Z", &"./data".into(), |_progress| {}).await?;
 ```
 
-現状はフルダンプ方式(CoW 差分保存は未実装、`CLAUDE.md` 参照)。S3/SFTP
-宛先は未接続で、ローカルディスクのみ実装済み。
+現状はフルダンプ方式(CoW 差分保存は未実装、`CLAUDE.md` 参照)。S3宛先は
+2026-07-12実装済み(`BackupDestination::S3`、認証情報は
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`環境変数から取得)。SFTP宛先は
+未接続。
 
 ## 5. データのお引越し(既存環境から)
 

@@ -200,7 +200,16 @@ open-raid-z
   2. `aruaru-backup` の真のCoWスナップショット(Prolly Tree reference
      counting による差分のみ保存)は未実装。現状は毎回全データをParquetへ
      フルダンプする簡易実装。大規模データでの性能が問題になれば対応する。
-  3. `aruaru-backup` のS3/SFTP宛先は未接続(`local_dest()`がエラーを返す)。
-     実際のオブジェクトストレージ/SFTPクライアント接続は未実装。
+  3. ~~`aruaru-backup` のS3/SFTP宛先は未接続~~ **2026-07-12実装済み(S3のみ)**:
+     `crates/aruaru-backup/src/s3.rs`新設。`rusty-s3`でSigV4署名付きURLを
+     生成し`reqwest`で実PUT/GET/ListObjectsV2する設計(認証情報は
+     `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`環境変数から取得、
+     `BackupConfig`には持たせない)。`local_dest()`をS3宛先向けローカル
+     ステージングディレクトリ方式に変更し、既存のParquet書き込みロジックは
+     無変更のまま`write_snapshot`後にS3へアップロード、`restore`前に
+     S3からダウンロードする形で配線。SFTPは今回のパスでは引き続き未接続
+     (真に不可能ではなく単に見送り——次回対応)。署名付きURL生成ロジックは
+     分離クレートでの実ビルド・実行テスト7件で検証済み(実S3/MinIOサーバー
+     への到達確認はこの環境に無いため未実施)。
   4. `origin/backup-before-github-merge-20260705` ブランチは引き続き
      用済みだが削除しないこと(履歴保全のため)。
