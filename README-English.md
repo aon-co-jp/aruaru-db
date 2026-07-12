@@ -207,6 +207,8 @@ Maintained by volunteers around the world.
 - Start with a **good-first-issue** label
 - Please read `CONTRIBUTING.md` first
 - Discord: discuss in the community channel
+- When unsure about a technical choice, verify via search (both Japanese
+  and English) and GitHub research rather than relying on guesses
 
 ---
 

@@ -220,3 +220,11 @@ cargo run -p aruaru-backup --bin backup-cli -- restore --path ./backups/<manifes
 移設先で pgwire/GraphQL のどちらかしか要らない場合は、対応するクレート
 (`aruaru-wire` または `aruaru-graphql`)だけを依存に加えれば足りる
 (いずれも `aruaru-core`/`aruaru-query` を共通基盤として利用)。
+
+## 8. 移植・拡張時の注意
+
+他プロジェクトへ移植・拡張する際、依存クレートの現状(バージョン・
+メンテナンス状況)や仕様の詳細で判断に迷う場合は、学習データからの
+推測だけに頼らず、実際に検索(日本語・英語の両方の Google 検索、
+および GitHub 上の実装状況調査)して裏付けを取ってから技術選定を
+行うことを推奨する。
