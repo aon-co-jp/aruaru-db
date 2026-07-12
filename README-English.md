@@ -95,25 +95,66 @@ npm run tauri dev
 
 ## 🌿 Using Git-on-SQL
 
-```sql
--- Create a branch
-SELECT aruaru_branch('feature/new-schema');
+> ⚠️ The previous version of this example used `ALTER TABLE` and
+> `SELECT aruaru_diff(...)`, **neither of which the current SQL parser
+> supports** (verified against source, 2026-07-12). Replaced below with
+> syntax that actually works.
 
--- Modify a table on the current branch
-ALTER TABLE users ADD COLUMN score INT DEFAULT 0;
+```sql
+-- Create a branch, then switch to it
+SELECT aruaru_branch('feature/new-schema');
+SELECT aruaru_checkout('feature/new-schema');
+
+-- Change data on this branch (assumes the table was already CREATE TABLE'd)
+INSERT INTO users (id, name, score) VALUES (1, 'Alice', 100);
 
 -- Commit
-SELECT aruaru_commit('Add score column to users');
+SELECT aruaru_commit('Add score for Alice');
 
 -- Check the log
 SELECT * FROM aruaru_log LIMIT 10;
 
--- diff
-SELECT * FROM aruaru_diff('main', 'feature/new-schema');
-
--- Merge
-SELECT aruaru_merge('feature/new-schema', 'main');
+-- Switch back to main, then fast-forward merge feature into it.
+-- Note: aruaru_merge takes exactly ONE argument (the source branch) and
+-- merges it into whatever the CURRENT branch is. The old two-argument
+-- form aruaru_merge('feature/new-schema', 'main') shown in a previous
+-- version of this README does not match the implementation and will not work.
+SELECT aruaru_checkout('main');
+SELECT aruaru_merge('feature/new-schema');
 ```
+
+Branch diffs aren't exposed as a SQL function — use the `aruaru-graphql` API instead:
+
+```graphql
+query {
+  diff(from: "main", to: "feature/new-schema") {
+    added
+    removed
+    modified
+  }
+}
+```
+
+### UPSERT (added 2026-07-12)
+
+`ON CONFLICT ... DO UPDATE` / `DO NOTHING` is now supported (added for
+compatibility with the UPSERT SQL that `open-runo` generates):
+
+```sql
+-- First call inserts a new row; on a later call with the same id, only
+-- the balance column is overwritten with EXCLUDED (the new value passed in).
+INSERT INTO wallets (id, balance) VALUES (1, '500')
+  ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance;
+
+-- Idempotent "create if missing" pattern: do nothing if it already exists
+INSERT INTO wallets (id, balance) VALUES (1, '500')
+  ON CONFLICT (id) DO NOTHING;
+```
+
+> Conflict detection currently only considers the table's **first column**
+> (which this engine always treats as the primary key). The `col` in
+> `ON CONFLICT (col)` must match that first column, or the statement returns
+> an error.
 
 ---
 

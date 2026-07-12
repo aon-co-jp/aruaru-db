@@ -20,3 +20,12 @@ uuid.workspace     = true
 chrono.workspace   = true
 sha2.workspace     = true
 hex.workspace      = true
+# S3-compatible backup destination (AWS/MinIO/R2). `rusty-s3` generates
+# SigV4-presigned request URLs (the actual cryptographic signing is
+# delegated to it rather than hand-rolled, matching this codebase's
+# existing "audited crypto library for the signing, hand-rolled protocol
+# glue" convention) so we can PUT/DELETE/LIST objects with a plain HTTP
+# client (`reqwest`, already a workspace dependency elsewhere) instead of
+# pulling in the much heavier `aws-sdk-s3`.
+rusty-s3 = "0.7"
+reqwest = { workspace = true }
