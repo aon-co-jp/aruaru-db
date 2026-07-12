@@ -115,6 +115,13 @@ SELECT * FROM aruaru_diff('main', 'feature/new-schema');
 SELECT aruaru_merge('feature/new-schema', 'main');
 ```
 
+> **新機能 (2026-07-13)**: `SELECT col FROM t WHERE pk = 'v' AS OF COMMIT
+> '<commit_id>'` 構文に対応。PKで特定した行の、最新値ではなく**指定した
+> 過去コミット時点の値**を返す(単一行のみ対応、全表スキャンは未対応。
+> pgwire経由での外部呼び出しへの配線はまだ未実施——詳細は正本の
+> `README.md`「🌿 Git-on-SQL の使い方」節、および本ファイル下部の
+> CLAUDE.md HANDOFF相当の記載参照)。
+
 ---
 
 ## 🔗 関連プロジェクト

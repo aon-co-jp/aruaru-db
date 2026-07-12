@@ -115,6 +115,12 @@ SELECT * FROM aruaru_diff('main', 'feature/new-schema');
 SELECT aruaru_merge('feature/new-schema', 'main');
 ```
 
+> **Nuevo (2026-07-13)**: se admite `SELECT col FROM t WHERE pk = 'v' AS OF
+> COMMIT '<commit_id>'` para consultar el valor de una fila tal como
+> existía en un commit pasado (identificado por PK), no el valor más
+> reciente (solo consultas de una fila; el escaneo completo de tabla aún
+> no está soportado; todavía no expuesto vía pgwire a llamadores externos).
+
 ---
 
 ## 🔗 Proyectos relacionados

@@ -115,6 +115,13 @@ SELECT * FROM aruaru_diff('main', 'feature/new-schema');
 SELECT aruaru_merge('feature/new-schema', 'main');
 ```
 
+> **Novità (2026-07-13)**: supportata la sintassi `SELECT col FROM t WHERE
+> pk = 'v' AS OF COMMIT '<commit_id>'`, che restituisce il valore della
+> riga così com'era in un commit passato (identificato dalla PK), non
+> l'ultimo valore (solo query su riga singola; la scansione completa della
+> tabella non è ancora supportata; non ancora esposta via pgwire ai
+> chiamanti esterni).
+
 ---
 
 ## 🔗 Progetti correlati

@@ -115,6 +115,13 @@ SELECT * FROM aruaru_diff('main', 'feature/new-schema');
 SELECT aruaru_merge('feature/new-schema', 'main');
 ```
 
+> **Nouveau (2026-07-13)** : prise en charge de `SELECT col FROM t WHERE
+> pk = 'v' AS OF COMMIT '<commit_id>'`, qui renvoie la valeur d'une ligne
+> telle qu'elle existait lors d'un commit passé (identifiée par sa clé
+> primaire), et non la valeur la plus récente (uniquement des requêtes sur
+> une seule ligne ; le balayage complet de table n'est pas encore pris en
+> charge ; pas encore exposé via pgwire aux appelants externes).
+
 ---
 
 ## 🔗 Projets liés

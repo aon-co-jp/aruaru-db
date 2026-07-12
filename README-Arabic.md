@@ -115,6 +115,12 @@ SELECT * FROM aruaru_diff('main', 'feature/new-schema');
 SELECT aruaru_merge('feature/new-schema', 'main');
 ```
 
+> **جديد (2026-07-13)**: تمت إضافة دعم لصيغة `SELECT col FROM t WHERE pk =
+> 'v' AS OF COMMIT '<commit_id>'`، والتي تُرجع قيمة الصف كما كانت عند
+> commit سابق محدد (بواسطة المفتاح الأساسي) وليس أحدث قيمة (استعلامات صف
+> واحد فقط؛ المسح الكامل للجدول غير مدعوم بعد؛ لم يُتَح بعد عبر pgwire
+> للمستدعين الخارجيين).
+
 ---
 
 ## 🔗 مشاريع ذات صلة

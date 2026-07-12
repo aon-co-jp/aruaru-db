@@ -115,6 +115,11 @@ SELECT * FROM aruaru_diff('main', 'feature/new-schema');
 SELECT aruaru_merge('feature/new-schema', 'main');
 ```
 
+> **신규 (2026-07-13)**: `SELECT col FROM t WHERE pk = 'v' AS OF COMMIT
+> '<commit_id>'` 구문을 지원한다 — 최신 값이 아니라 PK 기준으로 특정
+> 과거 commit 시점의 값을 조회한다 (단일 행 조회만 지원, 전체 테이블
+> 스캔은 미지원. 아직 pgwire를 통한 외부 호출자 노출은 없음).
+
 ---
 
 ## 🔗 관련 프로젝트

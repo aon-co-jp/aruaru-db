@@ -122,6 +122,30 @@ SELECT aruaru_checkout('main');
 SELECT aruaru_merge('feature/new-schema');
 ```
 
+### 過去コミット時点の状態を問い合わせる (`AS OF COMMIT`, 2026-07-13 追加)
+
+VersionLessAPI(エンドポイントはバージョン番号を持たない)と Git 版管理
+(データはコミット単位で完全な履歴を持つ)のハイブリッドの**読み出し側**。
+`WHERE pk = 'value'` で行を1件特定できる場合、`AS OF COMMIT '<commit_id>'`
+を付けると最新値ではなくその commit_id 時点の値を返します:
+
+```sql
+INSERT INTO items (id, qty) VALUES ('sword', 1);
+SELECT aruaru_commit('first grant');          -- commit_id 例: abc123...
+
+UPDATE items SET qty = '5' WHERE id = 'sword';
+SELECT aruaru_commit('quantity bumped');
+
+SELECT qty FROM items WHERE id = 'sword';                          -- 5 (最新)
+SELECT qty FROM items WHERE id = 'sword' AS OF COMMIT 'abc123...'; -- 1 (過去)
+```
+
+内部では commit の `root_hash` から Prolly Tree を再構築して読み出すため、
+最新の可変テーブル状態を経由しません。現状のスコープ: 単一行 (PK 一致の
+`WHERE`) のみ対応、フルテーブルスキャンの `AS OF` は未対応(次回拡張候補)。
+pgwire 経由(`open-runo`/`open-web-server` からの外部アクセス)にはまだ
+配線されていません — 詳細は本ファイル下部の HANDOFF 節を参照。
+
 ブランチ間の diff は SQL 関数としては提供されていません。`aruaru-graphql` の
 GraphQL API 経由で取得します:
 

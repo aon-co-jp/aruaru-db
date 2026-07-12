@@ -132,6 +132,22 @@ tree.merge("feature/new-schema", "main")?;
 SQL 経由でも同等の操作が可能(`SELECT aruaru_branch(...)` 等、`README.md`
 「🌿 Git-on-SQL の使い方」参照)。
 
+### 4.2.1 過去コミット時点の値を問い合わせる (`AS OF COMMIT`, 2026-07-13追加)
+
+`open-web-server` 拡張要件(1)「VersionLessAPIとGit版管理のハイブリッド」の
+読み出し側。`aruaru-query::engine::QueryEngine` に
+`SELECT col FROM t WHERE pk = 'v' AS OF COMMIT '<commit_id>'` 構文を追加した
+(パーサー: `aruaru-query/src/parser.rs` の `Statement::SelectAsOf`、実行:
+`engine.rs` の `select_as_of`)。内部では
+`aruaru_core::version::VersionController::get_commit_by_str` で対象コミットの
+`root_hash` を引き、`ProllyTree::from_root(root_hash, store)` でその時点の
+ツリーを再構築して読み出す。移植時に持っていく場合は
+`aruaru-core::version::prolly::ProllyTree::from_root`(既存)+
+`VersionController::get_commit_by_str`(新規)+ `aruaru-query`側の2ファイルを
+セットで持っていくこと。**スコープの限界**: 単一行(PK一致のWHERE)のみ、
+pgwire経由(`open-runo`/`open-web-server`からの外部呼び出し)へは未配線
+(SQL層の実装のみ、ネットワーク越しの呼び出しはこのパスの範囲外)。
+
 ### 4.3 既存 Postgres/MySQL/CSV からの移行
 
 ```rust
