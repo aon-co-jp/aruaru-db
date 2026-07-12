@@ -14,7 +14,7 @@ use aruaru_core::catalog::ColumnType;
 use aruaru_core::version::prolly::{NodeStore, ProllyTree};
 use aruaru_core::version::VersionController;
 
-use crate::parser::{self, ColumnDef, Statement};
+use crate::parser::{self, ColumnDef, ConflictAction, ConflictValue, Statement};
 
 /// 値の型 (pgwire への変換用)
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -357,6 +357,13 @@ impl QueryEngine {
                 columns,
                 values,
             } => self.insert(table, columns, values),
+            Statement::Upsert {
+                table,
+                columns,
+                values,
+                conflict_column,
+                action,
+            } => self.upsert(table, columns, values, conflict_column, action),
             Statement::Select {
                 table,
                 columns,
@@ -523,6 +530,110 @@ impl QueryEngine {
         Ok(QueryResponse::Command {
             tag: "INSERT 0 1".to_string(),
         })
+    }
+
+    /// INSERT ... ON CONFLICT (col) DO UPDATE SET .../DO NOTHING
+    ///
+    /// `aruaru-db` はテーブル先頭列を常にPKとして扱うため、衝突判定は
+    /// 「先頭列(PK)の値が既存行と一致するか」で行う。`conflict_column` は
+    /// open-runo 側のSQLとの整合性チェック用(先頭列と一致しない場合はエラー)。
+    /// これにより open-runo の `ON CONFLICT ... DO UPDATE` 生成SQLがそのまま
+    /// 実行できるようになり、§0 の「exactly-once適用」要件
+    /// (同じ課金アイテム付与/証券注文を再送しても二重に増えない)を満たす。
+    fn upsert(
+        &self,
+        table: String,
+        columns: Vec<String>,
+        values: Vec<String>,
+        conflict_column: Option<String>,
+        action: ConflictAction,
+    ) -> Result<QueryResponse, String> {
+        let (pk, existed, final_row) = {
+            let mut tables = self.tables.write();
+            let t = tables
+                .get_mut(&table)
+                .ok_or_else(|| format!("table not found: {}", table))?;
+
+            // 列順を揃える: テーブル定義の列順に values を並べ替え
+            let mut new_row = vec![String::new(); t.columns.len()];
+            for (col, val) in columns.iter().zip(values.iter()) {
+                if let Some(idx) = t.columns.iter().position(|c| c == col) {
+                    new_row[idx] = val.clone();
+                } else {
+                    return Err(format!("unknown column: {}", col));
+                }
+            }
+
+            // conflict_column の整合性チェック (指定されていれば先頭列=PKと一致必須)
+            if let Some(cc) = &conflict_column {
+                if t.columns.first().map(|c| c.as_str()) != Some(cc.as_str()) {
+                    return Err(format!(
+                        "ON CONFLICT ({}): aruaru-db only supports the table's first \
+                         column as the conflict target (PK); table '{}' first column is '{}'",
+                        cc,
+                        table,
+                        t.columns.first().cloned().unwrap_or_default()
+                    ));
+                }
+            }
+
+            let pk = new_row.first().cloned().unwrap_or_default().into_bytes();
+            let existed = t.rows.contains_key(&pk);
+
+            let final_row = if !existed {
+                // 新規行: 通常のINSERTと同じ
+                t.rows.insert(pk.clone(), new_row.clone());
+                new_row
+            } else {
+                match &action {
+                    ConflictAction::DoNothing => {
+                        // 既存行はそのまま。返り値用に現在の行を読む
+                        t.rows.get(&pk).cloned().unwrap_or(new_row)
+                    }
+                    ConflictAction::DoUpdate(assignments) => {
+                        let mut row = t.rows.get(&pk).cloned().unwrap_or_else(|| new_row.clone());
+                        for (col, val) in assignments {
+                            let idx = t
+                                .columns
+                                .iter()
+                                .position(|c| c == col)
+                                .ok_or_else(|| format!("unknown column in DO UPDATE SET: {}", col))?;
+                            let resolved = match val {
+                                ConflictValue::Literal(s) => s.clone(),
+                                ConflictValue::Excluded(excl_col) => {
+                                    let excl_idx = t
+                                        .columns
+                                        .iter()
+                                        .position(|c| c == excl_col)
+                                        .ok_or_else(|| {
+                                            format!("unknown column in EXCLUDED.{}", excl_col)
+                                        })?;
+                                    new_row.get(excl_idx).cloned().unwrap_or_default()
+                                }
+                            };
+                            row[idx] = resolved;
+                        }
+                        t.rows.insert(pk.clone(), row.clone());
+                        row
+                    }
+                }
+            };
+            (pk, existed, final_row)
+        };
+
+        // write-through: 新規行 or 更新後の行を永続化 (DO NOTHING で既存行を
+        // 変更しなかった場合も、再送によるズレを防ぐため現状態を書き直す)
+        self.persist_row(&table, &pk, &final_row);
+
+        let tag = if !existed {
+            "INSERT 0 1".to_string()
+        } else {
+            match action {
+                ConflictAction::DoNothing => "INSERT 0 0".to_string(),
+                ConflictAction::DoUpdate(_) => "UPDATE 1".to_string(),
+            }
+        };
+        Ok(QueryResponse::Command { tag })
     }
 
     /// DELETE FROM t [WHERE col = 'v']
@@ -893,7 +1004,100 @@ mod tests {
     }
 
     #[test]
-    fn test_transaction_commit() {
+    fn test_upsert_insert_when_absent() {
+        // ON CONFLICT 付きINSERTでも、行が存在しなければ通常のINSERTと同じ
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE wallets (id TEXT, balance TEXT)").unwrap();
+        eng.execute(
+            "INSERT INTO wallets (id, balance) VALUES ('u1', '100') \
+             ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance",
+        )
+        .unwrap();
+
+        let resp = eng.execute("SELECT * FROM wallets").unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], Value::Text("100".into()));
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_upsert_do_update_on_conflict() {
+        // 【§0 zero-loss mission】同じ口座への2回目の入金UPSERTが
+        // 新規行を作らず既存残高を更新することを確認 (課金アイテム/口座残高の
+        // 二重付与防止と同じ形の保証)
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE wallets (id TEXT, balance TEXT)").unwrap();
+        eng.execute(
+            "INSERT INTO wallets (id, balance) VALUES ('u1', '100') \
+             ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance",
+        )
+        .unwrap();
+        eng.execute(
+            "INSERT INTO wallets (id, balance) VALUES ('u1', '250') \
+             ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance",
+        )
+        .unwrap();
+
+        let resp = eng.execute("SELECT * FROM wallets").unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows.len(), 1, "must not create a duplicate row on conflict");
+            assert_eq!(rows[0][1], Value::Text("250".into()));
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_upsert_do_nothing_keeps_existing_value() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE items (id TEXT, granted TEXT)").unwrap();
+        eng.execute(
+            "INSERT INTO items (id, granted) VALUES ('sword-1', 'yes') ON CONFLICT (id) DO NOTHING",
+        )
+        .unwrap();
+        // 同じidempotency的な再送を想定した再送 — 既存の 'yes' を変えないこと
+        eng.execute(
+            "INSERT INTO items (id, granted) VALUES ('sword-1', 'no') ON CONFLICT (id) DO NOTHING",
+        )
+        .unwrap();
+
+        let resp = eng.execute("SELECT * FROM items").unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], Value::Text("yes".into()));
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_upsert_multi_column_do_update() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE orders (id TEXT, qty TEXT, status TEXT)").unwrap();
+        eng.execute(
+            "INSERT INTO orders (id, qty, status) VALUES ('o1', '1', 'pending') \
+             ON CONFLICT (id) DO UPDATE SET qty = '5', status = 'filled'",
+        )
+        .unwrap();
+        eng.execute(
+            "INSERT INTO orders (id, qty, status) VALUES ('o1', '1', 'pending') \
+             ON CONFLICT (id) DO UPDATE SET qty = '5', status = 'filled'",
+        )
+        .unwrap();
+
+        let resp = eng.execute("SELECT * FROM orders").unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], Value::Text("5".into()));
+            assert_eq!(rows[0][2], Value::Text("filled".into()));
+        } else {
+            panic!("expected rows");
+        }
+    }
+}
         let eng = QueryEngine::new();
         eng.execute("CREATE TABLE t (id INT, v TEXT)").unwrap();
         eng.execute("INSERT INTO t (id, v) VALUES (1, 'a')").unwrap();
@@ -1078,5 +1282,92 @@ mod tests {
             .diff_branches(eng.store(), "main", "feature")
             .unwrap();
         assert_eq!(diff.added_count(), 1, "id=2 の行が追加されているはず");
+    }
+
+    #[test]
+    fn test_upsert_do_nothing_keeps_existing_row() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE wallets (id INT, balance TEXT)").unwrap();
+        eng.execute("INSERT INTO wallets (id, balance) VALUES (1, '100')").unwrap();
+
+        // 同じPKで再送 (ネットワーク再送を想定) → DO NOTHINGで残高は変わらない
+        eng.execute(
+            "INSERT INTO wallets (id, balance) VALUES (1, '999') ON CONFLICT (id) DO NOTHING",
+        )
+        .unwrap();
+
+        let resp = eng.execute("SELECT balance FROM wallets WHERE id = '1'").unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Text("100".into()));
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_upsert_do_update_set_excluded() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE wallets (id INT, balance TEXT)").unwrap();
+        eng.execute("INSERT INTO wallets (id, balance) VALUES (1, '100')").unwrap();
+
+        // 既存行を EXCLUDED (新しい値) で更新
+        eng.execute(
+            "INSERT INTO wallets (id, balance) VALUES (1, '250') ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance",
+        )
+        .unwrap();
+
+        let resp = eng.execute("SELECT balance FROM wallets WHERE id = '1'").unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Value::Text("250".into()));
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_upsert_inserts_when_no_conflict() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE items (id INT, qty TEXT)").unwrap();
+
+        // 既存行なし → 通常のINSERTとして動作するはず
+        eng.execute(
+            "INSERT INTO items (id, qty) VALUES (1, '5') ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.qty",
+        )
+        .unwrap();
+
+        let resp = eng.execute("SELECT * FROM items").unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][1], Value::Text("5".into()));
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    #[test]
+    fn test_upsert_idempotent_replay_does_not_double_grant() {
+        // §0 の使命(課金アイテム/資産データのexactly-once適用)そのものの回帰テスト:
+        // 同じ idempotency_key で同じUPSERTを2回送っても、残高が二重に増えないこと。
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE wallets (id INT, balance TEXT)").unwrap();
+        eng.execute("INSERT INTO wallets (id, balance) VALUES (1, '0')").unwrap();
+
+        let sql = "INSERT INTO wallets (id, balance) VALUES (1, '500') ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance";
+        eng.execute_idempotent("grant-item-42", sql, "grant paid item #42")
+            .unwrap();
+        // クライアントのリトライを模擬: 同じキーで再送
+        eng.execute_idempotent("grant-item-42", sql, "grant paid item #42")
+            .unwrap();
+
+        let resp = eng.execute("SELECT balance FROM wallets WHERE id = '1'").unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows.len(), 1);
+            // 再送しても '500' から変わらない (二重付与ではない) ことを確認
+            assert_eq!(rows[0][0], Value::Text("500".into()));
+        } else {
+            panic!("expected rows");
+        }
     }
 }
