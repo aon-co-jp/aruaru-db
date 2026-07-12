@@ -19,3 +19,11 @@ uuid.workspace = true
 async-trait   = "0.1"
 reqwest.workspace = true
 futures.workspace = true
+# aruaru-db commit x open-raid-z スナップショット連携(`open_raid_z` feature
+# 有効時のみ)。別Cargoワークスペースへの path 依存であり、
+# `default-features = false` により WinFsp/dxc/Windows SDK は不要
+# (CPUフォールバックのみ、FileBackedDeviceによるファイルI/Oで検証可能)。
+open_raid_z_core = { path = "../../../open-raid-z/open_runo_zfs_source/open_raid_z_core", default-features = false, optional = true }
+
+[features]
+open_raid_z = ["dep:open_raid_z_core"]

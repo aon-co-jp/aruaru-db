@@ -1,6 +1,9 @@
 //! aruaru-dist: 分散レイヤー (openraft + Range シャーディング)
 pub mod raft;
 pub mod shard;
+pub mod snapshot_pairing;
+#[cfg(feature = "open_raid_z")]
+pub mod raid_z_backend;
 
 /// ノード設定
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -25,3 +28,6 @@ pub use raft::{
 pub use shard::{
     ClusterTopology, NodeInfo, Range, RouteTarget, DEFAULT_RANGE_SIZE, SPLIT_THRESHOLD,
 };
+pub use snapshot_pairing::{wire_to_node, InMemorySnapshotBackend, SnapshotBackend, SnapshotPairingRegistry};
+#[cfg(feature = "open_raid_z")]
+pub use raid_z_backend::OpenRaidZSnapshotBackend;

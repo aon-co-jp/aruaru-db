@@ -82,7 +82,7 @@ npm run tauri dev
 | Crate | Aufgabe |
 |---|---|
 | `aruaru-core` | Storage-Engine, MVCC, Git-on-SQL-Versionsverwaltung |
-| `aruaru-dist` | openraft-Integration, Range-Sharding, Knotenverwaltung |
+| `aruaru-dist` | openraft-Integration, Range-Sharding, Knotenverwaltung, Raft-Commit-x-open-raid-z-Snapshot-Kopplung (`snapshot_pairing`, hinzugefügt am 2026-07-13) |
 | `aruaru-query` | SQL-Parser, HTAP-Router, DataFusion-Integration |
 | `aruaru-wire` | PostgreSQL-Wire-Protokoll (pgwire) |
 | `aruaru-graphql` | Versionless GraphQL + Poem-HTTP-Server |

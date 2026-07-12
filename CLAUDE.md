@@ -190,6 +190,54 @@ open-raid-z
     **この方針にまだ移行していない** ため、その旨を明記した(上記の
     「aruaru-db 固有の注記」参照)。
 
+- **2026-07-13 巡回で完了した作業(aruaru-dbコミット×open-raid-zスナップ
+  ショット連携、`open-web-server/CLAUDE.md`拡張要件(2)「次回新規開発予定」
+  の第一段実装)**:
+  - `crates/aruaru-dist/src/raft/node.rs`: `RaftNode`に
+    `on_commit: RwLock<Option<Box<dyn Fn(u64) + Send + Sync>>>`フィールドと
+    `set_commit_hook`メソッドを追加。`apply_committed`が適用済み最終
+    ログインデックス(=commit ID)でフックを1回呼ぶ(適用対象が無い呼び出し
+    では呼ばれない)。フック未登録時は何もしない(既存動作を変えない)。
+  - `crates/aruaru-dist/src/snapshot_pairing.rs`(新規): `SnapshotBackend`
+    トレイト(スナップショット操作の抽象化)、テスト・開発用の
+    `InMemorySnapshotBackend`、`commit_index -> snapshot_id`の対応関係を
+    記録・問い合わせできる`SnapshotPairingRegistry`、`RaftNode`へ配線する
+    `wire_to_node`関数を実装。スナップショット失敗はRaft適用パイプライン
+    自体を止めない設計(`tracing::warn!`のみ、課金/金融データの書き込み
+    成功をスナップショット失敗で巻き込まない)。
+  - `crates/aruaru-dist/src/raid_z_backend.rs`(新規、`open_raid_z`
+    feature有効時のみコンパイル): `open_raid_z_core::pool::Pool`
+    (RAID-Z2、`FileBackedDevice`6台)を実際に構築・保持し
+    `create_snapshot`を呼ぶ`OpenRaidZSnapshotBackend`を実装。
+    `Cargo.toml`に`open_raid_z_core`をpath依存として追加
+    (`default-features = false`——WinFsp/dxc/Windows SDK不要のCPU
+    フォールバックのみを使うため、`open_raid_z` feature無効時の
+    デフォルトビルドには一切影響しない)。
+  - **検証**: `real_raft_commit_triggers_real_raid_z_snapshot`統合テスト
+    (`raid_z_backend.rs`内)で、実Raft commit(`propose`→`try_commit_to`→
+    `apply_committed`)が実RAID-Z2プール上の実`create_snapshot`をトリガーし、
+    `SnapshotPairingRegistry`経由の問い合わせと実プールの
+    `snapshot_names()`の両方で対応関係を確認できることを実証した
+    (型チェックのみでの「完了」報告ではない)。`cargo test -p aruaru-dist`
+    (feature無し、21件)・`cargo test -p aruaru-dist --features
+    open_raid_z`(21件、`raid_z_backend`のテストを含む)・
+    `cargo check --workspace`・`cargo test --workspace`(デフォルト構成)
+    すべてgreenを確認。
+  - **正直なスコープの限界**: (a) 対応関係(`SnapshotPairingRegistry`)は
+    現状プロセスメモリ上のみで、永続化(再起動で失われる)は未実装——
+    将来`aruaru-backup`のMANIFEST.json的な永続化と統合することが想定
+    される。(b) 双方向のリカバリ(スナップショットからのRaftログ巻き戻し
+    等)は範囲外。(c) `open_raid_z_core`は別Cargoワークスペース
+    (`open-raid-z/open_runo_zfs_source/open_raid_z_core`)へのpath依存
+    であり、デフォルトのワークスペースビルド(`cargo check --workspace`
+    /`cargo test --workspace`)には含まれない——`open_raid_z` feature
+    (`cargo test -p aruaru-dist --features open_raid_z`)を明示的に
+    有効にした場合のみコンパイル・検証される。両リポジトリが同一の
+    `F:\open-runo`ドライブ配下にある前提のpath依存であり、CI環境や
+    別マシンでは`open-raid-z`リポジトリのチェックアウトが同じ相対位置に
+    無いと失敗する点に注意(将来的にはgitサブモジュール化やcrates.io
+    公開を検討する余地がある)。
+
 - **次回以降の巡回で確認・対応すべきこと**:
   1. **Poem/Tauri 依存の剥離**: open-raid-z の2026-07-10方針転換に本リポジトリ
      を追随させる場合、`aruaru-graphql`(poem/async-graphql-poem)・

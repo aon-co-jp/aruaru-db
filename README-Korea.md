@@ -82,7 +82,7 @@ npm run tauri dev
 | 크레이트 | 역할 |
 |---|---|
 | `aruaru-core` | 스토리지 엔진・MVCC・Git-on-SQL 버전 관리 |
-| `aruaru-dist` | openraft 통합・Range 샤딩・노드 관리 |
+| `aruaru-dist` | openraft 통합・Range 샤딩・노드 관리・Raft 커밋×open-raid-z 스냅샷 연동(`snapshot_pairing`, 2026-07-13 추가) |
 | `aruaru-query` | SQL 파서・HTAP 라우터・DataFusion 통합 |
 | `aruaru-wire` | PostgreSQL 와이어 프로토콜 (pgwire) |
 | `aruaru-graphql` | Versionless GraphQL + Poem HTTP 서버 |

@@ -82,7 +82,7 @@ npm run tauri dev
 | Крейт | Роль |
 |---|---|
 | `aruaru-core` | Движок хранения, MVCC, версионирование Git-on-SQL |
-| `aruaru-dist` | Интеграция openraft, шардирование по диапазонам, управление узлами |
+| `aruaru-dist` | Интеграция openraft, шардирование по диапазонам, управление узлами, связка commit Raft со снапшотами open-raid-z (`snapshot_pairing`, добавлено 2026-07-13) |
 | `aruaru-query` | SQL-парсер, HTAP-роутер, интеграция с DataFusion |
 | `aruaru-wire` | Проводной протокол PostgreSQL (pgwire) |
 | `aruaru-graphql` | Versionless GraphQL + HTTP-сервер на Poem |

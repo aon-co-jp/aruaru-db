@@ -82,7 +82,7 @@ npm run tauri dev
 | الحزمة | الدور |
 |---|---|
 | `aruaru-core` | محرك التخزين، MVCC، إدارة الإصدارات Git-on-SQL |
-| `aruaru-dist` | تكامل openraft، التجزئة حسب النطاقات (Range Sharding)، إدارة العقد |
+| `aruaru-dist` | تكامل openraft، التجزئة حسب النطاقات، إدارة العقد، ربط التزامات Raft بلقطات open-raid-z (`snapshot_pairing`، أُضيف في 2026-07-13) |
 | `aruaru-query` | محلل SQL، موجّه HTAP، تكامل DataFusion |
 | `aruaru-wire` | بروتوكول PostgreSQL السلكي (pgwire) |
 | `aruaru-graphql` | GraphQL بدون إصدارات (Versionless) + خادم HTTP قائم على Poem |

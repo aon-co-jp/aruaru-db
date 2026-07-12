@@ -82,7 +82,7 @@ npm run tauri dev
 | Crate | 作用 |
 |---|---|
 | `aruaru-core` | 存储引擎・MVCC・Git-on-SQL 版本管理 |
-| `aruaru-dist` | openraft 集成・Range 分片・节点管理 |
+| `aruaru-dist` | openraft 集成・Range 分片・节点管理・Raft提交与open-raid-z快照联动(`snapshot_pairing`,2026-07-13新增) |
 | `aruaru-query` | SQL 解析器・HTAP 路由・DataFusion 集成 |
 | `aruaru-wire` | PostgreSQL 线协议 (pgwire) |
 | `aruaru-graphql` | Versionless GraphQL + Poem HTTP 服务器 |

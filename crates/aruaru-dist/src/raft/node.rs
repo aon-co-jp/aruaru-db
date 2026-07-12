@@ -49,6 +49,12 @@ pub struct RaftNode<A: Applier> {
     /// 【課金アイテムの権利消失防止】書き込みクライアントが
     /// 過半数コミット+適用の完了を待ち合わせるために使う (`wait_for_commit`)。
     pending_results: RwLock<HashMap<u64, CommandResponse>>,
+    /// 【aruaru-db commit × ZFS風スナップショット連携】commit+適用が完了する
+    /// たびに呼ばれるフック(引数は適用済み最終ログインデックス = commit ID)。
+    /// `open_raid_z_core` のスナップショット操作を呼ぶ用途などに使う
+    /// (`snapshot_pairing` モジュール参照)。単一責務を保つため RaftNode 自体は
+    /// スナップショットの実体を知らず、任意のクロージャを保持するのみ。
+    on_commit: RwLock<Option<Box<dyn Fn(u64) + Send + Sync>>>,
 }
 
 impl<A: Applier> RaftNode<A> {
@@ -60,7 +66,14 @@ impl<A: Applier> RaftNode<A> {
             peers,
             match_index: RwLock::new(HashMap::new()),
             pending_results: RwLock::new(HashMap::new()),
+            on_commit: RwLock::new(None),
         }
+    }
+
+    /// commit+適用完了フックを登録する(ノード生成後、任意のタイミングで
+    /// 差し替え可能)。`snapshot_pairing::wire_to_node` から利用する。
+    pub fn set_commit_hook<F: Fn(u64) + Send + Sync + 'static>(&self, hook: F) {
+        *self.on_commit.write() = Some(Box::new(hook));
     }
 
     pub fn node_id(&self) -> u64 {
@@ -309,9 +322,14 @@ impl<A: Applier> RaftNode<A> {
         }
         if last > 0 {
             self.log.write().set_applied(last);
-            let mut s = self.state.write();
-            s.applied_index = last;
-            s.commit_index = self.log.read().commit_index();
+            {
+                let mut s = self.state.write();
+                s.applied_index = last;
+                s.commit_index = self.log.read().commit_index();
+            }
+            if let Some(hook) = self.on_commit.read().as_ref() {
+                hook(last);
+            }
         }
         applied
     }
@@ -411,6 +429,26 @@ mod tests {
         // prev_index=5 は存在しない → 照合失敗
         let r = n.append_entries(1, 5, 1, vec![], 0);
         assert!(!r.success);
+    }
+
+    #[test]
+    fn test_commit_hook_fires_with_last_applied_index() {
+        let n = node();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<u64>::new()));
+        let seen2 = seen.clone();
+        n.set_commit_hook(move |idx| seen2.lock().push(idx));
+
+        n.become_leader();
+        n.propose(&Command::Exec("INSERT 1".into())).unwrap();
+        n.propose(&Command::Exec("INSERT 2".into())).unwrap();
+        n.try_commit_to(2);
+        assert_eq!(n.apply_committed(), 2);
+        // フックは適用済み最終インデックス(=2)で1回だけ呼ばれる
+        assert_eq!(*seen.lock(), vec![2]);
+
+        // 適用対象が無い呼び出しでは再度呼ばれない
+        assert_eq!(n.apply_committed(), 0);
+        assert_eq!(*seen.lock(), vec![2]);
     }
 
     #[test]
