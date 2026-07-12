@@ -1097,7 +1097,9 @@ mod tests {
             panic!("expected rows");
         }
     }
-}
+
+    #[test]
+    fn test_transaction_commit() {
         let eng = QueryEngine::new();
         eng.execute("CREATE TABLE t (id INT, v TEXT)").unwrap();
         eng.execute("INSERT INTO t (id, v) VALUES (1, 'a')").unwrap();
