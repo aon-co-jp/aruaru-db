@@ -121,6 +121,28 @@ open-raid-z
 
 ## 現状(このリポジトリ固有)・重要な引き継ぎ事項
 
+- **2026-07-12: ZFS互換チェックサム層を追加(ZFS互換 + ACID互換のハイブリッド、
+  ユーザー指示)**: `crates/aruaru-core/src/storage/mod.rs`に、open-raid-z
+  (`open_raid_z_core::checksum`)と**アルゴリズム・型ともに完全同一**の
+  SHA-256チェックサム(`compute_checksum`)を追加。`PersistentStore`に
+  新パーティション`__checksums`を追加し、`save_row`で書き込みバイト列の
+  チェックサムを必ず記録、`scan_table`で読み込み時に再検証(不一致は
+  `StorageError::ChecksumMismatch`、黙って壊れたデータを返さない)。
+  ZFSの`zpool scrub`に相当する`scrub()`メソッドも追加(全行を検証し
+  破損箇所の一覧を返す、最初の不一致で打ち切らない)。既存のACID
+  トランザクション層(BEGIN/COMMIT/ROLLBACK、Git-on-SQLコミット)とは
+  直交する保証(ACID=正しい順序で確定、チェックサム=保存後にバイトが
+  破損していない)。チェックサム未記録の既存データは検証をスキップし
+  後方互換を維持。単体テスト4件追加(破損検出・scrub複数破損検出・
+  後方互換)。**検証**: `compute_checksum`単体は分離クレートで実行し
+  標準SHA-256テストベクタ(空文字列)と一致することを確認済み。
+  `PersistentStore`本体(fjall統合部分)は、このサンドボックスの
+  rustc 1.75では`fjall`自体がrustc 1.76+を要求するため(edition2024とは
+  別の、より根本的なツールチェーン制約)実ビルド確認ができなかった。
+  既存の動作実績あるパターン(`data.insert`/`data.prefix`等)を踏襲した
+  最小限の追加のため目視レビューでは問題なしと判断したが、実CI/実
+  ツールチェーンでの`cargo test -p aruaru-core`確認を推奨。
+
 - **2026-07-10 に重大な問題を発見・修正**: `main`ブランチの`Cargo.toml`が
   ワークスペースメンバーとして `crates/aruaru-query` / `aruaru-wire` /
   `aruaru-registry` / `aruaru-server`(サーバー本体バイナリ)を参照していたが、
