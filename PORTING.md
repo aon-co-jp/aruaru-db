@@ -228,3 +228,12 @@ cargo run -p aruaru-backup --bin backup-cli -- restore --path ./backups/<manifes
 推測だけに頼らず、実際に検索(日本語・英語の両方の Google 検索、
 および GitHub 上の実装状況調査)して裏付けを取ってから技術選定を
 行うことを推奨する。
+
+**パフォーマンス・並行処理**: 移植先でも、非同期(tokio マルチスレッド
+ランタイム)を基本としつつ、必要な場面のみ同期処理を用いる方針を
+踏襲すること。`#[tokio::main]` のランタイム flavor が
+`current_thread` に固定されていないか、async 関数内でブロッキング
+I/O・CPU 負荷処理を直接呼んでいないか(`tokio::task::spawn_blocking`
+へ退避すべき)、CPU 律速な処理(チェックサム・OLAPクエリ等)は
+`rayon`/`DataFusion` の並列実行を活用する価値があるか、を移植時にも
+確認するとよい。
