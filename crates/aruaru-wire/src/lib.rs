@@ -32,7 +32,7 @@ use pgwire::api::{ClientInfo, PgWireHandlerFactory, Type};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::tokio::process_socket;
 
-use aruaru_query::{QueryEngine, QueryResponse as EngineResponse, Value};
+use aruaru_query::{parser, QueryEngine, QueryResponse as EngineResponse, Value};
 
 /// pgwire サーバ設定
 #[derive(Clone)]
@@ -326,28 +326,106 @@ impl ExtendedQueryHandler for AruaruHandler {
         engine_to_pgwire(resp)
     }
 
+    /// **拡張プロトコル(prepared statement)対応の実用性ギャップを解消**
+    /// (open-web-server連携の実用性調査で指摘、2026-07-14)。
+    ///
+    /// このサーバーは動的スキーマ(テーブル定義がクライアントの
+    /// `CREATE TABLE`次第で変わる)のため、以前は`Describe`で列情報を
+    /// 一切返せず常に空列リストだった。psqlはSimple Queryプロトコルを
+    /// 使うため影響しないが、`sqlx`をはじめ多くのORM/ドライバは既定で
+    /// Extendedプロトコルを使い、`Parse`直後(パラメータがまだ`Bind`
+    /// されていない段階)に送る`Describe(Statement)`の応答で得た列形状を
+    /// 使って後続の`Execute`結果をデコードするため、行データを持つ
+    /// SELECTは`ColumnIndexOutOfBounds`で必ず失敗していた(この
+    /// ワークスペースの`AruaruDbBackend`自身が`raw_sql`=Simple Query
+    /// プロトコルへ回避策として切り替えていた実例が、まさにこの制約の
+    /// 証拠)。
+    ///
+    /// **修正方針**: クエリを実行せず、`aruaru_query::parser::parse`の
+    /// 構文解析結果と`QueryEngine::table_columns`(テーブルスキーマの
+    /// 参照のみ、行は読まない)だけから列名を解決する
+    /// (`describe_columns`)。`Bind`前で実パラメータ値が無くても動作
+    /// する(列名はWHERE句の値に依存しないため)——**副作用の心配が
+    /// そもそも無い設計**であり、実行を伴う代替案(クエリを1回
+    /// 事前実行して列を確定する等)より安全。書き込み文やGit-on-SQL
+    /// 関数呼び出し(`Statement::AruaruFn`——`SELECT aruaru_commit(...)`
+    /// のように構文上は`SELECT`で始まるが実際には副作用を持つ)は
+    /// `describe_columns`が`None`を返し空列リストのまま
+    /// (コマンドタグのみの応答なので実害無し)。
     async fn do_describe_statement<C>(
         &self,
         _client: &mut C,
-        _stmt: &StoredStatement<Self::Statement>,
+        stmt: &StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        // 動的スキーマのためパラメータ型・列は未確定で返す
-        Ok(DescribeStatementResponse::new(vec![], vec![]))
+        let fields = describe_columns(&self.engine, &stmt.statement).unwrap_or_default();
+        let field_infos: Vec<FieldInfo> = fields
+            .into_iter()
+            .map(|name| FieldInfo::new(name, None, None, Type::VARCHAR, FieldFormat::Text))
+            .collect();
+        // パラメータ型は動的型付けのため引き続き未確定(空)のまま返す。
+        Ok(DescribeStatementResponse::new(vec![], field_infos))
     }
 
+    /// `Describe(Portal)`(`Bind`後、実パラメータ値が判明している段階)。
+    /// 列名の解決ロジックは`do_describe_statement`と同一
+    /// (`describe_columns`、パラメータ値には依存しない)——`Bind`前後
+    /// どちらでDescribeが呼ばれても正しい応答を返せる。
     async fn do_describe_portal<C>(
         &self,
         _client: &mut C,
-        _portal: &Portal<Self::Statement>,
+        portal: &Portal<Self::Statement>,
     ) -> PgWireResult<DescribePortalResponse>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        // 列は Execute 時の RowDescription で確定する
-        Ok(DescribePortalResponse::new(vec![]))
+        let fields = describe_columns(&self.engine, &portal.statement.statement).unwrap_or_default();
+        let field_infos: Vec<FieldInfo> = fields
+            .into_iter()
+            .map(|name| FieldInfo::new(name, None, None, Type::VARCHAR, FieldFormat::Text))
+            .collect();
+        Ok(DescribePortalResponse::new(field_infos))
+    }
+}
+
+/// `sql`(バインド前の生テンプレート、`$1`等のプレースホルダを含んでも
+/// よい——列名はパラメータ値に依存しないため)が返す列名を、**クエリを
+/// 実行せずに**解決する。`aruaru_query::parser::parse`の構文解析結果と
+/// `QueryEngine::table_columns`(スキーマ参照のみ)だけから求める。
+///
+/// 副作用の有無で判定を分けているわけではなく、そもそも実行しないため
+/// 副作用の心配が構造的に存在しない。書き込み文・Git-on-SQL関数呼び出し
+/// (`AruaruFn`)・未知テーブルへの`SELECT *`など、列名を静的に解決
+/// できない場合は`None`(呼び出し側は空列リストにフォールバック)。
+fn describe_columns(engine: &QueryEngine, sql: &str) -> Option<Vec<String>> {
+    match parser::parse(sql).ok()? {
+        parser::Statement::Select { table, columns, .. } => match columns {
+            Some(cols) => Some(cols),
+            None => engine.table_columns(&table),
+        },
+        // `select_as_of`は要求された列リストを無視し常にテーブルの
+        // フルROWを返す(`AruaruDbBackend::get_at_commit`のdoc comment
+        // 参照)ため、実行時と同じ列形状(テーブル全列)を返す。
+        parser::Statement::SelectAsOf { table, .. } => engine.table_columns(&table),
+        parser::Statement::AruaruLog { .. } => Some(vec![
+            "commit_id".to_string(),
+            "author".to_string(),
+            "message".to_string(),
+            "timestamp".to_string(),
+        ]),
+        // Git-on-SQL関数呼び出し。副作用を持つため実行はしないが、
+        // 各関数が返す列の形は`aruaru_query::engine::QueryEngine::
+        // aruaru_fn`にハードコードされた固定の単一列
+        // (`columns: vec!["<関数名>".into()]`)であり、実行結果を見ずに
+        // 静的に分かる——それをそのままミラーする。
+        parser::Statement::AruaruFn { name, .. }
+            if matches!(name.as_str(), "aruaru_branch" | "aruaru_checkout" | "aruaru_commit" | "aruaru_merge") =>
+        {
+            Some(vec![name])
+        }
+        _ => None,
     }
 }
 
