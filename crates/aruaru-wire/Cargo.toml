@@ -31,3 +31,9 @@ rand.workspace            = true
 chacha20poly1305.workspace = true
 hkdf.workspace             = true
 sha2.workspace             = true
+
+[dev-dependencies]
+# Extended (prepared statement) プロトコルでの実回帰テスト用
+# (describe_portal修正、2026-07-14) — psql/Simple Queryとは別に、
+# 主要ORM/ドライバのデフォルト経路を実クライアントで検証する。
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }

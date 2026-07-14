@@ -263,6 +263,16 @@ impl QueryEngine {
         self.tables.read().get(table).map(|t| t.rows.len())
     }
 
+    /// 指定テーブルの列名一覧 (存在しなければ None)。
+    ///
+    /// pgwireの`Describe(Statement)`応答(prepared statementの列形状を
+    /// クエリ実行前に返す)を、クエリを実際に実行せずに構築するために
+    /// 追加(2026-07-14、拡張プロトコル対応の一環)。`SELECT *`の実際の
+    /// 列名を、行を1件も読まずに解決できる。
+    pub fn table_columns(&self, table: &str) -> Option<Vec<String>> {
+        self.tables.read().get(table).map(|t| t.columns.clone())
+    }
+
     /// 全テーブルの合計行数
     pub fn total_rows(&self) -> usize {
         self.tables.read().values().map(|t| t.rows.len()).sum()
