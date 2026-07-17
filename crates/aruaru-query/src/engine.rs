@@ -420,7 +420,7 @@ impl QueryEngine {
             .and_then(|t| t.rows.get(&pk).cloned())
         {
             if let Some(json) = row.get(1) {
-                if let Ok(resp) = serde_json::from_str::<QueryResponse>(json) {
+                if let Ok(resp) = rust_json::from_str_strict::<QueryResponse>(json) {
                     tracing::info!(
                         key = idempotency_key,
                         "idempotent replay: returning cached result (not re-executed)"
@@ -432,7 +432,7 @@ impl QueryEngine {
 
         let resp = self.execute(sql)?;
 
-        let json = serde_json::to_string(&resp).map_err(|e| e.to_string())?;
+        let json = rust_json::to_string_strict(&resp).map_err(|e| e.to_string())?;
         let row = vec![idempotency_key.to_string(), json];
         {
             let mut tables = self.tables.write();

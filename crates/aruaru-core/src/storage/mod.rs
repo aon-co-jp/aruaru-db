@@ -74,7 +74,7 @@ pub enum StorageError {
     #[error("fjall error: {0}")]
     Fjall(#[from] fjall::Error),
     #[error("serde error: {0}")]
-    Serde(#[from] serde_json::Error),
+    Serde(#[from] rust_json::RustJsonError),
     /// ZFS互換チェックサム検証エラー: 保存時のチェックサムと読み込み時に
     /// 再計算したチェックサムが一致しない(ビットロット等でデータが破損)。
     /// ACIDトランザクション層が保証する「正しい順序で確定した」ことと、
@@ -134,7 +134,7 @@ impl PersistentStore {
             table: table.to_string(),
             columns: columns.to_vec(),
         };
-        let json = serde_json::to_vec(&schema)?;
+        let json = rust_json::to_vec_strict(&schema)?;
         self.meta.insert(table.as_bytes(), json)?;
         Ok(())
     }
@@ -144,7 +144,7 @@ impl PersistentStore {
         let mut out = Vec::new();
         for kv in self.meta.iter() {
             let (_k, v) = kv?;
-            let schema: StoredSchema = serde_json::from_slice(&v)?;
+            let schema: StoredSchema = rust_json::from_slice_strict(&v)?;
             out.push(schema);
         }
         Ok(out)
@@ -155,7 +155,7 @@ impl PersistentStore {
     /// 付与)。
     pub fn save_row(&self, table: &str, pk: &[u8], row: &[String]) -> Result<()> {
         let key = Self::data_key(table, pk);
-        let json = serde_json::to_vec(row)?;
+        let json = rust_json::to_vec_strict(row)?;
         let checksum = compute_checksum(&json);
         self.data.insert(&key, json)?;
         self.checksums.insert(&key, checksum.to_vec())?;
@@ -193,7 +193,7 @@ impl PersistentStore {
                 }
             }
 
-            let row: Vec<String> = serde_json::from_slice(&v)?;
+            let row: Vec<String> = rust_json::from_slice_strict(&v)?;
             out.push((pk, row));
         }
         Ok(out)

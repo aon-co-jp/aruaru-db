@@ -19,11 +19,11 @@ pub enum Command {
 impl Command {
     /// ログ payload へシリアライズ
     pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).unwrap_or_default()
+        rust_json::to_vec_strict(self).unwrap_or_default()
     }
     /// payload からデコード
     pub fn decode(payload: &[u8]) -> Option<Command> {
-        serde_json::from_slice(payload).ok()
+        rust_json::from_slice_strict(payload).ok()
     }
 }
 

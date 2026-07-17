@@ -326,7 +326,7 @@ impl BackupEngine {
         };
 
         let manifest_path = dest_root.join("MANIFEST.json");
-        let manifest_json = serde_json::to_string_pretty(&manifest)?;
+        let manifest_json = rust_json::to_string_pretty_strict(&manifest)?;
         fs::write(&manifest_path, manifest_json).await?;
 
         progress_cb(BackupProgress {
@@ -389,7 +389,7 @@ impl BackupEngine {
                     continue;
                 }
                 match client.get_object(&key).await {
-                    Ok(bytes) => match serde_json::from_slice::<BackupManifest>(&bytes) {
+                    Ok(bytes) => match rust_json::from_slice_strict::<BackupManifest>(&bytes) {
                         Ok(m) => manifests.push(m),
                         Err(e) => tracing::warn!(key, error = %e, "invalid MANIFEST.json in S3, skipping"),
                     },
@@ -425,7 +425,7 @@ impl BackupEngine {
                 continue;
             }
             let content = fs::read_to_string(&manifest_path).await?;
-            match serde_json::from_str::<BackupManifest>(&content) {
+            match rust_json::from_str_strict::<BackupManifest>(&content) {
                 Ok(m) => manifests.push(m),
                 Err(e) => tracing::warn!(path = %manifest_path.display(), error = %e, "invalid MANIFEST.json, skipping"),
             }
@@ -455,7 +455,7 @@ impl BackupEngine {
             anyhow::bail!("backup not found: {backup_id} (no MANIFEST.json at {})", manifest_path.display());
         }
         let content = fs::read_to_string(&manifest_path).await?;
-        let manifest: BackupManifest = serde_json::from_str(&content)?;
+        let manifest: BackupManifest = rust_json::from_str_strict(&content)?;
 
         progress_cb(BackupProgress {
             phase: BackupPhase::Preparing,
