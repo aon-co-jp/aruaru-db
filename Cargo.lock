@@ -411,6 +411,7 @@ dependencies = [
  "hex",
  "parquet",
  "reqwest",
+ "rust-json",
  "rusty-s3",
  "serde",
  "serde_json",
@@ -430,6 +431,7 @@ dependencies = [
  "fjall",
  "hex",
  "parking_lot",
+ "rust-json",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -449,6 +451,7 @@ dependencies = [
  "openraft",
  "parking_lot",
  "reqwest",
+ "rust-json",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -505,6 +508,7 @@ dependencies = [
  "aruaru-core",
  "datafusion",
  "parking_lot",
+ "rust-json",
  "serde",
  "serde_json",
  "sqlparser 0.52.0",
@@ -5164,6 +5168,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "rust-json"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
