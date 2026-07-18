@@ -17,6 +17,9 @@ use aruaru_query::QueryEngine;
 pub mod s3;
 use s3::S3Client;
 
+pub mod sftp;
+use sftp::SftpClient;
+
 // ── バックアップ設定 ──────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +53,26 @@ pub enum BackupDestination {
         port: u16,
         path: String,
         username: String,
+        /// 認証方式 (パスワードまたは秘密鍵)
+        auth: SftpAuth,
     },
+}
+
+/// SFTP 宛先の認証方式。実際のシークレット (パスワード/秘密鍵のパスフレーズ)
+/// はこの構造体には持たせない -- `BackupConfig`/`BackupDestination` は
+/// ディスク上の設定ファイルへシリアライズされ得るため、S3 宛先の AWS
+/// 認証情報と同様、接続時に環境変数 (`SFTP_PASSWORD` /
+/// `SFTP_KEY_PASSPHRASE`) から読み出す (`crates/aruaru-backup/src/sftp.rs`
+/// 参照)。秘密鍵の *パス* 自体は秘密情報ではないため、S3 宛先の
+/// バケット名/リージョンと同様に直接保持する。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SftpAuth {
+    /// パスワード認証。パスワードは `SFTP_PASSWORD` 環境変数から取得する。
+    Password,
+    /// 公開鍵認証。`key_path` は秘密鍵ファイルへのパス。鍵自体が
+    /// パスフレーズ付きで暗号化されている場合は `SFTP_KEY_PASSPHRASE`
+    /// 環境変数から取得する。
+    PrivateKey { key_path: PathBuf },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -129,19 +151,16 @@ impl BackupEngine {
         Self { config, engine }
     }
 
-    /// ローカルディレクトリ宛先の場合のパスを取得する。S3 宛先の場合は
+    /// ローカルディレクトリ宛先の場合のパスを取得する。S3/SFTP 宛先の場合は
     /// ローカルステージング用の一時ディレクトリを返す (Parquet 書き込み・
     /// チェックサム計算は既存のローカル実装をそのまま使い、その後
-    /// `upload_staged_backup`/`download_staged_backup` で S3 との間を
-    /// 転送する設計)。SFTP は今回のパスでは未接続のまま
-    /// (今回スコープ外、正直に記載——真に不可能ではなく単に見送り)。
+    /// `upload_staged_backup`/`download_staged_backup` で S3/SFTP との間を
+    /// 転送する設計)。
     fn local_dest(&self) -> anyhow::Result<PathBuf> {
         match &self.config.destination {
             BackupDestination::Local { path } => Ok(path.clone()),
             BackupDestination::S3 { .. } => Ok(self.s3_staging_dir()),
-            BackupDestination::Sftp { host, .. } => {
-                anyhow::bail!("SFTP destination ({host}) is not yet implemented; use BackupDestination::Local or S3")
-            }
+            BackupDestination::Sftp { .. } => Ok(self.sftp_staging_dir()),
         }
     }
 
@@ -156,6 +175,14 @@ impl BackupEngine {
         std::env::temp_dir().join(format!("aruaru-backup-s3-staging-{}", std::process::id()))
     }
 
+    /// Local staging directory used when the configured destination is
+    /// SFTP -- same rationale as [`Self::s3_staging_dir`], separate temp
+    /// dir so an engine can't confuse an S3 staging copy for an SFTP one
+    /// if a config were ever (mis)constructed with both in play.
+    fn sftp_staging_dir(&self) -> PathBuf {
+        std::env::temp_dir().join(format!("aruaru-backup-sftp-staging-{}", std::process::id()))
+    }
+
     /// Build an [`S3Client`] if (and only if) this engine's destination is
     /// `BackupDestination::S3`. `None` for `Local`/`Sftp`.
     fn s3_client(&self) -> Option<anyhow::Result<S3Client>> {
@@ -167,69 +194,145 @@ impl BackupEngine {
         }
     }
 
-    /// After `write_snapshot` has written `<staging>/<backup_id>/*` to the
-    /// local S3 staging directory, upload every file there (Parquet files
-    /// plus `MANIFEST.json`) to S3 under `<backup_id>/<filename>`, then
-    /// remove the local staging copy. A no-op (`Ok(())`) if this engine's
-    /// destination isn't S3.
-    async fn upload_staged_backup(&self, backup_id: &str) -> anyhow::Result<()> {
-        let Some(client) = self.s3_client() else { return Ok(()) };
-        let client = client?;
-
-        let staged_dir = self.s3_staging_dir().join(backup_id);
-        let mut entries = fs::read_dir(&staged_dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
+    /// Build an [`SftpClient`] if (and only if) this engine's destination
+    /// is `BackupDestination::Sftp`. `None` for `Local`/`S3`.
+    fn sftp_client(&self) -> Option<anyhow::Result<SftpClient>> {
+        match &self.config.destination {
+            BackupDestination::Sftp { host, port, path, username, auth } => {
+                Some(SftpClient::new(host, *port, username, path, auth))
             }
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| anyhow::anyhow!("non-UTF8 file name in staging dir: {}", path.display()))?
-                .to_string();
-            let bytes = fs::read(&path).await?;
-            client.put_object(&format!("{backup_id}/{file_name}"), bytes).await?;
+            _ => None,
+        }
+    }
+
+    /// Whether this engine's destination requires local Parquet/MANIFEST
+    /// files to be staged in a temp directory and pushed to/pulled from a
+    /// remote store (S3 or SFTP), as opposed to `Local` where the
+    /// configured path already *is* the final destination.
+    fn uses_remote_staging(&self) -> bool {
+        matches!(self.config.destination, BackupDestination::S3 { .. } | BackupDestination::Sftp { .. })
+    }
+
+    /// After `write_snapshot` has written `<staging>/<backup_id>/*` to the
+    /// local S3/SFTP staging directory, upload every file there (Parquet
+    /// files plus `MANIFEST.json`) to the remote destination under
+    /// `<backup_id>/<filename>`, then remove the local staging copy. A
+    /// no-op (`Ok(())`) if this engine's destination is `Local`.
+    async fn upload_staged_backup(&self, backup_id: &str) -> anyhow::Result<()> {
+        if let Some(client) = self.s3_client() {
+            let client = client?;
+
+            let staged_dir = self.s3_staging_dir().join(backup_id);
+            let mut entries = fs::read_dir(&staged_dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("non-UTF8 file name in staging dir: {}", path.display()))?
+                    .to_string();
+                let bytes = fs::read(&path).await?;
+                client.put_object(&format!("{backup_id}/{file_name}"), bytes).await?;
+            }
+
+            // Best-effort cleanup: a leftover staging copy is a disk-space
+            // nuisance, not a correctness problem (the S3 upload above already
+            // succeeded by the time we get here), so a cleanup failure is
+            // logged rather than surfaced as a backup failure.
+            if let Err(error) = fs::remove_dir_all(&staged_dir).await {
+                tracing::warn!(%error, dir = %staged_dir.display(), "failed to clean up local S3 staging directory");
+            }
+
+            return Ok(());
         }
 
-        // Best-effort cleanup: a leftover staging copy is a disk-space
-        // nuisance, not a correctness problem (the S3 upload above already
-        // succeeded by the time we get here), so a cleanup failure is
-        // logged rather than surfaced as a backup failure.
-        if let Err(error) = fs::remove_dir_all(&staged_dir).await {
-            tracing::warn!(%error, dir = %staged_dir.display(), "failed to clean up local S3 staging directory");
+        if let Some(client) = self.sftp_client() {
+            let client = client?;
+
+            let staged_dir = self.sftp_staging_dir().join(backup_id);
+            let mut entries = fs::read_dir(&staged_dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("non-UTF8 file name in staging dir: {}", path.display()))?
+                    .to_string();
+                let bytes = fs::read(&path).await?;
+                client.put_object(&format!("{backup_id}/{file_name}"), bytes).await?;
+            }
+
+            // Best-effort cleanup, same rationale as the S3 branch above.
+            if let Err(error) = fs::remove_dir_all(&staged_dir).await {
+                tracing::warn!(%error, dir = %staged_dir.display(), "failed to clean up local SFTP staging directory");
+            }
+
+            return Ok(());
         }
 
         Ok(())
     }
 
-    /// Download every object under `<backup_id>/` from S3 into the local
-    /// staging directory, so `restore`'s existing local-file logic can
-    /// read them unchanged. A no-op if this engine's destination isn't S3
-    /// (the staging dir is simply the already-local backup directory in
-    /// that case).
+    /// Download every object under `<backup_id>/` from S3/SFTP into the
+    /// local staging directory, so `restore`'s existing local-file logic
+    /// can read them unchanged. A no-op if this engine's destination is
+    /// `Local` (the staging dir is simply the already-local backup
+    /// directory in that case).
     async fn download_staged_backup(&self, backup_id: &str) -> anyhow::Result<()> {
-        let Some(client) = self.s3_client() else { return Ok(()) };
-        let client = client?;
+        if let Some(client) = self.s3_client() {
+            let client = client?;
 
-        let staged_dir = self.s3_staging_dir().join(backup_id);
-        fs::create_dir_all(&staged_dir).await?;
+            let staged_dir = self.s3_staging_dir().join(backup_id);
+            fs::create_dir_all(&staged_dir).await?;
 
-        let keys = client.list_objects().await?;
-        let wanted_prefix = format!("{backup_id}/");
-        let mut found_any = false;
-        for key in keys {
-            let Some(file_name) = key.strip_prefix(&wanted_prefix) else { continue };
-            if file_name.is_empty() || file_name.contains('/') {
-                continue; // skip the prefix "directory marker" or nested keys
+            let keys = client.list_objects().await?;
+            let wanted_prefix = format!("{backup_id}/");
+            let mut found_any = false;
+            for key in keys {
+                let Some(file_name) = key.strip_prefix(&wanted_prefix) else { continue };
+                if file_name.is_empty() || file_name.contains('/') {
+                    continue; // skip the prefix "directory marker" or nested keys
+                }
+                found_any = true;
+                let bytes = client.get_object(&key).await?;
+                fs::write(staged_dir.join(file_name), bytes).await?;
             }
-            found_any = true;
-            let bytes = client.get_object(&key).await?;
-            fs::write(staged_dir.join(file_name), bytes).await?;
+            if !found_any {
+                anyhow::bail!("no objects found under S3 prefix for backup_id {backup_id}");
+            }
+            return Ok(());
         }
-        if !found_any {
-            anyhow::bail!("no objects found under S3 prefix for backup_id {backup_id}");
+
+        if let Some(client) = self.sftp_client() {
+            let client = client?;
+
+            let staged_dir = self.sftp_staging_dir().join(backup_id);
+            fs::create_dir_all(&staged_dir).await?;
+
+            let keys = client.list_objects().await?;
+            let wanted_prefix = format!("{backup_id}/");
+            let mut found_any = false;
+            for key in keys {
+                let Some(file_name) = key.strip_prefix(&wanted_prefix) else { continue };
+                if file_name.is_empty() || file_name.contains('/') {
+                    continue;
+                }
+                found_any = true;
+                let bytes = client.get_object(&key).await?;
+                fs::write(staged_dir.join(file_name), bytes).await?;
+            }
+            if !found_any {
+                anyhow::bail!("no objects found under SFTP remote directory for backup_id {backup_id}");
+            }
+            return Ok(());
         }
+
         Ok(())
     }
 
@@ -340,8 +443,8 @@ impl BackupEngine {
 
         tracing::info!(id = %backup_id, rows = total_rows, bytes = total_bytes, "Backup complete");
 
-        // If this engine's destination is S3, push the just-written local
-        // staging copy up and clean up locally; no-op for Local/Sftp.
+        // If this engine's destination is S3/SFTP, push the just-written
+        // local staging copy up and clean up locally; no-op for Local.
         self.upload_staged_backup(backup_id).await?;
 
         Ok(manifest)
@@ -377,8 +480,9 @@ impl BackupEngine {
     }
 
     /// バックアップ一覧: 宛先ディレクトリ配下の `<id>/MANIFEST.json` を読む。
-    /// S3 宛先の場合は `ListObjectsV2` で一覧を取得し、各 `MANIFEST.json`
-    /// をダウンロードして解析する (SFTP は今回のパスでは未接続のまま)。
+    /// S3 宛先の場合は `ListObjectsV2` で、SFTP 宛先の場合はリモート
+    /// ディレクトリの一覧取得で、それぞれ `MANIFEST.json` をダウンロードして
+    /// 解析する。
     pub async fn list_backups(&self) -> anyhow::Result<Vec<BackupManifest>> {
         if let Some(client) = self.s3_client() {
             let client = client?;
@@ -400,14 +504,27 @@ impl BackupEngine {
             return Ok(manifests);
         }
 
-        let root = match self.local_dest() {
-            Ok(p) => p,
-            // SFTP: 転送クライアント未接続のため空一覧を返す (エラーにはしない)
-            Err(e) => {
-                tracing::warn!(error = %e, "list_backups: remote destination not supported yet");
-                return Ok(vec![]);
+        if let Some(client) = self.sftp_client() {
+            let client = client?;
+            let keys = client.list_objects().await?;
+            let mut manifests = Vec::new();
+            for key in keys {
+                if !key.ends_with("/MANIFEST.json") {
+                    continue;
+                }
+                match client.get_object(&key).await {
+                    Ok(bytes) => match rust_json::from_slice_strict::<BackupManifest>(&bytes) {
+                        Ok(m) => manifests.push(m),
+                        Err(e) => tracing::warn!(key, error = %e, "invalid MANIFEST.json in SFTP destination, skipping"),
+                    },
+                    Err(e) => tracing::warn!(key, error = %e, "failed to download MANIFEST.json from SFTP destination, skipping"),
+                }
             }
-        };
+            manifests.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+            return Ok(manifests);
+        }
+
+        let root = self.local_dest()?;
 
         if !root.exists() {
             return Ok(vec![]);
@@ -444,9 +561,9 @@ impl BackupEngine {
         tracing::info!(backup_id = %backup_id, "Starting restore");
         let start = std::time::Instant::now();
 
-        // If this engine's destination is S3, pull the backup's objects
-        // down into the local staging dir first, so the rest of this
-        // function's file-reading logic works unchanged either way.
+        // If this engine's destination is S3/SFTP, pull the backup's
+        // objects down into the local staging dir first, so the rest of
+        // this function's file-reading logic works unchanged either way.
         self.download_staged_backup(backup_id).await?;
 
         let root = self.local_dest()?.join(backup_id);
@@ -508,11 +625,12 @@ impl BackupEngine {
 
         tracing::info!(backup_id = %backup_id, rows = rows_done, "Restore complete");
 
-        // Clean up the local S3 staging copy downloaded above; no-op for
-        // Local/Sftp (s3_client() is None, same guard as upload/download).
-        if self.s3_client().is_some() {
+        // Clean up the local S3/SFTP staging copy downloaded above; no-op
+        // for Local (uses_remote_staging() is false there, same guard as
+        // upload/download).
+        if self.uses_remote_staging() {
             if let Err(error) = fs::remove_dir_all(&root).await {
-                tracing::warn!(%error, dir = %root.display(), "failed to clean up local S3 staging directory after restore");
+                tracing::warn!(%error, dir = %root.display(), "failed to clean up local staging directory after restore");
             }
         }
 
@@ -671,6 +789,7 @@ mod tests {
                 port: 22,
                 path: "/backups".to_string(),
                 username: "aruaru".to_string(),
+                auth: SftpAuth::Password,
             },
             kind,
             compression: BackupCompression::None,
@@ -705,11 +824,39 @@ mod tests {
     }
 
     #[test]
-    fn local_dest_still_errors_for_sftp_destination() {
-        // SFTP remains explicitly out of scope this pass -- confirm it's
-        // still a clear, honest error rather than silently doing nothing.
+    fn local_dest_succeeds_for_sftp_destination_via_staging_dir() {
+        // Previously this returned an Err ("SFTP destination ... is not
+        // yet implemented"); confirm the fix -- it should now succeed and
+        // point at a real (creatable) staging path, distinct from the S3
+        // staging path.
         let engine = BackupEngine::new(sftp_config(BackupKind::Full), Arc::new(QueryEngine::new()));
-        assert!(engine.local_dest().is_err());
+        let dest = engine.local_dest();
+        assert!(dest.is_ok());
+        assert!(dest.unwrap().to_string_lossy().contains("aruaru-backup-sftp-staging"));
+    }
+
+    #[test]
+    fn sftp_client_is_none_for_local_destination() {
+        let engine = BackupEngine::new(local_config(&PathBuf::from("/tmp/x"), BackupKind::Full), Arc::new(QueryEngine::new()));
+        assert!(engine.sftp_client().is_none());
+    }
+
+    #[test]
+    fn sftp_client_is_some_for_sftp_destination() {
+        let engine = BackupEngine::new(sftp_config(BackupKind::Full), Arc::new(QueryEngine::new()));
+        assert!(engine.sftp_client().is_some());
+    }
+
+    #[test]
+    fn uses_remote_staging_is_true_for_s3_and_sftp_but_not_local() {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "k");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "s");
+        let local = BackupEngine::new(local_config(&PathBuf::from("/tmp/x"), BackupKind::Full), Arc::new(QueryEngine::new()));
+        let s3 = BackupEngine::new(s3_config(BackupKind::Full), Arc::new(QueryEngine::new()));
+        let sftp = BackupEngine::new(sftp_config(BackupKind::Full), Arc::new(QueryEngine::new()));
+        assert!(!local.uses_remote_staging());
+        assert!(s3.uses_remote_staging());
+        assert!(sftp.uses_remote_staging());
     }
 
     #[tokio::test]
