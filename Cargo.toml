@@ -68,11 +68,12 @@ scraper       = "0.20"
 serde         = { version = "1", features = ["derive"] }
 serde_json    = "1"
 bincode       = "2"
-# Rust-JSON: hybrid lenient/strict JSON crate, split out of open-runo into
-# its own repo (https://github.com/aon-co-jp/Rust-JSON, 2026-07-17). Path
+# RJSON (旧Rust-JSON): hybrid lenient/strict JSON crate, split out of
+# open-runo into its own repo (https://github.com/aon-co-jp/RJSON,
+# 2026-07-17〜18でRust-JSON→RJSONへ改名、RFrontEnd傘下へ移動). Path
 # dependency since both repos live side-by-side under F:\open-runo, same
 # pattern as aruaru-dist's open_raid_z_core path dependency.
-rust-json     = { path = "../Rust-JSON" }
+rust-json     = { path = "../RFrontEnd/RJSON" }
 
 # ── Utilities ────────────────────────────────────────
 sha2          = "0.10"
