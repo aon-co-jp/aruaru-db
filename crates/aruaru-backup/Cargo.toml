@@ -30,3 +30,19 @@ hex.workspace      = true
 # pulling in the much heavier `aws-sdk-s3`.
 rusty-s3 = "0.7"
 reqwest = { workspace = true }
+# SFTP backup destination. `russh` is a pure-Rust SSH client implementation
+# (no libssh2/OpenSSL C dependency, unlike the `ssh2` crate) which matches
+# this workspace's existing preference for pure-Rust crates over C-binding
+# wrappers (e.g. `rustls` over openssl elsewhere in this workspace);
+# `russh-sftp` layers the SFTP subsystem protocol on top of a `russh`
+# channel. Only `aruaru-backup` uses these, so (matching the `rusty-s3`
+# precedent just above) they're added directly here rather than to the
+# workspace-wide `[workspace.dependencies]` table.
+# `default-features = false` + `ring` (instead of the default `aws-lc-rs`
+# crypto backend): `aws-lc-rs`'s build script requires a NASM assembler
+# toolchain, which is not guaranteed to be present on a plain dev machine;
+# `ring` builds with just a C compiler (already required elsewhere in this
+# workspace for other native deps), avoiding an extra hard toolchain
+# requirement for a single backup-destination feature.
+russh      = { version = "0.62", default-features = false, features = ["rsa", "ring", "flate2"] }
+russh-sftp = "2"
