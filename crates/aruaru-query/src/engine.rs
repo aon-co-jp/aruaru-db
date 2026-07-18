@@ -136,6 +136,26 @@ impl QueryEngine {
     }
 
     /// COMMIT: 遅延ログを永続ストアへ適用して sync、txn 終了
+    ///
+    /// **耐久性契約(2026-07-18 修正)**: 以前は、遅延ログの個々の永続化
+    /// 操作や最終的な WAL 同期 (`store.persist()`) が失敗しても
+    /// `tracing::warn!` でログを出すだけで、呼び出し元には常に
+    /// `COMMIT` 成功が返っていた——「DBがコミット成功を報告したのに
+    /// 実際は WAL 同期が失敗していてデータが消える」という致命的な
+    /// サイレント耐久性バグだった。現在は、ログ適用中のいずれかの操作
+    /// または最終 WAL 同期が失敗した場合、**`Err` を返し、
+    /// トランザクション開始時のスナップショットへインメモリのテーブル
+    /// 状態を戻す**(＝ commit が失敗した場合は rollback と同じ状態に
+    /// 揃え、「一部だけ永続化されたが呼び出し元はメモリ上にコミット
+    /// 済みの行を見てしまう」というメモリ/ディスクの分岐を避ける)。
+    ///
+    /// **既知の限界**: ログ中の複数操作のうち一部が既に fjall へ
+    /// 書き込まれた後に別の操作や最終 sync が失敗した場合、fjall 側の
+    /// パーティションには部分的な書き込みが残る可能性がある(fjall
+    /// 自体のバッチ/アトミック書き込みAPIは使っていないため)。真の
+    /// アトミック性(全operationを1回のfjallバッチとして書く)は今回の
+    /// 修正のスコープ外(本チケットの優先事項は「サイレント成功の
+    /// 除去」であり、fjall書き込み自体のアトミック化は別課題として残す)。
     fn commit_txn(&self) -> Result<QueryResponse, String> {
         let state = self.txn.lock().take();
         let Some(state) = state else {
@@ -151,11 +171,15 @@ impl QueryEngine {
                     PersistOp::Drop(t) => store.drop_table(t),
                 };
                 if let Err(e) = r {
-                    tracing::warn!(error = %e, "txn commit persist op failed");
+                    tracing::error!(error = %e, "txn commit persist op failed; aborting commit");
+                    *self.tables.write() = state.snapshot;
+                    return Err(format!("commit failed: persist op failed: {e}"));
                 }
             }
             if let Err(e) = store.persist() {
-                tracing::warn!(error = %e, "txn commit WAL sync failed");
+                tracing::error!(error = %e, "txn commit WAL sync failed; aborting commit");
+                *self.tables.write() = state.snapshot;
+                return Err(format!("commit failed: WAL sync failed: {e}"));
             }
         }
         Ok(QueryResponse::Command { tag: "COMMIT".to_string() })
@@ -174,12 +198,20 @@ impl QueryEngine {
     }
 
     /// 永続化操作を実行する。txn 中はログに記録し、autocommit 時は即適用。
-    fn record_or_apply(&self, op: PersistOp) {
+    ///
+    /// **耐久性契約**: autocommit 時に fjall への書き込み自体
+    /// (`save_row`/`delete_row`/`save_schema`/`drop_table`) が失敗した場合、
+    /// 以前は `tracing::warn!` でログを出すだけで呼び出し元には成功として
+    /// 返っていた(=呼び出し元の SQL は成功応答を受け取るのに実際は
+    /// 永続化されていない、というサイレント耐久性バグ)。現在はエラーを
+    /// `Err` として呼び出し元まで伝播させ、対応する SQL 文自体を失敗として
+    /// 扱う(2026-07-18 修正)。
+    fn record_or_apply(&self, op: PersistOp) -> Result<(), String> {
         {
             let mut txn = self.txn.lock();
             if let Some(state) = txn.as_mut() {
                 state.log.push(op);
-                return;
+                return Ok(());
             }
         }
         // autocommit: 即適用
@@ -191,9 +223,11 @@ impl QueryEngine {
                 PersistOp::Drop(t) => store.drop_table(t),
             };
             if let Err(e) = r {
-                tracing::warn!(error = %e, "persist op failed");
+                tracing::error!(error = %e, "persist op failed; propagating as statement failure");
+                return Err(format!("persist op failed: {e}"));
             }
         }
+        Ok(())
     }
 
     /// 外部ソースから取得したテーブルを直接取り込む (お引越し用)。
@@ -225,12 +259,25 @@ impl QueryEngine {
             row_map.insert(key, row);
         }
         let count = row_map.len();
-        // write-through: スキーマと全行を永続化
+        // write-through: スキーマと全行を永続化。
+        // `ingest_table` はお引越し用のバルク取り込みヘルパで、呼び出し元
+        // (admin.rs::migrate_run 等) は既に「ローカル限定・Raft複製対象外」
+        // として文書化されている(CLAUDE.md HANDOFF 2026-07-18 参照)ため、
+        // ここでは戻り値の型を変えず(呼び出し側3クレートへの波及を避ける)、
+        // 個別の永続化失敗はエラーとしてログに残すに留める。ただし黙って
+        // `tracing::warn!` するだけだった従来のコミット経路の問題とは異なり、
+        // これはそもそも「1コミット=1操作」という単位を持たないバルク処理
+        // であり、部分失敗時に呼び出し元へエラーを一つだけ返しても
+        // 何行目が失敗したか分からず有用でないため、この境界では変更しない。
         let cols: Vec<(String, ColumnType)> =
             columns.iter().cloned().zip(types.iter().cloned()).collect();
-        self.persist_schema(name, &cols);
+        if let Err(e) = self.persist_schema(name, &cols) {
+            tracing::error!(error = %e, table = name, "ingest_table: schema persist failed");
+        }
         for (pk, row) in &row_map {
-            self.persist_row(name, pk, row);
+            if let Err(e) = self.persist_row(name, pk, row) {
+                tracing::error!(error = %e, table = name, "ingest_table: row persist failed");
+            }
         }
         self.tables.write().insert(
             name.to_string(),
@@ -410,7 +457,7 @@ impl QueryEngine {
         sql: &str,
         commit_message: &str,
     ) -> Result<QueryResponse, String> {
-        self.ensure_idempotency_table();
+        self.ensure_idempotency_table()?;
         let pk = idempotency_key.as_bytes().to_vec();
 
         if let Some(row) = self
@@ -441,7 +488,7 @@ impl QueryEngine {
                 .expect("idempotency table ensured by ensure_idempotency_table");
             t.rows.insert(pk.clone(), row.clone());
         }
-        self.persist_row(IDEMPOTENCY_TABLE, &pk, &row);
+        self.persist_row(IDEMPOTENCY_TABLE, &pk, &row)?;
 
         // Git-on-SQL 監査証跡: 1トランザクション = 1コミット
         let safe_msg = commit_message.replace('\'', "''");
@@ -453,10 +500,10 @@ impl QueryEngine {
         Ok(resp)
     }
 
-    fn ensure_idempotency_table(&self) {
+    fn ensure_idempotency_table(&self) -> Result<(), String> {
         let exists = self.tables.read().contains_key(IDEMPOTENCY_TABLE);
         if exists {
-            return;
+            return Ok(());
         }
         {
             let mut tables = self.tables.write();
@@ -474,22 +521,22 @@ impl QueryEngine {
                 ("key".to_string(), ColumnType::Text),
                 ("result_json".to_string(), ColumnType::Text),
             ],
-        );
+        )
     }
 
     // ── write-through 永続化ヘルパ (txn中は遅延、ストア未設定なら no-op) ──
 
-    fn persist_row(&self, table: &str, pk: &[u8], row: &[String]) {
-        self.record_or_apply(PersistOp::Row(table.to_string(), pk.to_vec(), row.to_vec()));
+    fn persist_row(&self, table: &str, pk: &[u8], row: &[String]) -> Result<(), String> {
+        self.record_or_apply(PersistOp::Row(table.to_string(), pk.to_vec(), row.to_vec()))
     }
-    fn persist_delete(&self, table: &str, pk: &[u8]) {
-        self.record_or_apply(PersistOp::Del(table.to_string(), pk.to_vec()));
+    fn persist_delete(&self, table: &str, pk: &[u8]) -> Result<(), String> {
+        self.record_or_apply(PersistOp::Del(table.to_string(), pk.to_vec()))
     }
-    fn persist_schema(&self, table: &str, cols: &[(String, ColumnType)]) {
-        self.record_or_apply(PersistOp::Schema(table.to_string(), cols.to_vec()));
+    fn persist_schema(&self, table: &str, cols: &[(String, ColumnType)]) -> Result<(), String> {
+        self.record_or_apply(PersistOp::Schema(table.to_string(), cols.to_vec()))
     }
-    fn persist_drop(&self, table: &str) {
-        self.record_or_apply(PersistOp::Drop(table.to_string()));
+    fn persist_drop(&self, table: &str) -> Result<(), String> {
+        self.record_or_apply(PersistOp::Drop(table.to_string()))
     }
 
     // ── DDL/DML ──────────────────────────────────────────────
@@ -507,7 +554,7 @@ impl QueryEngine {
         }
         // write-through: スキーマを即永続化
         let cols: Vec<(String, ColumnType)> = names.into_iter().zip(types).collect();
-        self.persist_schema(&table, &cols);
+        self.persist_schema(&table, &cols)?;
         Ok(QueryResponse::Command {
             tag: "CREATE TABLE".to_string(),
         })
@@ -540,7 +587,7 @@ impl QueryEngine {
             (pk, row)
         };
         // write-through: 行を即永続化
-        self.persist_row(&table, &pk, &row);
+        self.persist_row(&table, &pk, &row)?;
 
         Ok(QueryResponse::Command {
             tag: "INSERT 0 1".to_string(),
@@ -638,7 +685,7 @@ impl QueryEngine {
 
         // write-through: 新規行 or 更新後の行を永続化 (DO NOTHING で既存行を
         // 変更しなかった場合も、再送によるズレを防ぐため現状態を書き直す)
-        self.persist_row(&table, &pk, &final_row);
+        self.persist_row(&table, &pk, &final_row)?;
 
         let tag = if !existed {
             "INSERT 0 1".to_string()
@@ -692,7 +739,7 @@ impl QueryEngine {
 
         // write-through
         for pk in &removed_pks {
-            self.persist_delete(&table, pk);
+            self.persist_delete(&table, pk)?;
         }
         Ok(QueryResponse::Command {
             tag: format!("DELETE {}", removed_pks.len()),
@@ -756,9 +803,9 @@ impl QueryEngine {
         for (old_pk, row) in &updated {
             let new_pk = row.first().cloned().unwrap_or_default().into_bytes();
             if &new_pk != old_pk {
-                self.persist_delete(&table, old_pk);
+                self.persist_delete(&table, old_pk)?;
             }
-            self.persist_row(&table, &new_pk, row);
+            self.persist_row(&table, &new_pk, row)?;
         }
         Ok(QueryResponse::Command {
             tag: format!("UPDATE {}", updated.len()),
@@ -769,7 +816,7 @@ impl QueryEngine {
     fn drop_table(&self, table: String) -> Result<QueryResponse, String> {
         let existed = self.tables.write().remove(&table).is_some();
         if existed {
-            self.persist_drop(&table);
+            self.persist_drop(&table)?;
         }
         Ok(QueryResponse::Command {
             tag: "DROP TABLE".to_string(),
@@ -938,12 +985,37 @@ impl QueryEngine {
 
                 // write-through で各 DML は既に永続化済み。
                 // commit ではバージョン確定後に WAL を同期するだけ。
+                //
+                // **耐久性契約(2026-07-18 修正)**: 以前は WAL 同期
+                // (`store.persist()`) が失敗しても `tracing::warn!` する
+                // だけで、呼び出し元には commit_id 付きの成功応答が
+                // 返っていた——「Git-on-SQL コミットが成功したとDBが
+                // 報告したのに、実際は WAL 同期が失敗していてデータが
+                // 消える可能性がある」という致命的なサイレント耐久性
+                // バグだった。現在は WAL 同期失敗を `Err` として呼び出し
+                // 元へ伝播させ、この `aruaru_commit` 呼び出し自体を
+                // 失敗として扱う。
+                //
+                // **既知の限界**: `self.version.commit(...)` (上の行) は
+                // この WAL 同期より前に成功しているため、WAL 同期だけが
+                // 失敗した場合、VersionController 側には既にコミット
+                // レコードが残る(Git-on-SQL のコミットログ自体を巻き戻す
+                // "uncommit" API は現状存在しない)。つまり `aruaru_log`
+                // には現れるが、対応する行データの永続化は保証されない
+                // コミットが残り得る、という非対称性が残る。これは
+                // MVCCのような大規模な再設計を要するため今回は対応せず、
+                // 既知の限界として記録する(呼び出し元がこの `Err` を
+                // 見て「コミットは失敗した」と正しく扱うことが最優先の
+                // 修正であり、それは達成されている)。
                 if let Some(store) = self.persistent.read().clone() {
                     if let Err(e) = store.persist() {
-                        tracing::warn!(error = %e, "WAL sync on commit failed");
-                    } else {
-                        tracing::debug!(commit = %commit_id.short(), "persisted (synced) on commit");
+                        tracing::error!(error = %e, commit = %commit_id.short(), "WAL sync on commit failed; reporting commit as failed");
+                        return Err(format!(
+                            "aruaru_commit failed: WAL sync failed after version commit {}: {e}",
+                            commit_id.short()
+                        ));
                     }
+                    tracing::debug!(commit = %commit_id.short(), "persisted (synced) on commit");
                 }
 
                 Ok(QueryResponse::Rows {
