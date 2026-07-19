@@ -168,7 +168,7 @@ AI機能が必要になった場合は、`open-cuda` + `aruaru-llm` のSET構成
 ## 関連プロジェクト
 
 - **poem-cosmo-tauri**(open-runoと同時並行開発。実装の先行地点。Pure Rust
-  + tokio/hyper直接実装): https://github.com/aon-co-jp/poem-cosmo-tauri
+  + tokio/hyper直接実装): https://github.com/aon-co-jp/RPoem
 - **open-runo**: https://github.com/aon-co-jp/open-runo
 - **open-web-server**: https://github.com/aon-co-jp/open-web-server
 - **aruaru-db**(このリポジトリ): https://github.com/aon-co-jp/aruaru-db
