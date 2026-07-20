@@ -100,6 +100,50 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!(error = %e, path = %cli.data, "could not open persistent store (in-memory only)"),
     }
 
+    // ── DUAL DATABASE構成: aruaru-db × 実PostgreSQL(2026-07-20追記) ──
+    // `DUAL_DATABASE_URL` 環境変数(未設定時はミラー無効、既存動作を
+    // 変えない)。commit_hookはfire-and-forget(`tokio::spawn`)であり、
+    // `aruaru_query::engine::QueryEngine::set_commit_hook`のdocに記載の
+    // 通り、真の同期ポリシーからの意図的な逸脱である(engineのasync化を
+    // 要する将来課題)。ミラー失敗はcommit自体の成功/失敗に影響しない。
+    if let Ok(dual_db_url) = std::env::var("DUAL_DATABASE_URL") {
+        match sqlx::PgPool::connect(&dual_db_url).await {
+            Ok(pool) => {
+                let mirror = std::sync::Arc::new(aruaru_dist::DualDatabaseMirror::new(pool));
+                match mirror.ensure_schema().await {
+                    Ok(()) => {
+                        tracing::info!("DUAL DATABASE: PostgreSQL mirror schema ready");
+                        let mirror_for_hook = mirror.clone();
+                        engine.set_commit_hook(std::sync::Arc::new(move |commit_id: &str, rows: &[(String, String, String)]| {
+                            let mirror = mirror_for_hook.clone();
+                            let commit_id = commit_id.to_string();
+                            let rows = rows.to_vec();
+                            tokio::spawn(async move {
+                                for (table_name, row_key, payload_json) in rows {
+                                    let mutation = aruaru_dist::MirroredMutation {
+                                        table_name,
+                                        row_key,
+                                        payload_json,
+                                        commit_id: commit_id.clone(),
+                                        committed_at: chrono::Utc::now(),
+                                    };
+                                    if let Err(e) = mirror.mirror(&mutation).await {
+                                        tracing::error!(error = %e, commit = %commit_id, "DUAL DATABASE mirror failed for this commit's row (aruaru-db commit itself is unaffected)");
+                                    }
+                                }
+                            });
+                        }));
+                        tracing::info!("DUAL DATABASE: commit hook registered (aruaru-db -> PostgreSQL mirror)");
+                    }
+                    Err(e) => tracing::error!(error = %e, "DUAL DATABASE: ensure_schema failed; mirror disabled"),
+                }
+            }
+            Err(e) => tracing::error!(error = %e, url = %dual_db_url, "DUAL DATABASE: failed to connect to PostgreSQL; mirror disabled"),
+        }
+    } else {
+        tracing::debug!("DUAL_DATABASE_URL not set; DUAL DATABASE mirror disabled");
+    }
+
     // ── バックアップエンジン (ローカル: <data>/backups) ────────
     let backup_config = aruaru_backup::BackupConfig {
         destination: aruaru_backup::BackupDestination::Local {

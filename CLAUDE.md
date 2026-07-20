@@ -291,6 +291,43 @@ AI機能が必要になった場合は、`open-cuda` + `aruaru-llm` のSET構成
 
 ## 現状(このリポジトリ固有)・重要な引き継ぎ事項
 
+- **2026-07-20(2) DUAL DATABASEミラーを`aruaru-server`の実コミットパスへ配線
+  — 前回HANDOFFの次回候補(a)(b)を実施**: `aruaru_query::QueryEngine`に
+  `commit_hook`(`set_commit_hook`)を新設し、`aruaru_commit`成功直後に
+  `(commit_id, 全テーブルの現在行(table_name, row_key, payload_json))`で
+  同期・非ブロッキングに呼ばれるようにした。`aruaru-server/src/main.rs`は
+  起動時に環境変数`DUAL_DATABASE_URL`が設定されていれば実PostgreSQLへ
+  接続・`ensure_schema()`した上でこのフックを登録し、以後すべての
+  `aruaru_commit`(pgwire経由・GraphQL経由・migrate_run経由いずれも)で
+  `DualDatabaseMirror`への書き込みが自動的に発生するようになった
+  (未設定時はこれまで通りミラー無効、既存動作は一切変わらない)。
+  - **正直な開示(重要な設計上のトレードオフ)**: フック自体は
+    `tokio::spawn`によるfire-and-forgetであり、`open-web-server-ledger::
+    multi_region`が定めた「全レグの完了を待ってから呼び出し元に返す」
+    という厳密な同期ポリシーからの**意図的な逸脱**である。理由は
+    `QueryEngine::execute`が同期関数でありpgwireの同期経路からも呼ばれる
+    ため、フック内で`block_on`すると`Cannot start a runtime from within a
+    runtime`のデッドロック/パニックリスクがあるため。詳細な設計判断は
+    `crates/aruaru-query/src/engine.rs`の`set_commit_hook`docコメントに
+    記載。将来`execute`自体をasync化する際は、この逸脱を解消し真の
+    同期ミラーへ格上げすることが望ましい。
+  - **粒度**: 変更行のみの差分抽出ではなく、コミット時点の全テーブル
+    全行を毎回書き出す(`export_all_rows_as_json`)。`aruaru_commit`
+    自体が全テーブルを1つのProlly Treeへスナップショットする設計
+    (`snapshot_root`)と同じ粒度であり、`aruaru-backup`のフルダンプ方式
+    と同じ既知の限界(将来、真の差分抽出への最適化余地あり)。
+  - **検証**: `commit_hook_fires_with_commit_id_and_current_rows`/
+    `commit_without_hook_registered_still_succeeds`(`aruaru-query`、
+    新規2件)、`cargo build -p aruaru-server`成功(既存の無関係な
+    dead_code警告1件のみ)、`cargo test --workspace`全green。実
+    PostgreSQLへの到達確認はこの開発環境では引き続き未実施
+    (`DATABASE_URL`/`DUAL_DATABASE_URL`いずれも到達可能なPostgreSQLが
+    無いため——前回HANDOFFと同じ既知の制約)。
+  - 次回以降の候補: (a) 実PostgreSQL/Docker環境での`DUAL_DATABASE_URL`
+    起動確認・`--ignored`統合テスト実行、(b) fire-and-forgetから真の
+    同期ミラーへの格上げ(`execute`のasync化を要する大規模な設計変更)、
+    (c) 全行ダンプから差分抽出への最適化。
+
 - **2026-07-20 DUAL DATABASE構成(aruaru-db × PostgreSQL)を新規実装
   — 拡張要件(4)「DB書き込みの四重化」の②、`open-web-server-ledger`
   (①PostgreSQL WAL・③マルチリージョン・④監査ログ)と対になる本リポジトリ側の
