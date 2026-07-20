@@ -80,6 +80,12 @@ struct TxnState {
 const IDEMPOTENCY_TABLE: &str = "__idempotency_log";
 
 /// クエリエンジン
+/// `aruaru_commit`成功直後に、確定したcommit_idと全テーブルの現在の
+/// 行データ(table_name, row_key, payload_json)を受け取るフック。
+/// DUAL DATABASE構成(`aruaru_dist::dual_database`)のPostgreSQLミラーへ
+/// 配線するために使う(2026-07-20追記、下記`set_commit_hook`のdocも参照)。
+pub type CommitHook = dyn Fn(&str, &[(String, String, String)]) + Send + Sync;
+
 pub struct QueryEngine {
     tables: RwLock<BTreeMap<String, TableData>>,
     store: Arc<NodeStore>,
@@ -88,6 +94,10 @@ pub struct QueryEngine {
     persistent: RwLock<Option<Arc<aruaru_core::PersistentStore>>>,
     /// アクティブなトランザクション (単一・直列化。None = autocommit)
     txn: parking_lot::Mutex<Option<TxnState>>,
+    /// commit完了フック(DUAL DATABASEミラー等)。`RaftNode::set_commit_hook`
+    /// と同じ設計判断: フック未登録時は何もしない、フック失敗が
+    /// `aruaru_commit`自体の成功/失敗に影響しない(下記ドキュメント参照)。
+    commit_hook: RwLock<Option<Arc<CommitHook>>>,
 }
 
 impl QueryEngine {
@@ -98,6 +108,7 @@ impl QueryEngine {
             version: Arc::new(VersionController::new()),
             persistent: RwLock::new(None),
             txn: parking_lot::Mutex::new(None),
+            commit_hook: RwLock::new(None),
         }
     }
 
@@ -109,12 +120,34 @@ impl QueryEngine {
             version,
             persistent: RwLock::new(None),
             txn: parking_lot::Mutex::new(None),
+            commit_hook: RwLock::new(None),
         }
     }
 
     /// 永続ストアを取り付ける。以後 aruaru_commit ごとに自動で persist する。
     pub fn attach_store(&self, store: Arc<aruaru_core::PersistentStore>) {
         *self.persistent.write() = Some(store);
+    }
+
+    /// commit完了フックを登録する(DUAL DATABASEミラー等、2026-07-20追記)。
+    ///
+    /// **設計上の注意(正直な開示)**: `QueryEngine::execute`は同期関数
+    /// であり、pgwire(`aruaru-wire`)の同期経路からも呼ばれる。フック自体を
+    /// 非同期I/O(実PostgreSQLへのINSERT等)でブロックさせると、tokio
+    /// ランタイムのワーカースレッド上で`block_on`することになり
+    /// デッドロック/パニックのリスクがある(`Cannot start a runtime from
+    /// within a runtime`)。そのためこのフックは**同期・非ブロッキング**
+    /// であることが呼び出し契約 —— 実際に非同期I/Oを行う場合は、フック
+    /// 内部で`tokio::spawn`する(呼び出し元が`#[tokio::main]`のランタイム
+    /// 上で動いていることを前提とする、fire-and-forget)。これは
+    /// `open-web-server-ledger::multi_region`が定めた「全レグの完了を
+    /// 待ってから呼び出し元に返す」という厳密な同期ポリシーからの
+    /// **意図的な逸脱**である(engineをasync化する大掛かりなリファクタ
+    /// なしに両立できないため)。ミラー失敗はcommit自体の成功/失敗には
+    /// 影響しない(`tracing::error!`のみ)。将来`execute`をasync化する
+    /// 際は、この逸脱を解消し真の同期ミラーへ格上げすることが望ましい。
+    pub fn set_commit_hook(&self, hook: Arc<CommitHook>) {
+        *self.commit_hook.write() = Some(hook);
     }
 
     /// トランザクション中か
@@ -342,6 +375,33 @@ impl QueryEngine {
                 (name.clone(), cols, rows)
             })
             .collect()
+    }
+
+    /// 全テーブルの全行を `(table_name, row_key, payload_json)` の形で書き出す。
+    /// DUAL DATABASEミラー(コミットフック)向け(2026-07-20追記)。
+    ///
+    /// **正直な開示**: `aruaru_commit`は全テーブルを1つのProlly Treeへ
+    /// スナップショットする設計(`snapshot_root`)のため、この書き出しも
+    /// 同じ粒度(コミット時点の全行)であり、当該コミットで実際に変更された
+    /// 行だけへの差分抽出ではない。`aruaru-backup`のフルダンプ方式と同じ
+    /// 既知の限界(将来、真の差分抽出に最適化する余地がある)。
+    fn export_all_rows_as_json(&self) -> Vec<(String, String, String)> {
+        let tables = self.tables.read();
+        let mut out = Vec::new();
+        for (table_name, t) in tables.iter() {
+            for (pk, row) in &t.rows {
+                let obj: serde_json::Map<String, serde_json::Value> = t
+                    .columns
+                    .iter()
+                    .zip(row.iter())
+                    .map(|(col, val)| (col.clone(), serde_json::Value::String(val.clone())))
+                    .collect();
+                let payload_json = serde_json::Value::Object(obj).to_string();
+                let row_key = String::from_utf8_lossy(pk).into_owned();
+                out.push((table_name.clone(), row_key, payload_json));
+            }
+        }
+        out
     }
 
     /// HTAP ルーティング付き実行。
@@ -1018,6 +1078,11 @@ impl QueryEngine {
                     tracing::debug!(commit = %commit_id.short(), "persisted (synced) on commit");
                 }
 
+                if let Some(hook) = self.commit_hook.read().clone() {
+                    let rows = self.export_all_rows_as_json();
+                    hook(commit_id.as_str(), &rows);
+                }
+
                 Ok(QueryResponse::Rows {
                     columns: vec!["aruaru_commit".into()],
                     rows: vec![vec![Value::Text(commit_id.as_str().to_string())]],
@@ -1112,6 +1177,47 @@ mod tests {
         } else {
             panic!("expected rows");
         }
+    }
+
+    /// DUAL DATABASEミラー配線(2026-07-20追記)の土台となるcommit_hookが、
+    /// 実際にcommit成功直後に正しい commit_id と行データで呼ばれることを検証する。
+    #[test]
+    fn commit_hook_fires_with_commit_id_and_current_rows() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE items (id TEXT, qty TEXT)").unwrap();
+        eng.execute("INSERT INTO items (id, qty) VALUES ('sword', '1')").unwrap();
+
+        let captured: Arc<parking_lot::Mutex<Option<(String, Vec<(String, String, String)>)>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let captured_clone = captured.clone();
+        eng.set_commit_hook(Arc::new(move |commit_id, rows| {
+            *captured_clone.lock() = Some((commit_id.to_string(), rows.to_vec()));
+        }));
+
+        let resp = eng.execute("SELECT aruaru_commit('add sword')").unwrap();
+        let commit_id = match resp {
+            QueryResponse::Rows { rows, .. } => match &rows[0][0] {
+                Value::Text(s) => s.clone(),
+                _ => panic!("expected commit id text"),
+            },
+            _ => panic!("expected rows"),
+        };
+
+        let (hook_commit_id, hook_rows) = captured.lock().take().expect("hook should have fired");
+        assert_eq!(hook_commit_id, commit_id);
+        assert_eq!(hook_rows.len(), 1);
+        assert_eq!(hook_rows[0].0, "items");
+        assert_eq!(hook_rows[0].1, "sword");
+        assert!(hook_rows[0].2.contains("\"qty\":\"1\""));
+    }
+
+    /// フック未登録時は何もしない(既存の`commit`動作を一切変えないことを保証)。
+    #[test]
+    fn commit_without_hook_registered_still_succeeds() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE t (id TEXT)").unwrap();
+        eng.execute("INSERT INTO t (id) VALUES ('x')").unwrap();
+        assert!(eng.execute("SELECT aruaru_commit('no hook')").is_ok());
     }
 
     /// VersionLessAPI + Git版管理ハイブリッドの読み出し側 (open-web-server/
