@@ -291,6 +291,42 @@ AI機能が必要になった場合は、`open-cuda` + `aruaru-llm` のSET構成
 
 ## 現状(このリポジトリ固有)・重要な引き継ぎ事項
 
+- **2026-07-20(3) DUAL DATABASE構成を実PostgreSQLで一気通貫検証(前回HANDOFFの
+  次回候補(a)を完了)**: この開発環境にDockerは無いが、WSL2に実
+  PostgreSQL 18(`apt`パッケージ、`sudo`パスワード不要な`wsl -u root`
+  経由)が導入済みと判明したため、それを使って実接続検証を行った
+  (推測・型チェックのみでの「検証済み」報告ではない)。
+  1. `cargo test -p aruaru-dist -- --ignored`を実WSL2 PostgreSQLへの
+     `DATABASE_URL`付きで実行 → **green**(`mirror_then_latest_and_
+     at_commit_round_trip_against_real_postgres`)。
+  2. 実`aruaru-server.exe`を`DUAL_DATABASE_URL`(WSL2 PostgreSQL、
+     ミラー先DB)+`ARUARU_USERS`(pgwire SCRAM認証用)を設定して起動し、
+     WSL2側の`psql`から**WindowsホストのIP(WSLのデフォルトゲートウェイ)
+     経由でpgwire(:15434)へ実接続**、`CREATE TABLE`→`INSERT`→
+     `SELECT aruaru_commit(...)`を実行。
+  3. 1回目コミット(`qty=1`)・2回目コミット(`UPDATE`→`qty=5`で再コミット)
+     を発行し、`fire-and-forget`のミラーが両方とも別プロセスの実
+     PostgreSQL(`aruaru_dual_mirror`テーブル)へ到達していることを
+     `psql`で直接確認。**VersionlessAPI**(`ORDER BY committed_at DESC
+     LIMIT 1`)が最新値`qty=5`を返すこと、**Git版管理**
+     (`WHERE commit_id = '<1回目のcommit_id>'`)が過去値`qty=1`を
+     返すこと(最新に上書きされていない)の両方を実データで確認した。
+  - **正直な開示**: (a) この検証はDockerではなくWSL2ネイティブ
+    PostgreSQLを使った(この環境にDockerが存在しないため)。手順自体は
+    Docker Composeでも同様に再現可能なはずだが、Docker環境そのものでの
+    確認ではない。(b) fire-and-forgetの非同期タイミング依存のため、
+    `psql`での確認前に`sleep 2`を挟んだ(ミラーが即座ではなく数十〜数百
+    ミリ秒後に反映される設計上の性質であり、バグではない——
+    `set_commit_hook`のdoc参照)。(c) 検証後、起動していた
+    `aruaru-server.exe`プロセス・一時データディレクトリ・検証用
+    PostgreSQLデータベース(`aruaru_dual_test`/`aruaru_dual_live`)は
+    このマシンに残したまま(次回セッションでの再検証に使える。不要になれば
+    `DROP DATABASE`で削除してよい)。
+  - 次回以降の候補: (a) fire-and-forgetから真の同期ミラーへの格上げ
+    (`execute`のasync化)、(b) 全行ダンプから差分抽出への最適化、(c) 本番
+    運用を見据えた`DUAL_DATABASE_URL`のTLS化・認証情報の秘匿(現状は
+    環境変数に平文、開発検証用としては妥当)。
+
 - **2026-07-20(2) DUAL DATABASEミラーを`aruaru-server`の実コミットパスへ配線
   — 前回HANDOFFの次回候補(a)(b)を実施**: `aruaru_query::QueryEngine`に
   `commit_hook`(`set_commit_hook`)を新設し、`aruaru_commit`成功直後に
