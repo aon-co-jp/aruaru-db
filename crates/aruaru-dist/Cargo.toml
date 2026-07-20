@@ -20,6 +20,13 @@ uuid.workspace = true
 async-trait   = "0.1"
 reqwest.workspace = true
 futures.workspace = true
+sha2.workspace = true
+hex.workspace = true
+# DUAL DATABASE構成(aruaru-db x PostgreSQL、`open-web-server/CLAUDE.md`
+# 拡張要件(4)「DB書き込みの四重化」の②。open-web-server-ledgerの
+# postgres_wal.rs(①)と同じ`sqlx`postgres featureを使う。
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono"] }
+chrono.workspace = true
 # aruaru-db commit x open-raid-z スナップショット連携(`open_raid_z` feature
 # 有効時のみ)。別Cargoワークスペースへの path 依存であり、
 # `default-features = false` により WinFsp/dxc/Windows SDK は不要

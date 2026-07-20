@@ -291,6 +291,47 @@ AI機能が必要になった場合は、`open-cuda` + `aruaru-llm` のSET構成
 
 ## 現状(このリポジトリ固有)・重要な引き継ぎ事項
 
+- **2026-07-20 DUAL DATABASE構成(aruaru-db × PostgreSQL)を新規実装
+  — 拡張要件(4)「DB書き込みの四重化」の②、`open-web-server-ledger`
+  (①PostgreSQL WAL・③マルチリージョン・④監査ログ)と対になる本リポジトリ側の
+  責務**: `crates/aruaru-dist/src/dual_database.rs`を新設。
+  - `DualDatabaseMirror::mirror()`が、aruaru-db側で既に確定した
+    ミューテーション(`MirroredMutation`: table_name/row_key/payload_json/
+    commit_id/committed_at)を実PostgreSQLへ**同期的に**ミラーする
+    (`open-web-server-ledger::multi_region`と同じ「全レグの完了を待って
+    から呼び出し元に返す」判断——金融データにeventual consistencyは
+    許されないという既存方針の踏襲)。
+  - **VersionlessAPI + Git版管理の両立**: ミラー先テーブルは
+    `(table_name, row_key, commit_id)`を保持し、`latest()`は
+    `committed_at DESC LIMIT 1`で「バージョンレス」な最新値、
+    `at_commit()`は`commit_id`一致行で「特定コミット時点」の値を返す
+    ——aruaru-db本体の`SELECT ... AS OF COMMIT`(2026-07-13実装済み)と
+    同じ意味論を、ミラー先のPostgreSQL単体からも再現できる。
+  - **冪等性**: `idempotency_key`(`SHA-256(table_name\0row_key\0
+    commit_id)`)に一意制約を張り`INSERT ... ON CONFLICT DO NOTHING`
+    (`postgres_wal.rs`/`multi_region.rs`と同じ形状)。
+  - **正直な開示**: (a) 実PostgreSQL接続での検証は未実施(この開発環境に
+    到達可能なPostgreSQLが無いため、`postgres_wal.rs`と同じ既知の制約)
+    ——SQL文字列・冪等性キー導出ロジックの単体テスト8件(オフラインで
+    検証可能な範囲)と、`DATABASE_URL`環境変数がある場合のみ動く
+    `#[ignore]`統合テスト1件の2段構え。(b) aruaru-db側のコミットと
+    PostgreSQL側のミラーは独立操作であり、真の2フェーズコミットでは
+    ない(`mirror()`失敗時にaruaru-db側をロールバックする手段は無い
+    ——`multi_region.rs`と同じスコープの限界、失敗は`DualDatabaseError`
+    で呼び出し側へ返す設計)。(c) `DualDatabaseMirror`をどこから
+    呼び出すか(`aruaru-server`のコミットパスへの実配線)は今回未実施
+    ——このパスは`aruaru-dist`内の独立コンポーネントとしての実装に
+    留めた(`snapshot_pairing`/`raid_z_backend`と同じ、まず疎結合な
+    コンポーネントとして実装してから呼び出し元へ配線する既存の
+    段階的アプローチ)。
+  - **検証**: `cargo test -p aruaru-dist`(26 passed, 1 ignored)、
+    `cargo test --workspace`引き続きgreen。
+  - 次回以降の候補: (a) `aruaru-server`のコミットパス(`admin.rs`の
+    `SELECT aruaru_commit(...)`実行後)から`DualDatabaseMirror::mirror()`
+    を呼ぶ実配線、(b) 環境変数(`DUAL_DATABASE_URL`等)経由でのPostgreSQL
+    接続先設定・起動時`ensure_schema()`呼び出し、(c) 実PostgreSQL/Docker
+    が使える環境での`--ignored`統合テスト実行確認。
+
 - **2026-07-18 `propose_commit`未使用警告を調査(コード変更は見送り、
   無人自動開発中の判断)**: `cargo build --workspace`のdead_code警告
   (`crates/aruaru-server/src/cluster.rs`の`propose_commit`が未使用)を
