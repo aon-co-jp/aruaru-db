@@ -291,6 +291,44 @@ AI機能が必要になった場合は、`open-cuda` + `aruaru-llm` のSET構成
 
 ## 現状(このリポジトリ固有)・重要な引き継ぎ事項
 
+- **2026-07-20(4) DUAL DATABASEミラーを全行ダンプ→差分抽出へ最適化
+  (前回HANDOFFの次回候補(b)を完了)**: `aruaru_query::QueryEngine`に
+  `dirty: RwLock<BTreeSet<(String, Vec<u8>)>>`を新設し、`persist_row`
+  (INSERT/UPSERT/UPDATEの単一集約点)で書き込みのたびに`(table, pk)`を
+  記録するようにした。`aruaru_commit`成功時、従来の
+  `export_all_rows_as_json`(常に全テーブル全行を書き出す)を
+  `export_dirty_rows_as_json`に置き換え——dirty集合の中身だけを
+  ミラーへ渡し、呼び出し後に集合を`std::mem::take`でクリアする。
+  - **未登録時のメモリリーク回避**: 当初、dirty集合のクリアを
+    `if let Some(hook) = ...`ブロック内(=フック登録時のみ)に置いて
+    いたが、`DUAL_DATABASE_URL`未設定でフックが無い環境では
+    コミットのたびに集合が際限なく肥大化する実バグになると気づき、
+    フックの有無によらず毎コミット必ずクリアする形に修正した。
+  - **既知の限界(正直な開示)**: (a) `persist_delete`(DELETE文)は
+    dirty集合に追加しない——現行の`MirroredMutation`は「値」を運ぶ
+    形で削除(tombstone)を表現できないため、対応するには将来
+    スキーマ拡張が必要(課金アイテム付与のような追記型ワークロードを
+    主眼とした設計判断)。(b) `load_from`(fjallからの起動時復元)も
+    `persist_row`経由でdirty集合に加わるため、再起動後の最初の
+    `aruaru_commit`は復元した全行を(実際には無変更でも)再送する
+    フルダンプ相当になる——安全側(過剰送信はデータ欠落より無害)に
+    倒した意図的な設計。
+  - **検証**: `commit_hook_only_receives_rows_changed_since_previous_
+    commit`(新規、2回目のコミットで無関係な行が再送されないこと・
+    3回目の無変更コミットで空になることを実証)を含む
+    `cargo test -p aruaru-query`(41件)・`cargo test --workspace`
+    全green。さらにWSL2の実PostgreSQL(`aruaru_dual_diff_test`
+    データベース)に対し`cargo test -p aruaru-dist -- --ignored`
+    (実DB往復テスト)を再実行しgreenを確認、加えて実`aruaru-server`
+    バイナリを`DUAL_DATABASE_URL`付きで起動しpgwire経由で複数回
+    コミットを発行、ミラー先PostgreSQLの`aruaru_dual_mirror`テーブルの
+    行数増分が「今回変更した行数」と一致し、無関係な既存行が重複挿入
+    されないことを`psql`で直接確認した(型チェックのみでの完了報告
+    ではない)。
+  - 次回以降の候補: (a) fire-and-forgetから真の同期ミラーへの格上げ
+    (`execute`のasync化)、(b) 削除(tombstone)のミラー伝播対応、
+    (c) 本番運用を見据えた`DUAL_DATABASE_URL`のTLS化・認証情報の秘匿。
+
 - **2026-07-20(3) DUAL DATABASE構成を実PostgreSQLで一気通貫検証(前回HANDOFFの
   次回候補(a)を完了)**: この開発環境にDockerは無いが、WSL2に実
   PostgreSQL 18(`apt`パッケージ、`sudo`パスワード不要な`wsl -u root`
@@ -789,3 +827,13 @@ open-web-serverがApache＋Nginxのハイブリッド仕様のWebサーバーと
 ミッションクリティカルな用途向けに、24時間365日ノンストップの
 サーバー対応WEBサイト開発を全面的にバックアップするフレームワーク・
 ミドルウェアとして機能することを目指す。
+---
+
+## エコシステム全体マップ(2026-07-21追記)
+
+同時並行開発の対象プロジェクト一覧・各リポジトリの現況は
+[`open-raid-z`のCLAUDE.md](https://github.com/aon-co-jp/open-raid-z/blob/main/CLAUDE.md)
+「関連プロジェクト」節を参照。**どのリポジトリから読み始めても、
+この節を起点に他プロジェクトへ辿れる**ようにしてある(新規追加:
+RGit・RJSON・RS-Chiketto・RS-Blog・RS-EC。このリポジトリ自身の状況は
+このファイルの他の節・HANDOFFを参照)。

@@ -98,6 +98,15 @@ pub struct QueryEngine {
     /// と同じ設計判断: フック未登録時は何もしない、フック失敗が
     /// `aruaru_commit`自体の成功/失敗に影響しない(下記ドキュメント参照)。
     commit_hook: RwLock<Option<Arc<CommitHook>>>,
+    /// 直前の`aruaru_commit`以降に書き込まれた`(table, pk)`の集合
+    /// (2026-07-20追記、DUAL DATABASEミラーの全行ダンプ→差分抽出
+    /// 最適化)。`persist_row`で書き込みのたびに追加し、`aruaru_commit`
+    /// 成功時にこの集合だけをコミットフックへ渡した上でクリアする。
+    /// 削除(`persist_delete`)はこの集合には追加しない——現行の
+    /// `MirroredMutation`スキーマは「値」を運ぶ形であり削除(tombstone)を
+    /// 表現できないため、削除された行がこの集合だけから復元しようとしても
+    /// 存在しない値になる(既知の限界、`export_dirty_rows_as_json`のdoc参照)。
+    dirty: RwLock<std::collections::BTreeSet<(String, Vec<u8>)>>,
 }
 
 impl QueryEngine {
@@ -109,6 +118,7 @@ impl QueryEngine {
             persistent: RwLock::new(None),
             txn: parking_lot::Mutex::new(None),
             commit_hook: RwLock::new(None),
+            dirty: RwLock::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -121,6 +131,7 @@ impl QueryEngine {
             persistent: RwLock::new(None),
             txn: parking_lot::Mutex::new(None),
             commit_hook: RwLock::new(None),
+            dirty: RwLock::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -380,11 +391,11 @@ impl QueryEngine {
     /// 全テーブルの全行を `(table_name, row_key, payload_json)` の形で書き出す。
     /// DUAL DATABASEミラー(コミットフック)向け(2026-07-20追記)。
     ///
-    /// **正直な開示**: `aruaru_commit`は全テーブルを1つのProlly Treeへ
-    /// スナップショットする設計(`snapshot_root`)のため、この書き出しも
-    /// 同じ粒度(コミット時点の全行)であり、当該コミットで実際に変更された
-    /// 行だけへの差分抽出ではない。`aruaru-backup`のフルダンプ方式と同じ
-    /// 既知の限界(将来、真の差分抽出に最適化する余地がある)。
+    /// 現在は[`export_dirty_rows_as_json`]に置き換わり通常経路では呼ばれない
+    /// (差分抽出への最適化、下記参照)。差分追跡が信頼できない状況
+    /// (将来的な用途を想定し、削除はしていない)向けのフルダンプ手段として
+    /// 残してある。
+    #[allow(dead_code)]
     fn export_all_rows_as_json(&self) -> Vec<(String, String, String)> {
         let tables = self.tables.read();
         let mut out = Vec::new();
@@ -400,6 +411,49 @@ impl QueryEngine {
                 let row_key = String::from_utf8_lossy(pk).into_owned();
                 out.push((table_name.clone(), row_key, payload_json));
             }
+        }
+        out
+    }
+
+    /// 直前の`aruaru_commit`以降に実際に書き込まれた行だけを
+    /// `(table_name, row_key, payload_json)`の形で書き出し、dirty集合を
+    /// クリアする。DUAL DATABASEミラー(コミットフック)向け
+    /// (2026-07-20追記、[`export_all_rows_as_json`]の全行ダンプ方式からの
+    /// 最適化——コミットのたびにテーブル全体を送っていた無駄を解消する)。
+    ///
+    /// **正直な開示(既知の限界)**:
+    /// 1. **削除は反映されない**: `persist_delete`はdirty集合に追加しない。
+    ///    現行の`MirroredMutation`スキーマは「値」を運ぶ形であり、削除
+    ///    (tombstone)を表現する列が無いため——削除された行のキーだけを
+    ///    ミラーへ送っても、ミラー側は最後にINSERTされた値をそのまま
+    ///    「最新値」として返し続けてしまう(削除がミラーに伝播しない)。
+    ///    真に対応するには`MirroredMutation`にtombstoneフラグの追加が必要
+    ///    (将来の増分、現状は削除を伴わないワークロード——課金アイテム
+    ///    付与のような追記型データ——を主眼とする設計判断)。
+    /// 2. **起動直後の初回コミットはフルダンプ相当になる**: `load_from`
+    ///    (fjallからの復元)も`persist_row`経由でdirty集合に追加されるため、
+    ///    再起動後の最初の`aruaru_commit`では復元した全行が(実際には
+    ///    変更されていなくても)ミラーへ再送される。安全側(過剰送信は
+    ///    データ欠落より無害)に倒した意図的な設計。
+    fn export_dirty_rows_as_json(&self) -> Vec<(String, String, String)> {
+        let dirty = std::mem::take(&mut *self.dirty.write());
+        if dirty.is_empty() {
+            return Vec::new();
+        }
+        let tables = self.tables.read();
+        let mut out = Vec::with_capacity(dirty.len());
+        for (table_name, pk) in dirty {
+            let Some(t) = tables.get(&table_name) else { continue };
+            let Some(row) = t.rows.get(&pk) else { continue };
+            let obj: serde_json::Map<String, serde_json::Value> = t
+                .columns
+                .iter()
+                .zip(row.iter())
+                .map(|(col, val)| (col.clone(), serde_json::Value::String(val.clone())))
+                .collect();
+            let payload_json = serde_json::Value::Object(obj).to_string();
+            let row_key = String::from_utf8_lossy(&pk).into_owned();
+            out.push((table_name, row_key, payload_json));
         }
         out
     }
@@ -587,6 +641,7 @@ impl QueryEngine {
     // ── write-through 永続化ヘルパ (txn中は遅延、ストア未設定なら no-op) ──
 
     fn persist_row(&self, table: &str, pk: &[u8], row: &[String]) -> Result<(), String> {
+        self.dirty.write().insert((table.to_string(), pk.to_vec()));
         self.record_or_apply(PersistOp::Row(table.to_string(), pk.to_vec(), row.to_vec()))
     }
     fn persist_delete(&self, table: &str, pk: &[u8]) -> Result<(), String> {
@@ -1078,9 +1133,13 @@ impl QueryEngine {
                     tracing::debug!(commit = %commit_id.short(), "persisted (synced) on commit");
                 }
 
+                // dirty集合は登録済みフックの有無によらず必ずクリアする
+                // (`export_dirty_rows_as_json`が内部で`take`する)——フック
+                // 未登録のままだとdirty集合がコミットのたびに際限なく
+                // 肥大化してしまうメモリリークを防ぐため。
+                let dirty_rows = self.export_dirty_rows_as_json();
                 if let Some(hook) = self.commit_hook.read().clone() {
-                    let rows = self.export_all_rows_as_json();
-                    hook(commit_id.as_str(), &rows);
+                    hook(commit_id.as_str(), &dirty_rows);
                 }
 
                 Ok(QueryResponse::Rows {
@@ -1218,6 +1277,43 @@ mod tests {
         eng.execute("CREATE TABLE t (id TEXT)").unwrap();
         eng.execute("INSERT INTO t (id) VALUES ('x')").unwrap();
         assert!(eng.execute("SELECT aruaru_commit('no hook')").is_ok());
+    }
+
+    /// DUAL DATABASEミラーの最適化(全行ダンプ→差分抽出、2026-07-20追記):
+    /// 2回目以降のコミットでは、その間に変更した行だけがフックへ渡り、
+    /// 1回目のコミットで既に確定していた無関係な行は再送されないことを検証。
+    #[test]
+    fn commit_hook_only_receives_rows_changed_since_previous_commit() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE items (id TEXT, qty TEXT)").unwrap();
+        eng.execute("INSERT INTO items (id, qty) VALUES ('sword', '1')").unwrap();
+        eng.execute("INSERT INTO items (id, qty) VALUES ('shield', '1')").unwrap();
+
+        let captured: Arc<parking_lot::Mutex<Vec<(String, String, String)>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        eng.set_commit_hook(Arc::new(move |_commit_id, rows| {
+            *captured_clone.lock() = rows.to_vec();
+        }));
+
+        // 1回目のコミット: 2行とも新規なので両方渡ってくる。
+        eng.execute("SELECT aruaru_commit('initial two items')").unwrap();
+        let first_rows = captured.lock().clone();
+        assert_eq!(first_rows.len(), 2);
+
+        // 2回目のコミットまでに sword だけを更新。shield は無変更のまま。
+        eng.execute("UPDATE items SET qty = '9' WHERE id = 'sword'").unwrap();
+        eng.execute("SELECT aruaru_commit('sword restocked')").unwrap();
+
+        let second_rows = captured.lock().clone();
+        assert_eq!(second_rows.len(), 1, "only the changed row should be mirrored, not a full re-dump");
+        assert_eq!(second_rows[0].0, "items");
+        assert_eq!(second_rows[0].1, "sword");
+        assert!(second_rows[0].2.contains("\"qty\":\"9\""));
+
+        // 3回目: 何も変更していなければ空。
+        eng.execute("SELECT aruaru_commit('no-op commit')").unwrap();
+        assert!(captured.lock().is_empty(), "a commit with no writes since the last one should mirror nothing");
     }
 
     /// VersionLessAPI + Git版管理ハイブリッドの読み出し側 (open-web-server/
