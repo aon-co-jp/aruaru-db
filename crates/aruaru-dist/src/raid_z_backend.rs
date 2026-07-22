@@ -29,7 +29,13 @@ impl OpenRaidZSnapshotBackend {
     /// RAID-Z2 プールを構築、`dataset_name` という単一データセットを
     /// 用意した状態で返す。
     pub fn new(dir: &Path, dataset_name: &str) -> std::io::Result<Self> {
-        const CHUNK_SIZE: usize = 4096;
+        // 8192 (PostgreSQLの既定ページサイズ) にrecordsize相当の
+        // chunk_sizeを揃える(2026-07-23、Web検索で裏取り済みの推奨事項
+        // ——ZFS/RAID-ZのrecordsizeとDB側のブロックサイズが不一致だと
+        // 書き込み増幅が発生する。以前は4096固定で、PostgreSQLの8192
+        // バイトページと不一致のまま実装されていた実バグだった。
+        // 参考: https://tech-champion.com/database/postgresql/zfs-on-postgres-recordsize-mismatch-and-write-amplification/)
+        const CHUNK_SIZE: usize = 8192;
         const NUM_STRIPES: u64 = 256;
         std::fs::create_dir_all(dir)?;
         let devices: Vec<FileBackedDevice> = (0..6)
