@@ -107,15 +107,22 @@ pub struct QueryEngine {
     /// 表現できないため、削除された行がこの集合だけから復元しようとしても
     /// 存在しない値になる(既知の限界、`export_dirty_rows_as_json`のdoc参照)。
     dirty: RwLock<std::collections::BTreeSet<(String, Vec<u8>)>>,
-    /// **HTAP列キャッシュ無効化(2026-07-20追記)**: `crate::olap`の
-    /// `OlapCache`(行→列インクリメンタル同期、TiDB/TiFlash方式のこの
-    /// エコシステムなりの実装)向けに、テーブル単位で「前回のOLAP列
-    /// キャッシュ構築以降に変更があったか」を追跡する。上の`dirty`
-    /// (DUAL DATABASEミラー用、行単位)とは目的・粒度が異なる別集合
-    /// ——同じ集合を2つの消費者(ミラーのコミットフックとOLAPキャッシュ)
-    /// で共有すると、片方が`take`で先にクリアしてしまいもう片方が
-    /// 変更を見逃す実バグになるため、意図的に分離した。
-    olap_dirty_tables: RwLock<std::collections::HashSet<String>>,
+    /// **HTAP列キャッシュ・行単位デルタ追跡(2026-07-23、TiFlashの
+    /// Delta Tree〈ベース列ストア+デルタ行ストアをマージ、周期的に
+    /// コンパクション〉を調査の上で再設計)**: `crate::olap::OlapCache`
+    /// 向けに、テーブルごとに「前回のOLAP列キャッシュ構築以降に変更
+    /// された行のpk集合」を追跡する。`OlapCache`はこの集合の分だけを
+    /// 行ストアから読み直してArrowの小さなデルタバッチを作り、ベースの
+    /// 列バッチから(このpk集合に該当する)古い行だけをフィルタで除いて
+    /// 結合する——テーブル全体を文字列から再構築するのは初回とスキーマ
+    /// 変更時だけで済む。上の`dirty`(DUAL DATABASEミラー用)とは目的・
+    /// 消費者が別の集合(同じ集合を共有すると片方の`take`がもう片方の
+    /// 変更を見逃す実バグになるため分離)。
+    olap_delta_pks: RwLock<std::collections::HashMap<String, std::collections::BTreeSet<Vec<u8>>>>,
+    /// スキーマ変更(CREATE/DROP TABLE)が入ったテーブル——列定義自体が
+    /// 変わるため、行単位のデルタマージでは対応できず、`OlapCache`側で
+    /// 全体再構築(ベースの作り直し)が必要なテーブル名の集合。
+    olap_schema_dirty: RwLock<std::collections::HashSet<String>>,
 }
 
 impl QueryEngine {
@@ -128,7 +135,8 @@ impl QueryEngine {
             txn: parking_lot::Mutex::new(None),
             commit_hook: RwLock::new(None),
             dirty: RwLock::new(std::collections::BTreeSet::new()),
-            olap_dirty_tables: RwLock::new(std::collections::HashSet::new()),
+            olap_delta_pks: RwLock::new(std::collections::HashMap::new()),
+            olap_schema_dirty: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
@@ -142,7 +150,8 @@ impl QueryEngine {
             txn: parking_lot::Mutex::new(None),
             commit_hook: RwLock::new(None),
             dirty: RwLock::new(std::collections::BTreeSet::new()),
-            olap_dirty_tables: RwLock::new(std::collections::HashSet::new()),
+            olap_delta_pks: RwLock::new(std::collections::HashMap::new()),
+            olap_schema_dirty: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
@@ -380,15 +389,18 @@ impl QueryEngine {
         self.tables.read().values().map(|t| t.rows.len()).sum()
     }
 
-    /// 1テーブルだけのスナップショット。`OlapCache`が変更のあった
-    /// テーブルだけを再構築する際、全テーブルを走査する
-    /// [`Self::snapshot_tables`] を避けるために使う。
-    pub fn snapshot_table(&self, table: &str) -> Option<(Vec<(String, ColumnType)>, Vec<Vec<String>>)> {
+    /// 1テーブルだけのスナップショット(pk・行の両方)。`OlapCache`が
+    /// 変更のあったテーブルだけを再構築する際、全テーブルを走査する
+    /// [`Self::snapshot_tables`] を避けるために使う。pkを一緒に返すのは、
+    /// `OlapCache`がArrow列バッチの各行がどのpkに対応するかを覚えておき、
+    /// 後で「このpkの行だけ列バッチから除く」フィルタ処理をするため。
+    pub fn snapshot_table(&self, table: &str) -> Option<(Vec<(String, ColumnType)>, Vec<Vec<u8>>, Vec<Vec<String>>)> {
         let tables = self.tables.read();
         let t = tables.get(table)?;
+        let pks: Vec<Vec<u8>> = t.rows.keys().cloned().collect();
         let rows: Vec<Vec<String>> = t.rows.values().cloned().collect();
         let cols: Vec<(String, ColumnType)> = t.columns.iter().cloned().zip(t.types.iter().cloned()).collect();
-        Some((cols, rows))
+        Some((cols, pks, rows))
     }
 
     /// 全テーブルのスナップショット (name, 列定義(名前,型), rows) を取得。
@@ -664,31 +676,56 @@ impl QueryEngine {
 
     fn persist_row(&self, table: &str, pk: &[u8], row: &[String]) -> Result<(), String> {
         self.dirty.write().insert((table.to_string(), pk.to_vec()));
-        self.olap_dirty_tables.write().insert(table.to_string());
+        self.olap_delta_pks.write().entry(table.to_string()).or_default().insert(pk.to_vec());
         self.record_or_apply(PersistOp::Row(table.to_string(), pk.to_vec(), row.to_vec()))
     }
     fn persist_delete(&self, table: &str, pk: &[u8]) -> Result<(), String> {
-        self.olap_dirty_tables.write().insert(table.to_string());
+        self.olap_delta_pks.write().entry(table.to_string()).or_default().insert(pk.to_vec());
         self.record_or_apply(PersistOp::Del(table.to_string(), pk.to_vec()))
     }
     fn persist_schema(&self, table: &str, cols: &[(String, ColumnType)]) -> Result<(), String> {
-        self.olap_dirty_tables.write().insert(table.to_string());
+        // 列定義自体が変わるため、行単位のデルタは意味を持たなくなる
+        // (以前の値の型/列数がもう合わない可能性がある) —— 全体再構築へ。
+        self.olap_delta_pks.write().remove(table);
+        self.olap_schema_dirty.write().insert(table.to_string());
         self.record_or_apply(PersistOp::Schema(table.to_string(), cols.to_vec()))
     }
     fn persist_drop(&self, table: &str) -> Result<(), String> {
-        self.olap_dirty_tables.write().insert(table.to_string());
+        self.olap_delta_pks.write().remove(table);
+        self.olap_schema_dirty.write().insert(table.to_string());
         self.record_or_apply(PersistOp::Drop(table.to_string()))
     }
 
-    /// `table`がOLAP列キャッシュ構築以降に変更されたか(覗き見、消費しない)。
-    pub fn is_olap_table_dirty(&self, table: &str) -> bool {
-        self.olap_dirty_tables.read().contains(table)
+    /// `table`のスキーマが変わった(CREATE/DROP TABLE)ため、`OlapCache`が
+    /// 行単位デルタではなく全体再構築すべきか(覗き見、消費しない)。
+    pub fn is_olap_schema_dirty(&self, table: &str) -> bool {
+        self.olap_schema_dirty.read().contains(table)
     }
 
-    /// `table`のOLAP dirtyフラグを落とす(列キャッシュを再構築し終えた後、
+    /// `table`のOLAPスキーマdirtyフラグを落とす(全体再構築を終えた後、
     /// `crate::olap::OlapCache`から呼ばれる)。
-    pub fn clear_olap_dirty(&self, table: &str) {
-        self.olap_dirty_tables.write().remove(table);
+    pub fn clear_olap_schema_dirty(&self, table: &str) {
+        self.olap_schema_dirty.write().remove(table);
+    }
+
+    /// `table`について、前回のOLAP列キャッシュ構築以降に変更された行の
+    /// pk集合を取り出し、内部の追跡集合からは取り除く(=消費する)。
+    /// 空集合なら「変更無し、キャッシュを丸ごと再利用してよい」ことを表す。
+    pub fn take_olap_delta_pks(&self, table: &str) -> std::collections::BTreeSet<Vec<u8>> {
+        self.olap_delta_pks.write().remove(table).unwrap_or_default()
+    }
+
+    /// `table`に前回のOLAP列キャッシュ構築以降の未反映な行変更があるか
+    /// (覗き見、消費しない——テスト・観測用)。
+    pub fn has_pending_olap_delta(&self, table: &str) -> bool {
+        self.olap_delta_pks.read().get(table).is_some_and(|s| !s.is_empty())
+    }
+
+    /// `table`の現在の行を`pk`で1件だけ取得する。`OlapCache`が行単位
+    /// デルタの現在値を読み直す際に使う(全テーブルスキャンを避ける)。
+    /// `None`は「削除済み、またはそもそも存在しない」を表す。
+    pub fn get_row(&self, table: &str, pk: &[u8]) -> Option<Vec<String>> {
+        self.tables.read().get(table)?.rows.get(pk).cloned()
     }
 
     // ── DDL/DML ──────────────────────────────────────────────
