@@ -298,6 +298,61 @@ AI機能が必要になった場合は、`open-cuda` + `aruaru-llm` のSET構成
 
 ## 現状(このリポジトリ固有)・重要な引き継ぎ事項
 
+- **2026-07-23 Multi-Raft(CockroachDB/TiKV方式)を新規実装
+  ——「最先端追従の方針」の最初の適用例**: ユーザーから、単一Raftグループ
+  のままでは将来のスケール限界になり得るという指摘に対し「今は問題ない」
+  という報告で終わらせず、CockroachDB/TiKVが既に採用しているMulti-Raft
+  方式へ実際に追従するよう指示を受けた(日英Web検索でRaftが2026年時点
+  でも最良のデフォルト選択と確認済み、詳細は
+  [systemdesignhandbook.com](https://www.systemdesignhandbook.com/guides/raft-consensus-algorithm/))。
+  1. **発見した実欠落**: `shard::topology::ClusterTopology`(Range単位の
+     ルーティング表、CockroachDB方式のキー空間分割データ構造)と
+     `raft::node::RaftNode`(単一Raftグループの合意ロジック)は、
+     以前から両方存在していたが**互いに一度も接続されたことがなかった**
+     ——前者はルーティング計算のみのデータ構造、後者は常に単一グループ
+     として使われていた。「Multi-Raftの土台となる部品は揃っていたが
+     実際には繋がっていなかった」という、このエコシステムで繰り返し
+     見つかる欠陥パターンの同種の実例。
+  2. **`crates/aruaru-dist/src/multi_raft.rs`新設**: `MultiRaftCluster<A>`
+     が`ClusterTopology`と`HashMap<range_id, Arc<RaftNode<A>>>`を保持し、
+     `propose(key, command)`がkeyの担当Rangeを解決してそのRange専用の
+     独立したRaftグループへ提案を委譲する。`split(range_id, split_key,
+     applier)`でRange分割時に新しい独立したRaftグループを立てる
+     (CockroachDBのRange分割と同じ発想)。
+  3. **正直な開示・スコープ**: `RaftNode`自体は単一プロセス内の
+     ログ/適用セマンティクスのみを提供し(ネットワーク越しの選挙/複製RPC
+     はopenraftに委譲する計画、`raft/mod.rs`参照)、本モジュールもその
+     制約を引き継ぐ——複数の物理ノードへの実際のネットワーク複製は
+     まだ無い。ここで実証したのは「Range単位で完全に独立した合意
+     グループが並行して進行できる」という構造的性質そのもの。また、
+     Range分割時の新グループは空のログから始まり、分割元の状態機械
+     スナップショット転送は今回未実装(次回以降の課題)。
+  4. **検証**: `cargo test -p aruaru-dist multi_raft`**3件全green**——
+     核心となる`split_ranges_progress_independently_like_cockroachdb_
+     multi_raft`は、Range分割後に一方のRangeへ3件コミットしても
+     もう一方のRangeのcommit_indexが不変であることを実証(単一グローバル
+     Raftグループでは得られない、Multi-Raftならではの独立性の直接証明)。
+     `cargo test --workspace`**リグレッション無し全green**
+     (aruaru-dist 27→30件、他クレート含め既存分すべて維持)。
+  - 次にすべきこと: (1) Range分割時の状態機械スナップショット転送、
+    (2) 実際のクエリエンジン(`aruaru-query::QueryEngine`)からの
+    `MultiRaftCluster`利用(現状は`aruaru-server`の本番経路には未配線、
+    疎結合コンポーネントとして実装した段階——`snapshot_pairing`/
+    `raid_z_backend`と同じ既存の段階的アプローチ)、(3) ネットワーク越し
+    の複製RPC(openraft統合、`raft/mod.rs`の既存計画)。
+
+- **2026-07-23(続き) recordsize不一致バグを修正(拡張要件(2)のZFS
+  ↔DB関連性で指摘されていた推奨事項の実施漏れ)**: 日英Web検索で
+  「ZFS/RAID-Zのrecordsizeをdatabaseのブロックサイズ(PostgreSQLは
+  8KB)に合わせないと書き込み増幅が発生する」という2026年時点でも
+  有効な推奨事項を再確認したところ
+  ([tech-champion.com](https://tech-champion.com/database/postgresql/zfs-on-postgres-recordsize-mismatch-and-write-amplification/))、
+  `crates/aruaru-dist/src/raid_z_backend.rs`の`OpenRaidZSnapshotBackend::new`
+  が`CHUNK_SIZE=4096`を固定でハードコードしており、PostgreSQLの8192バイト
+  ページと不一致のままだったことを発見・修正(`CHUNK_SIZE=8192`へ変更)。
+  `cargo test -p aruaru-dist --features open_raid_z`27件全green
+  (既存の`real_raft_commit_triggers_real_raid_z_snapshot`含め回帰無し)。
+
 - **2026-07-20(4) DUAL DATABASEミラーを全行ダンプ→差分抽出へ最適化
   (前回HANDOFFの次回候補(b)を完了)**: `aruaru_query::QueryEngine`に
   `dirty: RwLock<BTreeSet<(String, Vec<u8>)>>`を新設し、`persist_row`

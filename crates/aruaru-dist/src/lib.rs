@@ -1,5 +1,6 @@
 //! aruaru-dist: 分散レイヤー (openraft + Range シャーディング)
 pub mod dual_database;
+pub mod multi_raft;
 pub mod raft;
 pub mod shard;
 pub mod snapshot_pairing;
