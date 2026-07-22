@@ -298,6 +298,29 @@ AI機能が必要になった場合は、`open-cuda` + `aruaru-llm` のSET構成
 
 ## 現状(このリポジトリ固有)・重要な引き継ぎ事項
 
+- **2026-07-23(続き2) HTAP(TiDB/SingleStore/Snowflake Unistore方式)の
+  ギャップを日英Web検索で発見・対応着手中(正本はopen-raid-z/CLAUDE.md
+  同日エントリ参照)**: ユーザー指示「Snowflake×CockroachDBハイブリッド
+  の最新動向を調査」を受け、この設計思想がHTAP(Hybrid Transactional/
+  Analytical Processing)という確立パターンとして実在すると判明
+  ([PingCAP: Real-World HTAP](https://www.pingcap.com/blog/real-world-htap-a-look-at-tidb-and-singlestore-and-their-architectures/))。
+  **発見したギャップ**: `aruaru-query::olap.rs::run_olap`は、OLAP
+  クエリのたびに`engine.snapshot_tables()`で**全テーブルを行ストアから
+  毎回フル再構築**する設計(`olap.rs`冒頭の「現段階の制約」に単一ノード
+  MPPである旨は明記されていたが、フル再構築であることの性能上の
+  トレードオフは未記載だった)。TiDB(TiKV行ストア→TiFlash列ストアへ
+  リアルタイムインクリメンタル同期)のような「変更差分だけ列ストアへ
+  反映する」設計にはなっていない。
+  **対応方針**: 既存の`dirty`集合(DUAL DATABASEミラー用、`persist_row`
+  で`(table, pk)`を記録)とは別に、テーブル単位の粒度で列キャッシュの
+  無効化を追跡する仕組みを追加し、変更の無いテーブルは前回のArrow
+  RecordBatchキャッシュを再利用、変更されたテーブルのみ再構築する
+  ——という現実的なスコープでのインクリメンタル同期を実装する(次の
+  HANDOFFエントリで実装完了を記録)。真のマルチノード分散HTAP
+  (TiKV/TiFlash間のネットワーク越しレプリケーション相当)は、
+  aruaru-distのRaftがまだ単一プロセス内(ネットワーク越し複製は
+  openraft統合待ち)であるため範囲外。
+
 - **2026-07-23 Multi-Raft(CockroachDB/TiKV方式)を新規実装
   ——「最先端追従の方針」の最初の適用例**: ユーザーから、単一Raftグループ
   のままでは将来のスケール限界になり得るという指摘に対し「今は問題ない」
