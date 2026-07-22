@@ -352,6 +352,56 @@ AI機能が必要になった場合は、`open-cuda` + `aruaru-llm` のSET構成
     (`aruaru-dist::multi_raft`)との統合——Range単位でOLAP列キャッシュも
     分割する余地がある。
 
+- **2026-07-23(続き4) 上記(2)「行単位の真のインクリメンタル反映」を
+  日英Web検索でTiFlashの実設計を調査の上、実装完了**: ユーザー指示
+  「そのギャップ(テーブル単位粒度という限界)に対する再設計方法を
+  日英で検索して開発に活かして」を受けて着手。
+  **調査結果**: TiFlashは「Delta Tree」という設計(B+木とLSM木の
+  ハイブリッド)を採用し、列エンジンを書き込み最適化領域(デルタ、
+  行ストア形式)と読み出し最適化領域(ベース、列ストア形式)に分割、
+  新規行データはまずデルタへ書かれ、後でバッチ変換されて列ストアへ
+  マージされる、と判明
+  ([TiFlash Overview](https://docs.pingcap.com/tidb/stable/tiflash-overview/)、
+  [TiDB internals: TiFlash column storage](https://internals.tidb.io/t/topic/590))。
+  SQL Serverの列ストアインデックスも同様の「デルタストア」(行ストア
+  形式で新規行を保持、後で列形式へマージ)を持つことも確認、業界横断で
+  確立した設計と裏付けが取れた。
+  **再実装**: `engine.rs`のOLAP追跡を、テーブル単位の`bool`集合
+  (`olap_dirty_tables`)から**行単位のpk集合**
+  (`olap_delta_pks: HashMap<table, BTreeSet<pk>>`)へ全面的に再設計。
+  スキーマ変更(CREATE/DROP TABLE)は別集合`olap_schema_dirty`で扱う
+  (列定義自体が変わるため行単位デルタでは対応できない)。
+  `snapshot_table`をpk込みで返すよう変更(`(cols, pks, rows)`、
+  `pks[i]`と`rows[i]`が対応)。新規`get_row(table, pk)`で1行だけの
+  再取得を可能にした。
+  `olap.rs`の`OlapCache`を「ベース(Arrow列バッチ+対応するpk配列)+
+  変更されたpk集合」を保持する設計へ書き換え。クエリのたびに:
+  (1) `arrow::compute::filter_record_batch`(列指向の軽量フィルタ
+  カーネル、文字列パース不要)でベースから変更されたpkの行を除去、
+  (2) 変更されたpkだけを`get_row`で読み直し(テーブル全体ではない)、
+  小さなデルタバッチを構築、(3) `arrow::compute::concat_batches`で
+  結合し次回のベースとして採用(即時コンパクション)。
+  **検証**: `olap_cache_incremental_merge_handles_update_delete_and_
+  insert_correctly`(新規)——3行のテーブルに対し1行更新・1行削除・
+  1行新規追加を行い、`SUM`が二重集計無く正しい値(古い値がベースに
+  残っていないこと)、`COUNT(*)`が正しい行数(削除が反映されている
+  こと)を実証。既存の`olap_cache_reuses_unchanged_tables_and_
+  rebuilds_only_dirty_ones`もAPI名を`has_pending_olap_delta`
+  (旧`is_olap_table_dirty`)へ追従して更新、green維持。
+  `cargo test -p aruaru-query`**42件全green**(前回41件+今回1件)。
+  `cargo test --workspace`(全クレート)リグレッション無し。
+  **正直な開示・スコープの限界(前回よりは縮小したが残っている)**:
+  (1) 単一プロセス内のみ——TiKV/TiFlash間のネットワーク越し列レプリカ
+  配置は引き続き範囲外(openraft統合待ち)。(2) 毎回即時コンパクション
+  する設計であり、TiFlashのように「デルタ層が一定サイズになるまで
+  複数バッチのまま保持し、閾値到達時にまとめてコンパクション」という
+  最適化はしていない——書き込みのたびに軽量なフィルタ処理は発生する
+  (ただし文字列→型付き配列変換という重い処理は変更行数分だけで済む
+  ため、既存の「毎回全テーブルをフル再構築」より確実に軽い)。
+  - 次にすべきこと: (1) `aruaru-server`の本番経路への`OlapCache`配線
+    (引き続き未接続)、(2) デルタ層のバッチ保持+閾値コンパクション
+    (現状は毎回即時コンパクション)、(3) Multi-Raftとの統合。
+
 - **2026-07-23 Multi-Raft(CockroachDB/TiKV方式)を新規実装
   ——「最先端追従の方針」の最初の適用例**: ユーザーから、単一Raftグループ
   のままでは将来のスケール限界になり得るという指摘に対し「今は問題ない」
