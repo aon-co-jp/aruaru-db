@@ -835,5 +835,5 @@ open-web-serverがApache＋Nginxのハイブリッド仕様のWebサーバーと
 [`open-raid-z`のCLAUDE.md](https://github.com/aon-co-jp/open-raid-z/blob/main/CLAUDE.md)
 「関連プロジェクト」節を参照。**どのリポジトリから読み始めても、
 この節を起点に他プロジェクトへ辿れる**ようにしてある(新規追加:
-RGit・RJSON・RS-Chiketto・RS-Blog・RS-EC。このリポジトリ自身の状況は
+RS-Git・RS-JSON・RS-Chiketto・RS-Blog・RS-EC。このリポジトリ自身の状況は
 このファイルの他の節・HANDOFFを参照)。
