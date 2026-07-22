@@ -321,6 +321,37 @@ AI機能が必要になった場合は、`open-cuda` + `aruaru-llm` のSET構成
   aruaru-distのRaftがまだ単一プロセス内(ネットワーク越し複製は
   openraft統合待ち)であるため範囲外。
 
+- **2026-07-23(続き3) HTAP列キャッシュ`OlapCache`を実装完了**:
+  `crates/aruaru-query/src/engine.rs`に`olap_dirty_tables:
+  RwLock<HashSet<String>>`を新設(既存のDUAL DATABASEミラー用`dirty`
+  集合とは意図的に別集合——同じ集合を2つの消費者で共有すると片方が
+  `take`で先にクリアしもう片方が変更を見逃す実バグになるため分離)。
+  `persist_row`/`persist_delete`/`persist_schema`/`persist_drop`の
+  全てでテーブル名を記録、`is_olap_table_dirty`/`clear_olap_dirty`を
+  公開。`snapshot_table`(1テーブルのみ、全テーブル走査の
+  `snapshot_tables`を避ける)も追加。
+  `crates/aruaru-query/src/olap.rs`に`OlapCache`新設:
+  `refresh()`が変更のあったテーブルだけ`snapshot_table`+Arrow
+  `RecordBatch`再構築、変更の無いテーブルは行ストアに一切触れず
+  前回のキャッシュを再利用する。既存の`run_olap`(毎回全テーブル
+  フル再構築)は後方互換のため残置。
+  **検証**: `olap_cache_reuses_unchanged_tables_and_rebuilds_only_
+  dirty_ones`(新規)——2テーブル(`orders`/`customers`)を用意し、
+  `customers`だけを更新した後も`orders`が`is_olap_table_dirty`に
+  ならないこと、`customers`は正しく再構築され新しい行が反映される
+  こと、両方を実証。`cargo test -p aruaru-query`**41件全green**
+  (既存39件+新規2件)。
+  **正直な開示・スコープの限界**: (1) 粒度はテーブル単位——1行でも
+  変更されたテーブルはテーブル全体を再構築する(TiFlashのような
+  真の行単位インクリメンタル反映ではない)。(2) 単一プロセス内のみ
+  ——TiKV/TiFlash間のようなネットワーク越しの別ノードへの列レプリカ
+  配置は、aruaru-distのRaftが単一プロセス内実装のため範囲外。
+  - 次にすべきこと: (1) `aruaru-server`の本番経路への`OlapCache`配線
+    (現状は`aruaru-query`クレート内の新機能のみ、呼び出し元は未接続)、
+    (2) 行単位の真のインクリメンタル反映、(3) Multi-Raft
+    (`aruaru-dist::multi_raft`)との統合——Range単位でOLAP列キャッシュも
+    分割する余地がある。
+
 - **2026-07-23 Multi-Raft(CockroachDB/TiKV方式)を新規実装
   ——「最先端追従の方針」の最初の適用例**: ユーザーから、単一Raftグループ
   のままでは将来のスケール限界になり得るという指摘に対し「今は問題ない」
