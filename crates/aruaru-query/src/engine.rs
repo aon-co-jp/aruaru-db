@@ -107,6 +107,15 @@ pub struct QueryEngine {
     /// 表現できないため、削除された行がこの集合だけから復元しようとしても
     /// 存在しない値になる(既知の限界、`export_dirty_rows_as_json`のdoc参照)。
     dirty: RwLock<std::collections::BTreeSet<(String, Vec<u8>)>>,
+    /// **HTAP列キャッシュ無効化(2026-07-20追記)**: `crate::olap`の
+    /// `OlapCache`(行→列インクリメンタル同期、TiDB/TiFlash方式のこの
+    /// エコシステムなりの実装)向けに、テーブル単位で「前回のOLAP列
+    /// キャッシュ構築以降に変更があったか」を追跡する。上の`dirty`
+    /// (DUAL DATABASEミラー用、行単位)とは目的・粒度が異なる別集合
+    /// ——同じ集合を2つの消費者(ミラーのコミットフックとOLAPキャッシュ)
+    /// で共有すると、片方が`take`で先にクリアしてしまいもう片方が
+    /// 変更を見逃す実バグになるため、意図的に分離した。
+    olap_dirty_tables: RwLock<std::collections::HashSet<String>>,
 }
 
 impl QueryEngine {
@@ -119,6 +128,7 @@ impl QueryEngine {
             txn: parking_lot::Mutex::new(None),
             commit_hook: RwLock::new(None),
             dirty: RwLock::new(std::collections::BTreeSet::new()),
+            olap_dirty_tables: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
@@ -132,6 +142,7 @@ impl QueryEngine {
             txn: parking_lot::Mutex::new(None),
             commit_hook: RwLock::new(None),
             dirty: RwLock::new(std::collections::BTreeSet::new()),
+            olap_dirty_tables: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
@@ -367,6 +378,17 @@ impl QueryEngine {
     /// 全テーブルの合計行数
     pub fn total_rows(&self) -> usize {
         self.tables.read().values().map(|t| t.rows.len()).sum()
+    }
+
+    /// 1テーブルだけのスナップショット。`OlapCache`が変更のあった
+    /// テーブルだけを再構築する際、全テーブルを走査する
+    /// [`Self::snapshot_tables`] を避けるために使う。
+    pub fn snapshot_table(&self, table: &str) -> Option<(Vec<(String, ColumnType)>, Vec<Vec<String>>)> {
+        let tables = self.tables.read();
+        let t = tables.get(table)?;
+        let rows: Vec<Vec<String>> = t.rows.values().cloned().collect();
+        let cols: Vec<(String, ColumnType)> = t.columns.iter().cloned().zip(t.types.iter().cloned()).collect();
+        Some((cols, rows))
     }
 
     /// 全テーブルのスナップショット (name, 列定義(名前,型), rows) を取得。
@@ -642,16 +664,31 @@ impl QueryEngine {
 
     fn persist_row(&self, table: &str, pk: &[u8], row: &[String]) -> Result<(), String> {
         self.dirty.write().insert((table.to_string(), pk.to_vec()));
+        self.olap_dirty_tables.write().insert(table.to_string());
         self.record_or_apply(PersistOp::Row(table.to_string(), pk.to_vec(), row.to_vec()))
     }
     fn persist_delete(&self, table: &str, pk: &[u8]) -> Result<(), String> {
+        self.olap_dirty_tables.write().insert(table.to_string());
         self.record_or_apply(PersistOp::Del(table.to_string(), pk.to_vec()))
     }
     fn persist_schema(&self, table: &str, cols: &[(String, ColumnType)]) -> Result<(), String> {
+        self.olap_dirty_tables.write().insert(table.to_string());
         self.record_or_apply(PersistOp::Schema(table.to_string(), cols.to_vec()))
     }
     fn persist_drop(&self, table: &str) -> Result<(), String> {
+        self.olap_dirty_tables.write().insert(table.to_string());
         self.record_or_apply(PersistOp::Drop(table.to_string()))
+    }
+
+    /// `table`がOLAP列キャッシュ構築以降に変更されたか(覗き見、消費しない)。
+    pub fn is_olap_table_dirty(&self, table: &str) -> bool {
+        self.olap_dirty_tables.read().contains(table)
+    }
+
+    /// `table`のOLAP dirtyフラグを落とす(列キャッシュを再構築し終えた後、
+    /// `crate::olap::OlapCache`から呼ばれる)。
+    pub fn clear_olap_dirty(&self, table: &str) {
+        self.olap_dirty_tables.write().remove(table);
     }
 
     // ── DDL/DML ──────────────────────────────────────────────
