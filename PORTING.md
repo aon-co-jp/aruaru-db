@@ -6,11 +6,25 @@
 >
 > 対象バージョン: workspace 0.5.0(9 クレート / 76 テスト、2026-07-11 実測。
 > 最新のクレート数・テスト数は `CLAUDE.md` の「現状」節参照)
-> 最終更新: 2026-07-11
+> 最終更新: 2026-07-23
 
 ---
 
-## 0. aruaru-DB とは何か・エコシステム内での位置づけ
+## 0. 配布インストーラー(2026-07-23追加)
+
+`install.sh`(Linux、systemdサービス登録)/`install.ps1`(Windows、
+要管理者権限)/`.github/workflows/release.yml`(タグpushでLinux
+x86_64・Windows x86_64向け`aruaru-server`を自動ビルドしGitHub
+Releasesへ添付)を追加。**移植時の注意**: `aruaru-core`が
+`../RS-JSON`(`Rust-JSON`リポジトリ)へのpath依存を持つため、CI/別
+マシンでビルドする場合は同じ相対位置(このリポジトリのルートの
+1つ上)に`RS-JSON`リポジトリをcheckoutしておく必要がある
+(`release.yml`内の`git clone`ステップを参照——他のクレート`open_raid_z_core`
+のpath依存も同様のパターン、`open_raid_z` feature有効時のみ影響)。
+
+---
+
+## 0.1. aruaru-DB とは何か・エコシステム内での位置づけ
 
 CockroachDB 的な分散強整合(openraft)と Snowflake 的なストレージ/コンピュート
 分離(Arrow/DataFusion)を組み合わせつつ、**Git-on-SQL**(ブランチ・コミット・
