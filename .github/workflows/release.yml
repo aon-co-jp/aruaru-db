@@ -19,6 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # aruaru-coreが`../RS-JSON`をpath依存で参照しているため、CI環境でも
+      # 同じ相対位置(リポジトリルートの1つ上)にsiblingリポジトリを
+      # checkoutする(RPoem/open-web-serverのリリースCIで踏んだのと同じ
+      # 罠、v0.1.0タグでの初回リリースで発覚)。
+      - name: Checkout RS-JSON (sibling path dependency)
+        run: git clone --depth=1 https://github.com/aon-co-jp/RS-JSON.git ../RS-JSON
       - name: Build
         run: cargo build --release --bin aruaru-server
       - name: Package
@@ -37,6 +43,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout RS-JSON (sibling path dependency)
+        run: git clone --depth=1 https://github.com/aon-co-jp/RS-JSON.git ../RS-JSON
       - name: Build
         run: cargo build --release --bin aruaru-server
       - name: Package
