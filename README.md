@@ -82,8 +82,8 @@ npm run tauri dev
 | クレート | 役割 |
 |---------|------|
 | `aruaru-core` | ストレージエンジン・MVCC・Git-on-SQL バージョン管理 |
-| `aruaru-dist` | openraft 統合・Range シャーディング・ノード管理・Raftコミット×open-raid-zスナップショット連携(`snapshot_pairing`、2026-07-13追加) |
-| `aruaru-query` | SQL パーサ・HTAP ルーター・DataFusion 統合 |
+| `aruaru-dist` | openraft 統合・Range シャーディング・ノード管理・Raftコミット×open-raid-zスナップショット連携(`snapshot_pairing`、2026-07-13追加)・Multi-Raft(CockroachDB/TiKV方式、Range単位の独立合意グループ、`multi_raft`、2026-07-23追加) |
+| `aruaru-query` | SQL パーサ・HTAP ルーター(TiDB/TiFlash方式の行→列インクリメンタル同期`OlapCache`、2026-07-23追加)・DataFusion 統合 |
 | `aruaru-wire` | PostgreSQL ワイヤプロトコル (pgwire) |
 | `aruaru-graphql` | Versionless GraphQL + Poem HTTP サーバ |
 | `aruaru-registry` | 対応DBレジストリ (150+件) + 毎日クロール + 取り込みアダプタ |
