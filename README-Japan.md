@@ -14,6 +14,14 @@
 [Français](README-France.md) / [Deutsch](README-Germany.md) / [Italiano](README-Italy.md) /
 [Русский](README-Russia.md) / [العربية](README-Arabic.md)
 
+## インストール(v0.1.0〜、Linux/Windows)
+
+[GitHub Releases](https://github.com/aon-co-jp/aruaru-db/releases)から
+`aruaru-server`バイナリ入りのtar.gz(Linux)/zip(Windows)をダウンロード
+し、同梱の`install.sh`(Linux、systemdサービス登録)/`install.ps1`
+(Windows、要管理者権限)を実行してください。詳細は
+[install.sh](install.sh)/[install.ps1](install.ps1)冒頭のコメント参照。
+
 ---
 
 ## ✨ なぜ aruaru-DB か
