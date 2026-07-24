@@ -1037,6 +1037,63 @@ open-web-serverがApache＋Nginxのハイブリッド仕様のWebサーバーと
      この方針をここに記録するのみで、コード変更・ビルド・commit/pushは
      行っていない。
 
+## HANDOFF: 2026-07-24(続き) Android版モニタリング/管理クライアントを新規実装・ビルド成功
+
+- **前回HANDOFF(直上)の「未着手・設計のみ」を実装まで進めた**。
+  参照実装`open-web-server/android/`(`MainActivity.kt`の3電源プロファイル
+  +BroadcastReceiverによる電源抜き差し検知ダイアログ+プロファイル別
+  ポーリング間隔+WakeLockパターン)を読み、同じGradle構成パターンで
+  `aruaru-db/android/`を新規作成した。
+- **位置づけの確定**: aruaru-db本体(Rust製分散DBサーバー)をAndroid上で
+  動かすのではなく、既存の管理API(`crates/aruaru-server/src/admin.rs`の
+  `GET /admin/cluster`、`main.rs`で`/admin`配下にnest済み)へリモート接続
+  する**モニタリング/管理クライアント**として設計した。ネイティブ
+  バイナリ同梱・NDKクロスビルド・jniLibsは一切不要(open-web-server版との
+  最大の設計差)。
+- **実装内容**:
+  1. パッケージ名`tokyo.runo.aruarudb`(open-web-server版の
+     `tokyo.runo.openwebserver`と区別)。
+  2. `MainActivity`: `EditText`でaruaru-db管理APIのベースURLを入力・
+     `SharedPreferences`永続化、「接続/ステータス確認」ボタンで
+     `GET <url>/admin/cluster`を実際に叩き、レスポンスJSON
+     (`stats.total_nodes`/`healthy_nodes`/`total_ranges`/`table_count`/
+     `under_replicated`)をパースして画面に表示する。
+  3. 電源プロファイル管理: `PowerProfile.kt`(3モード、open-web-server版と
+     同一enum構成)、`ProfileSelectActivity`(LAUNCHER、3プロファイル専用
+     ホーム画面アイコンも`activity-alias`×3で用意)。プロファイルごとの
+     実際の差は「監視ポーリング間隔」(省電力5分/通常1分/常時電源接続5秒、
+     `pollIntervalMs()`)と「WakeLock有無」(常時電源接続のみ
+     `PARTIAL_WAKE_LOCK`取得)——open-web-server版の`healthPollIntervalMs`/
+     `applyProfilePowerBehavior`と同じ設計。
+  4. 電源抜き差し監視ダイアログ: `BroadcastReceiver`で
+     `ACTION_POWER_DISCONNECTED`/`ACTION_POWER_CONNECTED`を動的登録し、
+     常時電源接続中に電源が外れたら「省電力モードに切り替えますか?
+     それとも通常モードのままにしますか?」(既定推奨=省電力、
+     `setCancelable(false)`)、省電力/通常中に電源が接続されたら常時
+     電源接続へ戻すか尋ねる——open-web-server版と全く同じ導線をコピー。
+  5. タブレット対応: `layout-sw600dp/activity_main.xml`(幅720dp上限+
+     中央寄せ)を追加(open-web-server版と同じパターン)。
+- **ビルド確認**: このマシンには`gradlew`本体が無いが、
+  `~/.gradle/wrapper/dists/gradle-8.11.1-all/`にキャッシュ済み配布物が
+  あることを確認し(open-web-server版のセッション記録と同じ発見)、
+  `gradle-8.11.1/bin/gradle :app:assembleDebug`を直接実行したところ
+  **`BUILD SUCCESSFUL`**(33 actionable tasks executed)。
+  `android/app/build/outputs/apk/debug/app-debug.apk`(約3.24MB)が
+  実際に生成されたことを確認済み。
+- **正直な開示・未検証事項**: (1) 実機/エミュレータでの起動・
+  `GET /admin/cluster`への実際の疎通確認は今回未実施(ビルド成功までに
+  留まる、ユーザー指示通り正直に記録)。(2) `admin.rs`の他のエンドポイント
+  (`/backup`・`/migrate/*`・`/federation/*`等)への対応は今回のスコープ外
+  (最小限のモニタリングUIに集中する制約に従った)。(3) 管理API自体に
+  認証機構が現状無い(`aruaru-server`側、`grep`で`x-admin-token`相当の
+  認証コードが見当たらず)——将来追加された場合はこのアプリ側にも
+  トークン入力欄の追加が必要になる。(4) `usesCleartextTraffic="true"`は
+  開発用途のHTTP接続を許容するための設定(本番でHTTPS管理APIを使う場合は
+  見直しが必要)。
+- **次にすべきこと**: (1) 実機/エミュレータでの起動・実疎通確認、
+  (2) `admin.rs`側の管理系エンドポイント(バックアップ実行等)への
+  対応要否の検討、(3) 管理API認証機構の追加とアプリ側对応。
+
 ## エコシステム全体マップ(2026-07-21追記)
 
 同時並行開発の対象プロジェクト一覧・各リポジトリの現況は
