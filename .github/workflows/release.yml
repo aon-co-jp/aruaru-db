@@ -25,6 +25,13 @@ jobs:
       # 罠、v0.1.0タグでの初回リリースで発覚)。
       - name: Checkout RS-JSON (sibling path dependency)
         run: git clone --depth=1 https://github.com/aon-co-jp/RS-JSON.git ../RS-JSON
+      # aruaru-distの`open_raid_z_core`はCargo.toml上`optional = true`だが、
+      # optionalなpath依存でもCargoはワークスペース全体のマニフェスト
+      # 解決時に(featureが無効でも)このパスのCargo.tomlを読もうとする
+      # ため、siblingが無いと"failed to load manifest"で失敗する
+      # (v0.1.0タグ再pushで新たに発覚した2つ目のsibling依存)。
+      - name: Checkout open-raid-z (sibling path dependency, optional feature)
+        run: git clone --depth=1 https://github.com/aon-co-jp/open-raid-z.git ../open-raid-z
       - name: Build
         run: cargo build --release --bin aruaru-server
       - name: Package
@@ -45,6 +52,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Checkout RS-JSON (sibling path dependency)
         run: git clone --depth=1 https://github.com/aon-co-jp/RS-JSON.git ../RS-JSON
+      # aruaru-distの`open_raid_z_core`はCargo.toml上`optional = true`だが、
+      # optionalなpath依存でもCargoはワークスペース全体のマニフェスト
+      # 解決時に(featureが無効でも)このパスのCargo.tomlを読もうとする
+      # ため、siblingが無いと"failed to load manifest"で失敗する
+      # (v0.1.0タグ再pushで新たに発覚した2つ目のsibling依存)。
+      - name: Checkout open-raid-z (sibling path dependency, optional feature)
+        run: git clone --depth=1 https://github.com/aon-co-jp/open-raid-z.git ../open-raid-z
       - name: Build
         run: cargo build --release --bin aruaru-server
       - name: Package
