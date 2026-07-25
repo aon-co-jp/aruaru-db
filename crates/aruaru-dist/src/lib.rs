@@ -1,5 +1,7 @@
 //! aruaru-dist: 分散レイヤー (openraft + Range シャーディング)
 pub mod dual_database;
+#[cfg(feature = "disaster_email_backup")]
+pub mod disaster_email_backup;
 pub mod multi_raft;
 pub mod raft;
 pub mod shard;
@@ -32,5 +34,7 @@ pub use shard::{
 };
 pub use snapshot_pairing::{wire_to_node, InMemorySnapshotBackend, SnapshotBackend, SnapshotPairingRegistry};
 pub use dual_database::{DualDatabaseError, DualDatabaseMirror, MirroredMutation, SCHEMA_SQL as DUAL_DATABASE_SCHEMA_SQL};
+#[cfg(feature = "disaster_email_backup")]
+pub use disaster_email_backup::{DisasterEmailBackup, DisasterEmailBackupConfig};
 #[cfg(feature = "open_raid_z")]
 pub use raid_z_backend::OpenRaidZSnapshotBackend;

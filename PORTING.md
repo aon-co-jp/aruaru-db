@@ -275,3 +275,16 @@ CockroachDB/TiKV等の最先端の実運用システムが既に対応済みと�
 DataFusion(Arrow)を使う他のOLAP/HTAP実装へそのまま移植可能な
 パターン——スキーマ変更(CREATE/DROP TABLE)は別途「全体再構築が必要」
 集合で扱い、行単位の通常書き込みとは区別すること。
+
+**スタンドアロン・メールディザスタバックアップ(移植元: `open-raid-z`の
+`offsite_backup::EmailBackupTarget`、2026-07-25新設)**: VPS間分散同期・
+クラスタ構成・スナップショット連携のいずれも不要な、メールアドレス
+ひとつだけで有効化できる最後の砦のバックアップ。`aruaru-dist`側の
+`disaster_email_backup.rs`は、`open_raid_z_core::offsite_backup`への
+path依存を再利用し、独自クレートの書き込みコマンド型(このリポジトリでは
+`raft::Command`)をJSON化してメール添付するだけの薄いラッパー。他の
+プロジェクトへ移植する際も、メール送信ロジック自体(lettre経由のSMTP)は
+再実装せず、`open_raid_z_core`へのpath依存を追加する形で再利用すること。
+管理APIの認証(`x-admin-token`ヘッダー、環境変数トークン未設定なら503)は
+`open-web-server`/`open-easy-web`と共通の規約——新しい認証方式を増やさず
+既存パターンをそのまま踏襲する。

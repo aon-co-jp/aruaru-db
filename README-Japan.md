@@ -151,6 +151,15 @@ VersionLessAPI とGit管理のハイブリッド版管理も担う。現状はTC
 のみ実装済みで他は未着手(詳細は `open-web-server` の `README.md`/
 `CLAUDE.md` 参照)。
 
+**スタンドアロン・メール ディザスタバックアップ(2026-07-25追記)**:
+VPS間分散同期・Raftクラスタの複数ノード構成・ZFSスナップショット連携の
+いずれも設定しなくても、メールアドレスひとつだけで有効化できる最後の
+砦のバックアップ安全網を追加(`crates/aruaru-dist`の`disaster_email_backup`
+feature)。`open-raid-z`の`EmailBackupTarget`をそのまま再利用し、管理API
+(`POST /admin/disaster-email-backup`、`x-admin-token`認証)から設定する。
+ローカルモックSMTPでのテストのみ実施済み(実SMTP・実断線シナリオの検証は
+未実施、正直な開示は `CLAUDE.md` の2026-07-25 HANDOFF参照)。
+
 ---
 
 ## 🤝 コントリビュート
