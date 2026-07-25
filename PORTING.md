@@ -288,3 +288,14 @@ path依存を再利用し、独自クレートの書き込みコマンド型(こ
 管理APIの認証(`x-admin-token`ヘッダー、環境変数トークン未設定なら503)は
 `open-web-server`/`open-easy-web`と共通の規約——新しい認証方式を増やさず
 既存パターンをそのまま踏襲する。
+
+**quorum障害への自動配線(同日追記)**: `raft/writer.rs::RaftWriter`に
+`Option<Arc<DisasterEmailBackup>>`を持たせ、`wait_for_commit`が
+真にquorum未達(タイムアウト)で`Err`を返した経路でのみ
+`backup_failed_command`を呼ぶ設計にした(Applier側が拒否した非quorum
+エラーでは呼ばない)。送信自体はブロッキングI/Oのため
+`tokio::spawn`+`tokio::task::spawn_blocking`で呼び出し元から完全に
+切り離す。他プロジェクトへ移植する際、`ReplicatedWriter`/`RaftWriter`
+に相当するジェネリックな書き込みラッパーがあれば、同じ
+「Option型フィールド+quorum失敗パスでのみfire-and-forget呼び出し」
+というパターンをそのまま踏襲できる。

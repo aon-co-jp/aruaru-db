@@ -215,6 +215,14 @@ configured via an admin API (`POST /admin/disaster-email-backup`,
 server; real SMTP / real disconnection scenarios have not been tested (see
 the 2026-07-25 HANDOFF entry in `CLAUDE.md` for the honest disclosure).
 
+**Same-day follow-up**: wired `RaftWriter::propose_and_wait` so a genuine
+quorum failure (majority-commit timeout) optionally triggers
+`DisasterEmailBackup` automatically. Configured via an
+`Option<Arc<DisasterEmailBackup>>` (unset = fully unchanged behavior),
+sent from a background `tokio::spawn` + `spawn_blocking` task so the
+caller is never blocked. See the same-day follow-up HANDOFF entry in
+`CLAUDE.md` for details, verification, and remaining gaps.
+
 ---
 
 ## 🤝 Contributing
