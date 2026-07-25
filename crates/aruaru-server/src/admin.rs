@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::Mutex;
-use poem::{get, handler, post, web::Data, web::Json, EndpointExt, Route};
+use poem::{get, handler, post, web::Data, web::Json, EndpointExt, Request, Route};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -38,6 +38,11 @@ pub struct AdminState {
     topology: Mutex<aruaru_dist::ClusterTopology>,
     /// Raft ノード (クラスタモード時のみ Some)
     cluster: Mutex<Option<Arc<ClusterNode>>>,
+    /// スタンドアロンのメール・ディザスタバックアップ(`disaster_email_backup`
+    /// feature有効時のみ実際に構築可能。VPS同期・Raftクラスタ構成の登録
+    /// 有無に関わらず、メールアドレスひとつだけで有効化できる最後の砦)。
+    #[cfg(feature = "disaster_email_backup")]
+    disaster_email_backup: Mutex<Option<Arc<aruaru_dist::DisasterEmailBackup>>>,
 }
 
 impl AdminState {
@@ -51,6 +56,8 @@ impl AdminState {
             federation: Mutex::new(Vec::new()),
             topology: Mutex::new(aruaru_dist::ClusterTopology::single_node(1, "127.0.0.1:5432")),
             cluster: Mutex::new(None),
+            #[cfg(feature = "disaster_email_backup")]
+            disaster_email_backup: Mutex::new(None),
         })
     }
 
@@ -62,6 +69,36 @@ impl AdminState {
     pub fn cluster_node(&self) -> Option<Arc<ClusterNode>> {
         self.cluster.lock().clone()
     }
+}
+
+// ── 管理API認証(`x-admin-token`、2026-07-25追記) ───────────────
+//
+// このリポジトリの`/admin/*`は元々認証機構を持たなかった
+// (2026-07-24 HANDOFF「管理API自体に認証機構が現状無い」で明記済みの
+// 既知のギャップ)。新設のディザスタ・メールバックアップ管理API限定で、
+// `open-web-server`/`open-easy-web`と同じ「`x-admin-token`ヘッダー +
+// 環境変数設定のトークン、未設定なら503」という規約を導入する
+// (既存の他の`/admin/*`エンドポイントへの遡及適用は今回のスコープ外)。
+#[cfg(feature = "disaster_email_backup")]
+const ADMIN_TOKEN_ENV: &str = "ARUARU_DB_ADMIN_TOKEN";
+
+#[cfg(feature = "disaster_email_backup")]
+fn check_admin_auth(req: &Request) -> Result<(), (poem::http::StatusCode, &'static str)> {
+    let Ok(expected) = std::env::var(ADMIN_TOKEN_ENV) else {
+        return Err((
+            poem::http::StatusCode::SERVICE_UNAVAILABLE,
+            "admin API is not configured (ARUARU_DB_ADMIN_TOKEN is not set)",
+        ));
+    };
+    let provided = req
+        .headers()
+        .get("x-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if provided.is_empty() || provided != expected {
+        return Err((poem::http::StatusCode::UNAUTHORIZED, "invalid or missing x-admin-token header"));
+    }
+    Ok(())
 }
 
 fn now() -> String {
@@ -192,7 +229,15 @@ struct RegistryTestRequest {
 // ═══════════════════════════════════════════════════════════════
 
 pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
-    Route::new()
+    #[allow(unused_mut)]
+    let mut route = Route::new();
+    #[cfg(feature = "disaster_email_backup")]
+    {
+        route = route
+            .at("/disaster-email-backup", post(set_disaster_email_backup))
+            .at("/disaster-email-backup/verify", post(verify_disaster_email_backup));
+    }
+    route
         .at("/backup", get(list_backups).post(create_backup))
         .at("/backup/restore", post(restore_backup))
         .at("/backup/schedule", post(set_schedule))
@@ -821,5 +866,63 @@ async fn registry_test_connection(
             "message": format!("{} のワイヤ({:?})用アダプタは未実装です。", entry.name, entry.wire),
             "status": entry.status.label(),
         })),
+    }
+}
+
+// ── スタンドアロンのメール・ディザスタバックアップ(2026-07-25追記) ──
+//
+// `open-web-server`の`crates/open-web-server-gateway/src/handlers/
+// disaster_email_backup.rs`と同じ設計思想: VPS間分散同期・Raftクラスタ
+// 構成(`ClusterTopology`/`multi_raft`)・ZFSスナップショット連携
+// (`snapshot_pairing`/`open_raid_z`機能)のいずれも一切設定しなくても、
+// メールアドレスひとつだけで有効化できるディザスタ・セーフティネット。
+
+#[cfg(feature = "disaster_email_backup")]
+#[handler]
+fn set_disaster_email_backup(
+    req: &Request,
+    state: Data<&Arc<AdminState>>,
+    Json(config): Json<aruaru_dist::DisasterEmailBackupConfig>,
+) -> poem::Result<Json<Value>> {
+    if let Err((status, msg)) = check_admin_auth(req) {
+        return Err(poem::Error::from_string(msg, status));
+    }
+
+    *state.disaster_email_backup.lock() = Some(Arc::new(aruaru_dist::DisasterEmailBackup::new(config)));
+
+    Ok(Json(json!({
+        "message_ja": "ディザスタ用メール退避先を設定しました(他の同期・レプリケーション設定は不要です)。",
+        "message_en": "Disaster email backup destination configured (no other sync/replication setup required).",
+    })))
+}
+
+/// SMTP接続の疎通確認のみ(実送信は行わない)。
+#[cfg(feature = "disaster_email_backup")]
+#[handler]
+async fn verify_disaster_email_backup(req: &Request, state: Data<&Arc<AdminState>>) -> poem::Result<Json<Value>> {
+    if let Err((status, msg)) = check_admin_auth(req) {
+        return Err(poem::Error::from_string(msg, status));
+    }
+
+    let Some(backup) = state.disaster_email_backup.lock().clone() else {
+        return Err(poem::Error::from_string(
+            "disaster email backup is not configured yet",
+            poem::http::StatusCode::NOT_FOUND,
+        ));
+    };
+
+    match tokio::task::spawn_blocking(move || backup.ensure_ready()).await {
+        Ok(Ok(())) => Ok(Json(json!({
+            "message_ja": "SMTP接続を確認できました。",
+            "message_en": "SMTP connectivity check succeeded.",
+        }))),
+        Ok(Err(e)) => Err(poem::Error::from_string(
+            format!("SMTP connectivity check failed: {e}"),
+            poem::http::StatusCode::SERVICE_UNAVAILABLE,
+        )),
+        Err(e) => Err(poem::Error::from_string(
+            format!("verification task panicked: {e}"),
+            poem::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )),
     }
 }

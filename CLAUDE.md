@@ -1094,6 +1094,88 @@ open-web-serverがApache＋Nginxのハイブリッド仕様のWebサーバーと
   (2) `admin.rs`側の管理系エンドポイント(バックアップ実行等)への
   対応要否の検討、(3) 管理API認証機構の追加とアプリ側对応。
 
+## HANDOFF: 2026-07-25 スタンドアロン・メール ディザスタバックアップを実装
+
+**SETワイド要件(ユーザー原文の要約)**: VPS間分散同期を一切設定していなくても、
+物理断線(SATA/USB/LAN/WiFiケーブル切断)・ネットワーク障害に備え、
+メールアドレスひとつだけで有効化できる、独立した最後の砦のバックアップ
+安全網を用意すること。`open-raid-z`(`offsite_backup.rs`の`EmailBackupTarget`、
+111テスト済み)・`open-web-server`(`disaster_email_backup.rs`、153テスト済み)・
+`open-easy-web`(`dist_sync.rs`の`/admin/dist-sync/disaster-fallback`)で
+同一セッション内に完成済み。本リポジトリが4リポジトリ目。
+
+- **実装内容**:
+  1. `crates/aruaru-dist/Cargo.toml`に新feature`disaster_email_backup`を追加
+     (`dep:open_raid_z_core` + `open_raid_z_core/offsite_backup`を有効化)。
+     既存の`open_raid_z`feature(commit×ZFSスナップショット連携、
+     `snapshot_pairing.rs`)とは別軸——**こちらはZFSスナップショット連携も
+     Raftクラスタの複数ノード構成も一切不要**、単体で動く。
+  2. `crates/aruaru-dist/src/disaster_email_backup.rs`(新規)。
+     `open_raid_z_core::offsite_backup::EmailBackupTarget`をそのまま
+     path依存で再利用(メール送信ロジックは再実装しない)。
+     `DisasterEmailBackupConfig`は`EmailBackupTargetConfig`を`#[serde(flatten)]`
+     で包むだけ(必須項目はメールアドレス等、`open_raid_z_core`側定義のまま)。
+     `backup_failed_command`が`raft::Command`(Exec/Commit)をJSON化して
+     メール添付として退避する。
+  3. **失敗検知フックの設計**: 本来の理想は`RaftWriter::propose_and_wait`
+     (`crates/aruaru-dist/src/raft/writer.rs`、過半数コミット待ち
+     `wait_for_commit`が失敗・タイムアウトした経路)に自動フックすることだが、
+     `RaftWriter`は`Applier`にジェネリックで`DisasterEmailBackup`を
+     フィールドとして持たせる設計変更が必要になり、今回のパスでは
+     **`DisasterEmailBackup`単体の構築・SMTP疎通確認・メール送信までを
+     実装・テスト完了**、`RaftWriter`への自動配線(propose_and_wait失敗時に
+     自動で`backup_failed_command`を呼ぶ)は**未着手**(次回候補、下記参照)。
+     現状は呼び出し側(`aruaru-wire`等の書き込み経路)が`RaftWriter`から
+     `Err`を受け取った際に、明示的に`DisasterEmailBackup::backup_failed_command`
+     を呼ぶ運用を想定した「部品」としては完成している。
+  4. `crates/aruaru-server/src/admin.rs`に管理API追加(`disaster_email_backup`
+     feature有効時のみ):`POST /admin/disaster-email-backup`(設定)・
+     `POST /admin/disaster-email-backup/verify`(SMTP疎通確認のみ、実送信なし)。
+     `open-web-server`/`open-easy-web`と同じ規約——`x-admin-token`ヘッダー、
+     環境変数`ARUARU_DB_ADMIN_TOKEN`が未設定なら503、トークン不一致・未提示
+     なら401。**このリポジトリの`/admin/*`は元々認証機構自体が存在しなかった
+     (2026-07-24 HANDOFFで既知のギャップと記載済み)**——今回は新設の
+     ディザスタバックアップAPI限定で導入し、既存の他の`/admin/*`
+     エンドポイントへの遡及適用はスコープ外(次回候補)。
+  5. `crates/aruaru-server/Cargo.toml`に同名featureを追加し
+     `aruaru-dist/disaster_email_backup`へ素通し。
+
+- **テスト(ローカルモックのみ、正直な開示)**: `crates/aruaru-dist/src/
+  disaster_email_backup.rs`内の`#[cfg(test)]`に、`open-raid-z`の
+  `tests/offsite_backup_integration.rs`と同じ最小限の偽SMTPサーバー
+  (生TCP、EHLO/AUTH LOGIN/MAIL FROM/RCPT TO/DATA/QUIT)を実装し、3テスト
+  追加(メール送信成功・クラスタ/スナップショット設定なしでの単体動作・
+  秘密情報未設定時の正直なエラー)。**実SMTPサーバー・実メールアカウントへ
+  の接続はテストで一切行っていない**。実際の物理断線(SATA/USB/LAN/WiFi
+  ケーブル抜去)シナリオも、このサンドボックス環境では検証不可能——
+  モックベースの検証のみ(`open-raid-z`自身のHANDOFFエントリと同じ
+  正直さの基準)。
+
+- **実行したコマンドと実際の結果**:
+  - `cargo build -p aruaru-dist --features disaster_email_backup` →
+    `Finished` dev profile(初回はopen_raid_z_core経由でlettre/russh/ureq等の
+    新規依存をコンパイル、以後は差分ビルド)。
+  - `cargo test -p aruaru-dist --features disaster_email_backup` →
+    `test result: ok. 32 passed; 0 failed; 1 ignored`(新規3テスト
+    `disaster_email_backup::tests::*`含む、既存29テストも全てgreenのまま
+    リグレッション無し)。
+  - `cargo build --workspace` → `Finished` dev profile(デフォルトfeature構成、
+    警告2件のみ: `disaster_email_backup`feature無効時の`Request`未使用
+    importと、既存の`propose_commit`未使用関数——いずれも今回の変更が
+    原因ではない/feature無効時のみ発生する無害な警告)。
+  - `cargo test -p aruaru-server --features disaster_email_backup` →
+    `test result: ok. 0 passed; 0 failed`(`aruaru-server`はバイナリクレートで
+    元々ユニットテストを持たない構成——新設のadmin.rsハンドラ自体の
+    ロジックは薄い橋渡しのみで、実質的な検証は`aruaru-dist`側の
+    `DisasterEmailBackup`テストでカバー済み)。
+
+- **次にすべきこと(次回候補)**: (a) `RaftWriter::propose_and_wait`失敗時に
+  `DisasterEmailBackup`を自動で呼ぶ配線(`Applier`実装や`aruaru-wire`側の
+  呼び出し元での明示的なハンドリングとして実装するか、`RaftWriter`に
+  `Option<Arc<DisasterEmailBackup>>`フィールドを追加するかの設計判断が
+  必要)、(b) 既存の他の`/admin/*`エンドポイント全体への`x-admin-token`
+  認証の遡及適用、(c) Tauri Admin GUI側の対応(設定フォーム追加)。
+
 ## エコシステム全体マップ(2026-07-21追記)
 
 同時並行開発の対象プロジェクト一覧・各リポジトリの現況は

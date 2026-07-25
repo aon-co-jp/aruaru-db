@@ -30,3 +30,8 @@ chrono.workspace      = true
 # DUAL DATABASE構成(`DUAL_DATABASE_URL`)向け。aruaru-dist/aruaru-wireと
 # 同じsqlx postgres featureセット。
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+
+[features]
+# スタンドアロンのメール・ディザスタバックアップ(2026-07-25追記)。
+# `aruaru-dist`の同名featureをそのまま素通しする。
+disaster_email_backup = ["aruaru-dist/disaster_email_backup"]

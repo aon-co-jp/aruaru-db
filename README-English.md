@@ -205,6 +205,16 @@ Git-managed versioning. Currently only TCP-IP/UDP-IP are implemented; the
 rest has not been started yet (see `open-web-server`'s
 `README.md`/`CLAUDE.md` for details).
 
+**Standalone email disaster backup (added 2026-07-25)**: a last-resort
+backup safety net that can be enabled with just an email address, requiring
+no VPS-to-VPS distributed sync, multi-node Raft cluster setup, or ZFS
+snapshot pairing. Implemented as the `disaster_email_backup` feature in
+`crates/aruaru-dist`, reusing `open-raid-z`'s `EmailBackupTarget` as-is, and
+configured via an admin API (`POST /admin/disaster-email-backup`,
+`x-admin-token` authenticated). Verified only against a local mock SMTP
+server; real SMTP / real disconnection scenarios have not been tested (see
+the 2026-07-25 HANDOFF entry in `CLAUDE.md` for the honest disclosure).
+
 ---
 
 ## 🤝 Contributing

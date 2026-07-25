@@ -35,3 +35,10 @@ open_raid_z_core = { path = "../../../open-raid-z/open_runo_zfs_source/open_raid
 
 [features]
 open_raid_z = ["dep:open_raid_z_core"]
+# スタンドアロンのメール・ディザスタバックアップ(2026-07-25追記)。
+# `open_raid_z`機能(commit x ZFSスナップショット連携)とは別軸——
+# こちらはVPS間分散同期・ZFSスナップショット連携のいずれも未設定の
+# 状態でも、メールアドレスひとつだけで有効化できる最後の砦。
+# `open_raid_z_core`の`offsite_backup`feature(lettre経由のSMTP送信、
+# `EmailBackupTarget`)をそのまま再利用する(車輪の再発明をしない)。
+disaster_email_backup = ["dep:open_raid_z_core", "open_raid_z_core/offsite_backup"]
