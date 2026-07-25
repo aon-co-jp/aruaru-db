@@ -1,5 +1,13 @@
 # aruaru-DB 🦀
 
+> **Updated 2026-07-25**: The dev-policy file (`CLAUDE.md`) heading was
+> renamed from "Development Policy & Dev Environment Rules" to
+> "Design Philosophy & Development Policy & Dev Environment Rules",
+> to more clearly separate the project's design philosophy (what we
+> value), development policy (how we work), and dev environment rules
+> (concrete operational conventions). See `CLAUDE.md` for details.
+
+
 > **The hybrid distributed database that speaks Git.**  
 > CockroachDB's distributed strong consistency × Snowflake's storage/compute separation × Git-on-SQL version control — all in Pure Rust.
 
