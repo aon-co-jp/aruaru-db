@@ -1176,6 +1176,146 @@ open-web-serverがApache＋Nginxのハイブリッド仕様のWebサーバーと
   必要)、(b) 既存の他の`/admin/*`エンドポイント全体への`x-admin-token`
   認証の遡及適用、(c) Tauri Admin GUI側の対応(設定フォーム追加)。
 
+## HANDOFF: 2026-07-25(続き) `RaftWriter::propose_and_wait`のquorum障害を`DisasterEmailBackup`へ自動配線
+
+**位置づけ**: 直上のHANDOFF(同日)が「未着手」と正直に記載していたギャップ
+(`RaftWriter`への自動配線)を今回のパスで実施した。
+
+- **読んだ実コード**: `crates/aruaru-dist/src/raft/writer.rs`
+  (`RaftWriter<A: Applier + 'static>`、`propose_and_wait`)、
+  `crates/aruaru-dist/src/raft/node.rs`の`RaftNode::wait_for_commit`
+  (341〜358行目)。`wait_for_commit`が`Err`を返すのは
+  タイムアウトまでに過半数コミットへ到達できなかった場合のみ
+  (`"timeout waiting for raft commit of index {index} (quorum not
+  reached)"`という固定文言の1経路のみ)——**これが真の「quorum障害」**。
+  一方`Ok(resp)`で`resp.ok == false`のケースは、Raftとしては
+  (過半数)コミット+適用まで到達しているが`Applier`実装がコマンドを
+  拒否した場合(無効なコマンド等)であり、quorum障害ではない。両者を
+  明確に区別し、**`Err`分岐のみ**をディザスタバックアップのトリガーとした
+  (`resp.ok == false`では発火しない)。
+
+- **設計・実装内容**(`crates/aruaru-dist/src/raft/writer.rs`を変更):
+  1. `RaftWriter<A>`に`#[cfg(feature = "disaster_email_backup")]`
+     ゲート付きの`disaster_backup: Option<Arc<DisasterEmailBackup>>`
+     フィールドを追加。`RaftWriter::new`は常に`None`で初期化——
+     `feature`無効ビルドではこのフィールド自体が存在せず、コンパイル
+     結果は今回の変更前と完全に同一になる(`cfg`でフィールド自体を
+     消しているため、実行時分岐のオーバーヘッドすら残らない)。
+  2. `with_disaster_email_backup(Arc<DisasterEmailBackup>)`ビルダーを
+     追加(feature有効時のみ)。既存呼び出し元はこれを呼ばなければ
+     従来通り`None`のまま——挙動が一切変わらないことをテストで実証
+     (下記)。
+  3. `propose_and_wait`の`wait_for_commit`結果を`match`に変更し、
+     `Err(reason)`分岐でのみ`trigger_disaster_backup_if_configured`を
+     呼ぶ(`resp.ok == false`分岐は素通し、従来の`Err(resp.message)`
+     のまま)。
+  4. **非ブロッキングの実現方法**: `open_raid_z_core::offsite_backup::
+     EmailBackupTarget::upload_segment`(`disaster_email_backup.rs`が
+     再利用しているメール送信本体)を実際に読んだところ**完全に同期・
+     ブロッキングI/O**(async fnではない)と判明した。そのため
+     `trigger_disaster_backup_if_configured`は、(a)まず`tokio::spawn`で
+     呼び出し元(`propose_and_wait`)の`await`から切り離し、(b)その中で
+     さらに`tokio::task::spawn_blocking`に包んでブロッキングSMTP I/Oを
+     tokioのブロッキングスレッドプールへ退避する、という二重の構成に
+     した。`propose_and_wait`はこの`tokio::spawn`の完了を一切`await`
+     せず即座に元の`Err(reason)`を返す。
+  5. `disaster_email_backup`feature無効時は`trigger_disaster_backup_
+     if_configured`が空実装(`#[cfg(not(...))]`)になり、呼び出し自体は
+     残るが何もしない——このゲーティングにより無効ビルドへの影響は
+     皆無。
+
+- **既存テストの構造改修**: `RaftWriter`のテストが`RaftWriter { node,
+  timeout: ... }`という構造体リテラルを直接組み立てていたが、新設の
+  `disaster_backup`フィールドがfeature構成によって存在有無が変わるため
+  そのままでは両構成でコンパイルできなくなる。`with_timeout(Duration)`
+  ビルダーを新設し、既存3テストをこれ経由に書き換えた(挙動は無変更、
+  構築方法のみ変更)。
+
+- **新規テスト**(`crates/aruaru-dist/src/raft/writer.rs`):
+  1. `test_quorum_failure_without_disaster_backup_configured_behaves_
+     as_before`(feature有無どちらでもコンパイル・実行される):
+     `disaster_email_backup`feature有効ビルドでも`with_disaster_email_
+     backup`を呼ばず未設定のままなら、既存の
+     `test_write_times_out_if_quorum_never_reached`と同じquorum障害
+     シナリオで(a)結果が`Err`のまま(b)所要時間が1秒未満(余計な遅延が
+     無い)ことを実証——「未設定なら無変更」を実測で確認。
+  2. `mod disaster_backup_wiring_tests`(`#[cfg(all(test, feature =
+     "disaster_email_backup"))]`で新規モジュール化)。既存の
+     quorum失敗シミュレーション(peersは持つがネットワーク層が無いため
+     複製ACKが来ない、`test_write_times_out_if_quorum_never_reached`と
+     同じ手法を再利用——新しい障害シミュレーション機構は発明していない)
+     と、`disaster_email_backup.rs`のテストと同じ偽SMTPサーバー
+     (生TCP、EHLO/AUTH LOGIN/MAIL FROM/RCPT TO/DATA/QUIT)パターンを
+     再利用。
+     - `quorum_failure_with_disaster_backup_configured_emails_the_
+       failed_command`: `DisasterEmailBackup`を設定した状態でquorum
+       障害を起こし、失敗した`Command`が実際に(モックSMTP経由で)
+       メールされることを実証(受信ボディに`"INSERT INTO items"`が
+       含まれることを確認)。
+     - `quorum_failure_does_not_block_on_disaster_backup_even_if_smtp_
+       is_unreachable`: SMTPサーバーを一切起動せず(port 1、到達不能)
+       ディザスタバックアップを設定した状態でquorum障害を起こし、
+       それでも`write_sql`自体が設定タイムアウト通り(1秒未満)で`Err`を
+       返すことを実証——非ブロッキング配線の直接的な証拠。
+
+- **実行したコマンドと実際の結果(すべて実行、以下は生ログの要約ではなく
+  実際の出力)**:
+  - `cargo build -p aruaru-dist --features disaster_email_backup` →
+    `Finished` dev profile(1m 03s)。
+  - `cargo test -p aruaru-dist --features disaster_email_backup` →
+    `test result: ok. 35 passed; 0 failed; 1 ignored`(前回32件+今回
+    新規3件、既存全件green・リグレッション無し)。
+  - `cargo test -p aruaru-dist`(featureなし) →
+    `test result: ok. 30 passed; 0 failed; 1 ignored`(前回29件+
+    feature無しでもコンパイル・実行される新規1件、リグレッション無し)。
+  - `cargo build --workspace` → `Finished` dev profile(2m 40s)、
+    警告2件のみ(`aruaru-server`の`Request`未使用importと
+    `propose_commit`未使用関数)——いずれも前回HANDOFFから存在する
+    既知の無害な警告で、今回の変更が原因のものは無い。
+  - `cargo test -p aruaru-server --features disaster_email_backup` →
+    `test result: ok. 0 passed; 0 failed`(前回同様、バイナリクレートで
+    ユニットテスト無し、警告も前回同一の2件のみ)。
+
+- **正直な開示・スコープの限界**:
+  1. **非ブロッキングの検証範囲**: `quorum_failure_does_not_block_on_
+     disaster_backup_even_if_smtp_is_unreachable`はTCP接続自体が
+     即座に失敗する「到達不能ポート」シナリオで非ブロッキングを実証
+     したが、**「TCP接続は確立するがSMTPサーバーが応答をダラダラ遅延
+     させる」という真のスロー・スロー・ロリスシナリオでの検証は
+     行っていない**——このサンドボックス環境で意図的に遅いモック
+     SMTPサーバー(応答を数秒〜数十秒遅延させる)を書くことは技術的に
+     可能だが、今回はスコープを到達不能ケースの実証に留めた。
+     ただし設計自体(`tokio::spawn`+`spawn_blocking`で呼び出し元の
+     `await`から完全に切り離し)は、遅延の原因がDNS解決・TCP接続
+     確立・SMTP応答のどの段階であっても呼び出し元をブロックしない
+     はずである(`spawn_blocking`されたブロッキングタスク自体は
+     長時間かかり得るが、それは呼び出し元が待っている`Err(reason)`の
+     返却には一切影響しない)。次回、意図的に遅いモックSMTPサーバーで
+     この設計上の保証を実測することが望ましい。
+  2. **`Applier`実装側からの明示的な呼び出しは引き続き未対応**:
+     今回配線したのは`RaftWriter::propose_and_wait`(ジェネリックな
+     `RaftWriter<A>`レベル)のみ。`aruaru-wire`等の上位呼び出し元が
+     `RaftWriter`を経由せず`RaftNode`を直接使っている経路があれば
+     (現状は`aruaru-server/src/cluster.rs`が`RaftWriter`経由と
+     未使用の`propose_commit`の両方を持つ、既知の状態)、そちらは
+     今回の配線の対象外。
+  3. **`aruaru-wire`/`aruaru-server`側での実際の`with_disaster_email_
+     backup`呼び出し配線は未実施**: `RaftWriter`は今回自動配線を
+     受け付けられるようになったが、実際に`aruaru-server`起動時に
+     `DisasterEmailBackupConfig`から`DisasterEmailBackup`を構築し
+     `RaftWriter::with_disaster_email_backup`へ渡す配線(管理API
+     `POST /admin/disaster-email-backup`で設定した内容を実際の
+     `RaftWriter`インスタンスへ反映する経路)はまだ無い——現状の
+     `admin.rs`のハンドラは`DisasterEmailBackup`単体の設定検証のみで、
+     稼働中の`RaftWriter`への注入は次回対応。
+
+- **次にすべきこと(次回候補)**: (a) 意図的に遅延するモックSMTPサーバーで
+  真のスロー・スロー・ロリスシナリオでの非ブロッキング性を実測、
+  (b) `aruaru-server`起動時、`POST /admin/disaster-email-backup`で
+  設定された`DisasterEmailBackup`を稼働中の`RaftWriter`インスタンスへ
+  実際に注入する配線、(c) `aruaru-wire`が`RaftWriter`を経由せず
+  `RaftNode`を直接叩く経路が無いか棚卸し。
+
 ## エコシステム全体マップ(2026-07-21追記)
 
 同時並行開発の対象プロジェクト一覧・各リポジトリの現況は

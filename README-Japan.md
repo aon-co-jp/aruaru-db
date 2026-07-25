@@ -160,6 +160,13 @@ feature)。`open-raid-z`の`EmailBackupTarget`をそのまま再利用し、管�
 ローカルモックSMTPでのテストのみ実施済み(実SMTP・実断線シナリオの検証は
 未実施、正直な開示は `CLAUDE.md` の2026-07-25 HANDOFF参照)。
 
+**同日追記**: `RaftWriter::propose_and_wait`のquorum障害(過半数コミット
+タイムアウト)発生時に、設定されていれば自動で`DisasterEmailBackup`を
+呼ぶ配線を追加。`Option<Arc<DisasterEmailBackup>>`として任意設定
+(未設定なら挙動は完全に無変更)、`tokio::spawn`+`spawn_blocking`で
+呼び出し元をブロックしないバックグラウンド送信。詳細・検証結果・
+残課題は `CLAUDE.md` の同日続編HANDOFF参照。
+
 ---
 
 ## 🤝 コントリビュート
