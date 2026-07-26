@@ -223,6 +223,20 @@ sent from a background `tokio::spawn` + `spawn_blocking` task so the
 caller is never blocked. See the same-day follow-up HANDOFF entry in
 `CLAUDE.md` for details, verification, and remaining gaps.
 
+**Same-day follow-up (2)**: closed/advanced the 3 previously-disclosed
+open gaps. (1) Verified non-blocking behavior against a genuinely slow
+SMTP server (TCP connects, but EHLO/AUTH responses are delayed by
+seconds), not just an unreachable one. (2) The admin API (`POST
+/admin/disaster-email-backup`) now actually injects the configured
+`DisasterEmailBackup` into the **live** `RaftWriter` instance serving
+traffic (added a runtime setter `set_disaster_email_backup` to the
+`ReplicatedWriter` trait), not just validate-and-store. (3) Audited for
+`RaftNode`-direct callers bypassing `RaftWriter`: found and fixed one at
+REST `/admin/cluster/propose`. The GraphQL `cluster_propose` resolver
+(`crates/aruaru-graphql/src/admin_resolvers.rs`) still writes directly to
+`QueryEngine`, bypassing `RaftWriter` entirely — left undocumented^Wunfixed
+this pass (follow-up). See the 3rd same-day HANDOFF entry in `CLAUDE.md`.
+
 ---
 
 ## 🤝 Contributing

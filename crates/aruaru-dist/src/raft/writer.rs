@@ -15,6 +15,8 @@ use super::node::{Applier, RaftNode};
 
 #[cfg(feature = "disaster_email_backup")]
 use crate::disaster_email_backup::DisasterEmailBackup;
+#[cfg(feature = "disaster_email_backup")]
+use parking_lot::Mutex;
 
 /// デフォルトの複製書き込み待ちタイムアウト (単一ノードでは即時完了)
 pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,6 +28,15 @@ pub trait ReplicatedWriter: Send + Sync {
 
     /// バージョンコミット(aruaru_commit)をRaft経由で提案し、完了まで待つ。
     async fn write_commit(&self, message: &str) -> Result<String, String>;
+
+    /// 稼働中(既に`Arc`で共有済み)のインスタンスへ、スタンドアロン・メール
+    /// ディザスタバックアップを後から注入する(2026-07-25追記、gap (b) 対応)。
+    /// `RaftWriter::with_disaster_email_backup`が構築時専用のconsumingビルダー
+    /// なのに対し、こちらは`&self`のみで呼べる実行時セッター——管理API
+    /// (`POST /admin/disaster-email-backup`)が、既に起動しpgwireサーバへ
+    /// 渡し済みの`Arc<dyn ReplicatedWriter>`に対して呼び出すためのもの。
+    #[cfg(feature = "disaster_email_backup")]
+    fn set_disaster_email_backup(&self, backup: Arc<DisasterEmailBackup>);
 }
 
 /// `RaftNode<A>` を型消去して `ReplicatedWriter` として公開するラッパー
@@ -38,8 +49,13 @@ pub struct RaftWriter<A: Applier + 'static> {
     /// (「補助機能の失敗/未設定が本流の書き込み経路をブロックしない」
     /// という本エコシステム共通の設計方針、`open-web-server`の
     /// DDNS/ACME補助機能と同じ扱い)。
+    /// `Mutex`による内部可変性(2026-07-25追記、gap (b) 対応)。構築時の
+    /// `with_disaster_email_backup`ビルダーに加え、既に`Arc`共有済みの
+    /// 生存インスタンスへ実行時に注入する`set_disaster_email_backup`
+    /// (`ReplicatedWriter`トレイト経由)からも書き換えられるようにするため、
+    /// 単純な`Option<Arc<..>>`ではなく`Mutex`で包む。
     #[cfg(feature = "disaster_email_backup")]
-    disaster_backup: Option<Arc<DisasterEmailBackup>>,
+    disaster_backup: Mutex<Option<Arc<DisasterEmailBackup>>>,
 }
 
 impl<A: Applier + 'static> RaftWriter<A> {
@@ -48,17 +64,17 @@ impl<A: Applier + 'static> RaftWriter<A> {
             node,
             timeout: DEFAULT_COMMIT_TIMEOUT,
             #[cfg(feature = "disaster_email_backup")]
-            disaster_backup: None,
+            disaster_backup: Mutex::new(None),
         }
     }
 
-    /// スタンドアロン・メールディザスタバックアップを配線する(任意)。
+    /// スタンドアロン・メールディザスタバックアップを配線する(任意、構築時)。
     /// 過半数コミットに失敗した(=quorum未達/タイムアウト)`Command`だけを
     /// メールへ退避する。設定しなければ`propose_and_wait`の挙動は完全に
     /// 従来通り。
     #[cfg(feature = "disaster_email_backup")]
-    pub fn with_disaster_email_backup(mut self, backup: Arc<DisasterEmailBackup>) -> Self {
-        self.disaster_backup = Some(backup);
+    pub fn with_disaster_email_backup(self, backup: Arc<DisasterEmailBackup>) -> Self {
+        *self.disaster_backup.lock() = Some(backup);
         self
     }
 
@@ -110,7 +126,7 @@ impl<A: Applier + 'static> RaftWriter<A> {
     /// 既に受け取った呼び出し元をさらに待たせてはならないため。
     #[cfg(feature = "disaster_email_backup")]
     fn trigger_disaster_backup_if_configured(&self, command: &Command, reason: &str) {
-        let Some(backup) = self.disaster_backup.clone() else { return };
+        let Some(backup) = self.disaster_backup.lock().clone() else { return };
         let command = command.clone();
         let reason = reason.to_string();
         tokio::spawn(async move {
@@ -139,6 +155,11 @@ impl<A: Applier + 'static> ReplicatedWriter for RaftWriter<A> {
 
     async fn write_commit(&self, message: &str) -> Result<String, String> {
         self.propose_and_wait(Command::Commit(message.to_string())).await
+    }
+
+    #[cfg(feature = "disaster_email_backup")]
+    fn set_disaster_email_backup(&self, backup: Arc<DisasterEmailBackup>) {
+        *self.disaster_backup.lock() = Some(backup);
     }
 }
 
@@ -355,6 +376,161 @@ mod disaster_backup_wiring_tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
+        let bodies = received.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("INSERT INTO items"));
+    }
+
+    /// EHLO/AUTHへの応答を数秒遅延させる「本物の低速SMTP」偽サーバー。
+    /// 到達不能(接続自体が即失敗)ケースとは異なり、TCP接続は確立するが
+    /// アプリケーション層(SMTP応答)がダラダラ遅い、真のスロー・スロー・
+    /// ロリスシナリオを再現する。`disaster_email_backup.rs`と同じ最小限の
+    /// 偽SMTPサーバー実装に、EHLO受信後の`delay`だけを追加した。
+    fn spawn_slow_fake_smtp_server(received: Arc<Mutex<Vec<String>>>, delay: Duration) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                handle_slow_smtp_client(stream, Arc::clone(&received), delay);
+                break;
+            }
+        });
+        port
+    }
+
+    fn handle_slow_smtp_client(mut stream: TcpStream, received: Arc<Mutex<Vec<String>>>, delay: Duration) {
+        // 接続(TCP)自体はすぐ確立するが、EHLO/AUTHへの応答をわざと遅延させる。
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let _ = stream.write_all(b"220 localhost slow fake smtp ready\r\n");
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let cmd = line.trim_end();
+            if cmd.to_ascii_uppercase().starts_with("EHLO") {
+                std::thread::sleep(delay);
+                let _ = stream.write_all(b"250-localhost\r\n250-AUTH LOGIN\r\n250 OK\r\n");
+            } else if cmd.to_ascii_uppercase().starts_with("AUTH LOGIN") {
+                std::thread::sleep(delay);
+                let _ = stream.write_all(b"334 VXNlcm5hbWU6\r\n");
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                let _ = stream.write_all(b"334 UGFzc3dvcmQ6\r\n");
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                let _ = stream.write_all(b"235 Authentication successful\r\n");
+            } else if cmd.to_ascii_uppercase().starts_with("MAIL FROM") {
+                let _ = stream.write_all(b"250 OK\r\n");
+            } else if cmd.to_ascii_uppercase().starts_with("RCPT TO") {
+                let _ = stream.write_all(b"250 OK\r\n");
+            } else if cmd.to_ascii_uppercase().starts_with("DATA") {
+                let _ = stream.write_all(b"354 Start mail input; end with <CRLF>.<CRLF>\r\n");
+                let mut body = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if line == ".\r\n" {
+                        break;
+                    }
+                    body.push_str(&line);
+                }
+                received.lock().unwrap().push(body);
+                let _ = stream.write_all(b"250 OK: queued\r\n");
+            } else if cmd.to_ascii_uppercase().starts_with("QUIT") {
+                let _ = stream.write_all(b"221 Bye\r\n");
+                return;
+            } else {
+                let _ = stream.write_all(b"250 OK\r\n");
+            }
+        }
+    }
+
+    /// Gap (a) を埋めるテスト: 「TCP接続は確立するがSMTP応答がダラダラ遅い」
+    /// 真のスロー・スロー・ロリスシナリオでも、`propose_and_wait`(`write_sql`)
+    /// 自体は遅延に引きずられず、設定タイムアウト通りに素早く応答を返す
+    /// ことを実証する。遅延(3秒、EHLO+AUTHの2箇所で発生するため合計6秒相当)
+    /// より十分小さい`with_timeout`(100ms)で、書き込み自体の所要時間を検証する。
+    /// Gap (b) の土台となる実行時セッターの検証: 既に`Arc<dyn ReplicatedWriter>`
+    /// として共有済み(=生存中のサーバーが保持しているのと同じ状態)の
+    /// インスタンスに対し、構築時ビルダーを使わず`set_disaster_email_backup`
+    /// (トレイト経由)で後から注入しても、quorum障害時に実際にメールされる
+    /// ことを確認する。`aruaru-server`の管理API(`POST /admin/
+    /// disaster-email-backup`)がまさにこの経路(`&self`のみ、生存インスタンス
+    /// への注入)で呼ぶことを想定している。
+    #[tokio::test]
+    async fn set_disaster_email_backup_after_arc_sharing_still_wires_up_correctly() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_fake_smtp_server(Arc::clone(&received));
+        std::env::set_var("ARUARU_TEST_WRITER_SMTP_PASSWORD_RUNTIME", "test-password");
+        let backup = make_backup(port, "ARUARU_TEST_WRITER_SMTP_PASSWORD_RUNTIME");
+
+        let node = Arc::new(RaftNode::new(1, RecordingApplier { applied: PlMutex::new(vec![]) }, vec![2, 3]));
+        node.become_leader();
+        // 構築時は disaster backup 未設定のまま Arc<dyn ReplicatedWriter> として共有
+        // (main.rs が pgwire サーバへ渡すのと同じ形)。
+        let writer: Arc<dyn ReplicatedWriter> =
+            Arc::new(RaftWriter::new(node).with_timeout(Duration::from_millis(100)));
+
+        // ここで後から注入する(管理APIハンドラが行うのと同じ操作)。
+        writer.set_disaster_email_backup(backup);
+
+        let result = writer.write_sql("INSERT INTO items VALUES (1, 'sword')").await;
+        assert!(result.is_err(), "quorum未達なら書き込みは確定応答してはならない");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !received.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "実行時注入したdisaster backupがメールしなかった");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(received.lock().unwrap()[0].contains("INSERT INTO items"));
+    }
+
+    #[tokio::test]
+    async fn quorum_failure_does_not_block_on_disaster_backup_even_when_smtp_is_genuinely_slow() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let slow_delay = Duration::from_secs(3);
+        let port = spawn_slow_fake_smtp_server(Arc::clone(&received), slow_delay);
+        std::env::set_var("ARUARU_TEST_WRITER_SMTP_PASSWORD_SLOW", "test-password");
+        let backup = make_backup(port, "ARUARU_TEST_WRITER_SMTP_PASSWORD_SLOW");
+
+        let node = Arc::new(RaftNode::new(1, RecordingApplier { applied: PlMutex::new(vec![]) }, vec![2, 3]));
+        node.become_leader();
+        let writer = RaftWriter::new(node)
+            .with_timeout(Duration::from_millis(100))
+            .with_disaster_email_backup(backup);
+
+        let start = std::time::Instant::now();
+        let result = writer.write_sql("INSERT INTO items VALUES (1, 'sword')").await;
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "quorum未達なら書き込みは確定応答してはならない");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "本物の低速SMTP(EHLO/AUTH応答を{slow_delay:?}遅延)に引きずられて\
+             write_sql自体がブロックしてはならない(実測: {elapsed:?}、\
+             SMTP側の遅延より遥かに短いはず)"
+        );
+
+        // 背景タスク側では、遅延はあってもいずれメールが届くはず(非ブロッキングは
+        // 「呼び出し元を待たせない」であって「送信を諦める」ではないことの確認)。
+        let deadline = std::time::Instant::now() + slow_delay * 3 + Duration::from_secs(2);
+        loop {
+            if !received.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "低速SMTPでも(遅延はしても)最終的にはメールが送られるはず"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let bodies = received.lock().unwrap();
         assert_eq!(bodies.len(), 1);
         assert!(bodies[0].contains("INSERT INTO items"));

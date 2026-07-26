@@ -43,6 +43,15 @@ pub struct AdminState {
     /// 有無に関わらず、メールアドレスひとつだけで有効化できる最後の砦)。
     #[cfg(feature = "disaster_email_backup")]
     disaster_email_backup: Mutex<Option<Arc<aruaru_dist::DisasterEmailBackup>>>,
+    /// 稼働中のRaft複製書き込み経路(pgwireサーバへ渡されているのと同一の
+    /// `Arc<dyn ReplicatedWriter>`、2026-07-25追記・gap (b)/(c) 対応)。
+    /// `main.rs`でRaftクラスタ構築に成功した場合のみ`Some`。管理API
+    /// (`POST /admin/disaster-email-backup`)がここへ`set_disaster_email_backup`
+    /// を呼ぶことで、稼働中のインスタンスへ実際に注入できる。また
+    /// `cluster_propose`(REST `/admin/cluster/propose`)もこの経路を優先して
+    /// 使うことで、`RaftNode`を直接叩く旧経路(`cluster::propose_write`)を
+    /// 迂回しなくなる(=disaster-backup配線を必ず経由する)。
+    replicator: Mutex<Option<Arc<dyn aruaru_dist::ReplicatedWriter>>>,
 }
 
 impl AdminState {
@@ -58,6 +67,7 @@ impl AdminState {
             cluster: Mutex::new(None),
             #[cfg(feature = "disaster_email_backup")]
             disaster_email_backup: Mutex::new(None),
+            replicator: Mutex::new(None),
         })
     }
 
@@ -68,6 +78,16 @@ impl AdminState {
 
     pub fn cluster_node(&self) -> Option<Arc<ClusterNode>> {
         self.cluster.lock().clone()
+    }
+
+    /// 稼働中のRaft複製書き込み経路(pgwireサーバへ渡すのと同じインスタンス)
+    /// を取り付ける。`main.rs`でRaftクラスタ構築に成功した場合のみ呼ばれる。
+    pub fn attach_replicator(&self, replicator: Arc<dyn aruaru_dist::ReplicatedWriter>) {
+        *self.replicator.lock() = Some(replicator);
+    }
+
+    pub fn replicator(&self) -> Option<Arc<dyn aruaru_dist::ReplicatedWriter>> {
+        self.replicator.lock().clone()
     }
 }
 
@@ -791,8 +811,19 @@ fn raft_vote(
 }
 
 /// クライアント書き込みを Raft 経由で提案 (Leader のみ受理)
+///
+/// **2026-07-25追記(gap (c) 対応)**: 以前はここで`crate::cluster::
+/// propose_write`(`RaftNode`を直接叩き、`propose`→`try_commit_to`→
+/// `maybe_commit`→`apply_committed`を手動で行う経路)を呼んでおり、
+/// `RaftWriter`(および`disaster_email_backup`配線)を完全に迂回していた。
+/// 稼働中の`replicator`(`Arc<dyn ReplicatedWriter>`、pgwireサーバに渡して
+/// いるのと同一インスタンス)が取り付けられていれば、そちらを優先して使う
+/// ことで、この管理API経由の書き込みもRaftWriterの`propose_and_wait`
+/// (=quorum障害時のdisaster-backup配線)を必ず経由するようにした。
+/// `replicator`が無い(クラスタ構築に失敗した等の異常系)場合のみ、
+/// 後方互換のため旧経路へフォールバックする。
 #[handler]
-fn cluster_propose(state: Data<&Arc<AdminState>>, Json(req): Json<SqlRequest>) -> Json<Value> {
+async fn cluster_propose(state: Data<&Arc<AdminState>>, Json(req): Json<SqlRequest>) -> Json<Value> {
     let Some(node) = state.cluster_node() else {
         // 非クラスタモード: 通常パスで実行
         return match state.engine.execute(&req.sql) {
@@ -808,11 +839,25 @@ fn cluster_propose(state: Data<&Arc<AdminState>>, Json(req): Json<SqlRequest>) -
             "note": "書き込みは Leader ノードへ送ってください。"
         }));
     }
+
+    if let Some(replicator) = state.replicator() {
+        return match replicator.write_sql(&req.sql).await {
+            Ok(tag) => Json(json!({
+                "success": true, "mode": "raft", "commit_index": node.commit_index(),
+                "message": format!("RaftWriter経由で提案・commit+適用が完了しました({tag})。")
+            })),
+            Err(e) => Json(json!({ "success": false, "message": e })),
+        };
+    }
+
+    // フォールバック: replicator 未取り付け(構築失敗等の異常系)のみ、
+    // RaftNode を直接叩く旧経路を使う。この経路は disaster-backup 配線を
+    // 経由しない既知の限界(CLAUDE.md 参照)。
     match crate::cluster::propose_write(&node, &req.sql) {
         Ok(idx) => Json(json!({
-            "success": true, "mode": "raft", "log_index": idx,
+            "success": true, "mode": "raft_fallback_no_replicator", "log_index": idx,
             "commit_index": node.commit_index(),
-            "message": format!("提案を log index {idx} に追加しました。")
+            "message": format!("提案を log index {idx} に追加しました(replicator未取り付けのためRaftNode直接経路、disaster-backup配線対象外)。")
         })),
         Err(e) => Json(json!({ "success": false, "message": e })),
     }
@@ -888,11 +933,34 @@ fn set_disaster_email_backup(
         return Err(poem::Error::from_string(msg, status));
     }
 
-    *state.disaster_email_backup.lock() = Some(Arc::new(aruaru_dist::DisasterEmailBackup::new(config)));
+    let backup = Arc::new(aruaru_dist::DisasterEmailBackup::new(config));
+    *state.disaster_email_backup.lock() = Some(backup.clone());
+
+    // gap (b) 対応: 検証・保管だけでなく、実際に稼働中の RaftWriter
+    // (pgwire サーバへ渡しているのと同一インスタンス)へ注入する。
+    // クラスタ構築(Raft)に成功していない場合(単一ノード・レプリケータ
+    // 無し)は `replicator` が `None` のままなので、その旨を正直に message
+    // へ含める。
+    let injected = match state.replicator() {
+        Some(replicator) => {
+            replicator.set_disaster_email_backup(backup);
+            true
+        }
+        None => false,
+    };
 
     Ok(Json(json!({
-        "message_ja": "ディザスタ用メール退避先を設定しました(他の同期・レプリケーション設定は不要です)。",
-        "message_en": "Disaster email backup destination configured (no other sync/replication setup required).",
+        "message_ja": if injected {
+            "ディザスタ用メール退避先を設定し、稼働中のRaft書き込み経路へ反映しました(他の同期・レプリケーション設定は不要です)。".to_string()
+        } else {
+            "ディザスタ用メール退避先を設定しましたが、Raftクラスタが構築されていないため稼働中の書き込み経路への反映はできませんでした(--peers 未指定または構築失敗)。設定自体は保持しています。".to_string()
+        },
+        "message_en": if injected {
+            "Disaster email backup destination configured and injected into the live Raft write path (no other sync/replication setup required)."
+        } else {
+            "Disaster email backup destination configured, but no live Raft write path exists yet (cluster not built), so it could not be injected. The configuration is retained."
+        },
+        "injected_into_live_replicator": injected,
     })))
 }
 

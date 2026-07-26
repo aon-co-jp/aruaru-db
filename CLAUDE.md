@@ -1316,6 +1316,144 @@ open-web-serverがApache＋Nginxのハイブリッド仕様のWebサーバーと
   実際に注入する配線、(c) `aruaru-wire`が`RaftWriter`を経由せず
   `RaftNode`を直接叩く経路が無いか棚卸し。
 
+## HANDOFF: 2026-07-25(続き2) 前回の3つの正直な未検証ギャップを埋める
+
+**位置づけ**: 直上2件のHANDOFF(同日)が挙げた3つの「正直な開示」ギャップ
+(a) 真のスロー・スロー・ロリスSMTP未検証、(b) 管理APIが稼働中の
+`RaftWriter`へ注入しない、(c) `RaftNode`直叩きの迂回経路の棚卸し未実施、
+を今回のパスで解消/前進させた。
+
+- **(a) 真の低速SMTPテストを追加(解消)**:
+  `crates/aruaru-dist/src/raft/writer.rs`の`disaster_backup_wiring_tests`に
+  `spawn_slow_fake_smtp_server`/`handle_slow_smtp_client`を追加(既存の
+  偽SMTPサーバーと同じEHLO/AUTH LOGIN/MAIL FROM/RCPT TO/DATA/QUITだが、
+  EHLO・AUTH応答をそれぞれ`std::thread::sleep(3秒)`で遅延させる——TCP接続
+  自体はすぐ確立するが、SMTP応答がダラダラ遅い真のスロー・スロー・ロリス
+  シナリオ)。新規テスト
+  `quorum_failure_does_not_block_on_disaster_backup_even_when_smtp_is_genuinely_slow`
+  は、`with_timeout(100ms)`のquorum障害シナリオで`write_sql`自体が1秒未満
+  (=3秒の遅延より遥かに短い)で`Err`を返すことを実測し、その後
+  バックグラウンドで実際にメールが届くことも確認する。これにより
+  `tokio::spawn`+`spawn_blocking`の二重デタッチが、到達不能ケースだけで
+  なく実際の低速応答でも呼び出し元をブロックしないことを実証した。
+
+- **(b) 管理APIから稼働中のRaftWriterへの実注入(解消)**:
+  1. `crates/aruaru-dist/src/raft/writer.rs`: `RaftWriter<A>`の
+     `disaster_backup`フィールドを`Option<Arc<..>>`から
+     `parking_lot::Mutex<Option<Arc<..>>>`に変更(内部可変性)。
+     `ReplicatedWriter`トレイトに`#[cfg(feature = "disaster_email_backup")]`
+     ゲート付きの新メソッド`set_disaster_email_backup(&self, backup:
+     Arc<DisasterEmailBackup>)`を追加し、`RaftWriter`に実装。これにより
+     既に`Arc`で共有済み(生存中のサーバーが保持しているのと同じ状態)の
+     インスタンスへ、構築時ビルダー(`with_disaster_email_backup`、
+     consuming)を使わず後から注入できる。新規テスト
+     `set_disaster_email_backup_after_arc_sharing_still_wires_up_correctly`
+     で、`Arc<dyn ReplicatedWriter>`化した後の注入でも実際にメールされる
+     ことを確認済み。
+  2. `crates/aruaru-server/src/admin.rs`: `AdminState`に新フィールド
+     `replicator: Mutex<Option<Arc<dyn aruaru_dist::ReplicatedWriter>>>`を
+     追加(`attach_replicator`/`replicator`アクセサ)。
+     `set_disaster_email_backup`ハンドラ(`POST /admin/
+     disaster-email-backup`)は、設定検証・保管に加えて
+     `state.replicator()`が`Some`なら`set_disaster_email_backup`を実際に
+     呼び出す(`injected_into_live_replicator`をレスポンスに含め、
+     Raftクラスタ未構築で`replicator`が無い場合は正直にその旨を
+     message_ja/enへ記載)。
+  3. `crates/aruaru-server/src/main.rs`: Raftクラスタ構築成功時、
+     pgwireサーバへ渡すのと**同一の**`Arc<dyn ReplicatedWriter>`
+     (`raft_writer`)を`admin_state.attach_replicator(raft_writer.clone())`
+     でも取り付けるよう変更(1つのRaftWriterインスタンスを両方の経路が
+     共有する)。
+
+- **(c) `RaftNode`直叩きの迂回経路を棚卸し(1件発見・配線、1件発見・
+  ドキュメント化)**:
+  1. **発見して配線した迂回経路**: `crates/aruaru-server/src/admin.rs`の
+     `cluster_propose`ハンドラ(REST `POST /admin/cluster/propose`)が、
+     `crates/aruaru-server/src/cluster.rs`の`propose_write`(`RaftNode::
+     propose`→`try_commit_to`→`maybe_commit`→`apply_committed`を直接
+     手動で呼ぶ)経由で書き込みしており、`RaftWriter`(および
+     disaster-backup配線)を完全に迂回していた。今回、上記(b)で
+     `AdminState`に取り付けた`replicator`が`Some`の場合はそちらを
+     優先して`replicator.write_sql(&req.sql).await`を呼ぶよう変更
+     (ハンドラを`async fn`化)。`replicator`が無い(クラスタ構築失敗等の
+     異常系)場合のみ、後方互換のため`cluster::propose_write`の旧経路へ
+     フォールバックする(この場合のみ引き続きdisaster-backup配線の対象外
+     であることをレスポンスの`mode: "raft_fallback_no_replicator"`と
+     messageで明示)。
+  2. **発見したが今回は配線しなかった迂回経路(既知の未解決ギャップとして
+     明記)**: `crates/aruaru-graphql/src/admin_resolvers.rs`
+     355〜365行目の`cluster_propose` GraphQL resolver(Mutation)が、
+     `RaftNode`すら経由せず`a.engine.execute(&sql)`で`QueryEngine`へ
+     **直接**書き込んでいる(Raftコンセンサス自体を完全にスキップ)。
+     この経路は`AdminCtx`(同ファイル17〜21行目、`engine`/`registry`/
+     `backup`の3フィールドのみ)が`RaftWriter`/`replicator`への参照を
+     一切持っていないため。`aruaru-graphql`の`Cargo.toml`は現状
+     `aruaru-dist`に依存しておらず、`AdminCtx`への`replicator`追加・
+     `main.rs`側でのGraphQLコンテキスト構築箇所(`AdminCtx { engine:
+     .., registry: .., backup: .. }`)への配線・スキーマ影響確認が
+     必要になるため、今回のパスでは着手せず正直に未解決として記録する
+     (次回候補、下記)。**単一ノード構成では`QueryEngine`への直接書き込み
+     も最終的に同じ状態に収束するため実害は小さいが、複数ノードクラスタ
+     構成でこのGraphQL経路から書き込むと、Raftレプリケーションを経由せず
+     ローカルノードのみに適用される=他ノードとの一貫性が崩れる、
+     という真のバグになり得る**。
+  3. その他`RaftNode`使用箇所(`crates/aruaru-dist/src/multi_raft.rs`の
+     `MultiRaftGroups`、`crates/aruaru-dist/src/raid_z_backend.rs`・
+     `snapshot_pairing.rs`のテスト用途)は`aruaru-server`の実運用書き込み
+     経路(pgwire・REST admin API)からは呼ばれておらず、今回の迂回経路
+     棚卸しの対象外(`multi_raft`は複数Raftグループの実験的抽象化で、
+     現状`aruaru-server`からは未使用)。
+
+- **実行したコマンドと実際の結果(すべて実行、生ログ)**:
+  - `cargo build --workspace` →
+    `warning: unused import: \`Request\`` (admin.rs:18、feature無効時のみ)、
+    `warning: function \`propose_commit\` is never used` (cluster.rs:86、
+    今回のフォールバック経路が呼ばないため引き続き未使用)の2件のみ、
+    `Finished \`dev\` profile [optimized + debuginfo] target(s) in 1m 57s`。
+    いずれも前回HANDOFFから存在する既知の無害な警告で、今回の変更が
+    原因のものは無い。
+  - `cargo build -p aruaru-dist --features disaster_email_backup` →
+    `Finished \`dev\` profile [optimized + debuginfo] target(s) in 20.46s`。
+  - `cargo test -p aruaru-dist --features disaster_email_backup` →
+    `test result: ok. 37 passed; 0 failed; 1 ignored; 0 measured; 0 filtered
+    out; finished in 6.20s`(前回35件+今回新規2件
+    `quorum_failure_does_not_block_on_disaster_backup_even_when_smtp_is_
+    genuinely_slow`・`set_disaster_email_backup_after_arc_sharing_still_
+    wires_up_correctly`、既存全件green・リグレッション無し)。
+  - `cargo test -p aruaru-server --features disaster_email_backup` →
+    `test result: ok. 0 passed; 0 failed; 0 measured; 0 filtered out;
+    finished in 0.00s`(前回同様バイナリクレートでユニットテスト無し、
+    警告は`propose_commit`未使用1件のみ)。
+  - `cargo test -p aruaru-dist`(featureなし) →
+    `test result: ok. 30 passed; 0 failed; 1 ignored; 0 measured; 0
+    filtered out; finished in 0.12s`(前回同数、リグレッション無し)。
+  - `cargo test -p aruaru-server`(featureなし) →
+    `test result: ok. 0 passed; 0 failed; 0 measured; 0 filtered out;
+    finished in 0.00s`(警告2件、`Request`未使用importと`propose_commit`
+    未使用関数、いずれも既知)。
+
+- **正直な開示・スコープの限界(今回も残るもの)**:
+  1. `crates/aruaru-graphql/src/admin_resolvers.rs`の`cluster_propose`
+     resolverは引き続き`RaftWriter`/`replicator`を経由しない(上記(c)-2
+     参照)。GraphQL Admin GUIから複数ノードクラスタ構成でこの
+     ミューテーションを叩くと、disaster-backup対象外なだけでなく
+     Raftレプリケーション自体をスキップする(単一ノードでは実害なし)。
+  2. (a)のテストは「EHLO/AUTH応答を3秒遅延」という具体的な低速シナリオ
+     を検証したが、DNS解決自体が遅いケースやTLSハンドシェイクが遅い
+     ケースなど、遅延が発生し得る全段階を網羅したわけではない
+     (`tokio::spawn`+`spawn_blocking`という設計そのものは段階を問わず
+     呼び出し元を保護するはずだが、個別の実測は今回の1シナリオのみ)。
+  3. Tauri Admin GUI側の対応(ディザスタバックアップ設定フォーム追加)は
+     引き続き未着手(前々回HANDOFFから継続する既知の次回候補)。
+
+- **次にすべきこと(次回候補)**: (a) `aruaru-graphql`の`AdminCtx`へ
+  `replicator: Option<Arc<dyn aruaru_dist::ReplicatedWriter>>`を追加し
+  (`aruaru-graphql`の`Cargo.toml`へ`aruaru-dist`依存を追加する必要あり)、
+  GraphQL `cluster_propose` resolverもRaftWriter経由に統一する、
+  (b) Tauri Admin GUIのディザスタバックアップ設定フォーム、
+  (c) `cluster.rs`の`propose_commit`(既に未使用)を、フォールバック経路
+  以外で使う予定が無いなら削除するか、GraphQL側統一の際に活用するか判断する。
+
 ## エコシステム全体マップ(2026-07-21追記)
 
 同時並行開発の対象プロジェクト一覧・各リポジトリの現況は
