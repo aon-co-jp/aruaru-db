@@ -166,6 +166,40 @@ async fn set_backup_schedule(
     .await
 }
 
+// ── ①' ディザスタ用メール退避(2026-07-26追加、Tauri Admin GUI側の
+//   設定フォーム未着手だった項目への対応) ──────────────────────────
+//
+// サーバ側は以下を公開する(`crates/aruaru-server/src/admin.rs`、
+// `disaster_email_backup` feature有効時のみ):
+//   POST {base}/admin/disaster-email-backup         メール退避先の設定
+//   POST {base}/admin/disaster-email-backup/verify  SMTP疎通確認のみ
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DisasterEmailBackupForm {
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_username: String,
+    /// SMTPパスワードそのものではなく、パスワードを保持する環境変数名
+    /// (サーバー起動プロセス側の環境変数)。値そのものはこのフォーム/
+    /// リクエストには含めない。
+    pub smtp_password_env: String,
+    pub from_address: String,
+    pub to_address: String,
+    /// テスト・ローカルSMTPリレー向け(実運用ではfalse)。
+    #[serde(default)]
+    pub allow_plaintext_for_testing: bool,
+}
+
+#[tauri::command]
+async fn set_disaster_email_backup(base_url: String, config: DisasterEmailBackupForm) -> Result<Value, String> {
+    admin_post(&base_url, "/admin/disaster-email-backup", serde_json::to_value(config).unwrap()).await
+}
+
+#[tauri::command]
+async fn verify_disaster_email_backup(base_url: String) -> Result<Value, String> {
+    admin_post(&base_url, "/admin/disaster-email-backup/verify", json!({})).await
+}
+
 // ── ② お引越し (移行 / 移植) ───────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -343,6 +377,8 @@ fn main() {
             graphql_query, ping_server, list_branches, get_commit_log,
             // ① バックアップ
             create_backup, list_backups, restore_backup, set_backup_schedule,
+            // ①' ディザスタ用メール退避
+            set_disaster_email_backup, verify_disaster_email_backup,
             // ② お引越し
             test_source_connection, preview_source_schema, run_migration, migrate_instance,
             // ③ 分散並列化

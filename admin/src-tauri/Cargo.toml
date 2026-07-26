@@ -3,9 +3,13 @@ name    = "aruaru-admin"
 version = "0.4.0"
 edition = "2021"
 
-[lib]
-name = "aruaru_admin_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# ワークスペースルート(F:\runo\aruaru-db\Cargo.toml)のmembersには含まれて
+# いない独立パッケージ(Tauriデスクトップアプリ、`crates/`配下のサーバー系
+# クレートとは依存関係の性質が異なるため)。空の[workspace]テーブルで
+# 明示的に単独パッケージとして扱う(cargoのエラーメッセージが示す2つの
+# 選択肢のうち、ワークスペースへの参加ではなくこちらを採用——このcrateは
+# `crates/`配下のライブラリを直接参照しない独立GUIアプリのため)。
+[workspace]
 
 [dependencies]
 tauri               = { version = "2", features = [] }

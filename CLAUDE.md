@@ -1454,6 +1454,107 @@ open-web-serverがApache＋Nginxのハイブリッド仕様のWebサーバーと
   (c) `cluster.rs`の`propose_commit`(既に未使用)を、フォールバック経路
   以外で使う予定が無いなら削除するか、GraphQL側統一の際に活用するか判断する。
 
+## HANDOFF: 2026-07-26 Tauri Admin GUIのディザスタバックアップ設定フォームを実装
++ アプリ自体が一度もビルドできていなかった重大な既知の欠落を発見・解消
+
+上記2026-07-25(続き2)の「次にすべきこと(次回候補)(b) Tauri Admin GUIの
+ディザスタバックアップ設定フォーム」に対応(ユーザー指示: runo.tokyo/
+open-directx/open-cuda/aruaru-llm等7リポジトリの未着手・未完成事項の
+洗い出し→実装継続、SETバックアップ系の実接続配線の一環として着手)。
+
+**正直な開示(最重要): 着手前の調査で、`admin/`(Tauri Admin GUI)は
+これまで一度も実際にビルドできる状態になっていなかったことが判明した**。
+既存のHANDOFFはRust側コマンド(`main.rs`)・Reactページ群の「コードとしての
+実装」を記録していたが、以下が全て欠落しており、`cargo build`も
+`npm run build`も過去に一度も成功していなかった(型チェック・実行の
+どちらも行われないまま「実装済み」として記録されてきたことになる):
+- `admin/src-tauri/tauri.conf.json`(Tauriアプリ設定ファイル自体が存在しない)
+- `admin/src-tauri/build.rs`
+- `admin/src-tauri/icons/`(`icon.png`/`icon.ico`)
+- `admin/index.html`・`admin/src/main.tsx`・`admin/src/index.css`
+  (Reactのブートストラップ自体が無く、`App.tsx`以下のページ群は
+  どこからも読み込まれない孤立したファイル群だった)
+- `admin/vite.config.ts`・`admin/tsconfig.json`・`admin/tsconfig.node.json`・
+  `admin/tailwind.config.js`・`admin/postcss.config.js`
+- `admin/src-tauri/Cargo.toml`: `[lib]`セクションが`aruaru_admin_lib`という
+  存在しない`src/lib.rs`を指しており、マニフェスト解析自体が失敗する状態
+  (`can't find library aruaru_admin_lib`)。加えてワークスペースルート
+  (`F:\runo\aruaru-db\Cargo.toml`)の`members`にも含まれておらず、
+  「ワークスペースに属していると誤認された状態」でも失敗する
+  (`current package believes it's in a workspace when it's not`)。
+
+1. **最小限のTauri+Viteスキャフォールドを新規作成**(具体的な処理を追加
+   実装したのではなく、`cargo tauri init`相当の土台を後追いで補った):
+   `tauri.conf.json`(`devUrl: http://localhost:1420`、`frontendDist:
+   ../dist`、`identifier: tokyo.aon.aruaru-db.admin`)、`build.rs`、
+   1x1のプレースホルダー`icon.png`/`icon.ico`(実アイコン素材は今回
+   用意していない、ビルドを通すための最小限のダミー画像であることを
+   正直に記録)、`index.html`+`src/main.tsx`+`src/index.css`
+   (Tailwindディレクティブ)、`vite.config.ts`、`tsconfig.json`/
+   `tsconfig.node.json`、`tailwind.config.js`/`postcss.config.js`、
+   `package.json`に`"type": "module"`を追加。`admin/src-tauri/Cargo.toml`
+   から壊れていた`[lib]`セクションを削除(`aruaru_admin_lib`を参照する
+   コードは他に存在しないことを`grep`で確認済み)し、空の`[workspace]`
+   テーブルを追加してワークスペースルートから独立させた(cargo自身が
+   エラーメッセージで提示した2つの選択肢のうち、`crates/`配下の
+   ライブラリを直接参照しない独立GUIアプリという性質からこちらを選択)。
+2. **ディザスタ用メール退避のTauriコマンド2件を新規実装**
+   (`admin/src-tauri/src/main.rs`): `set_disaster_email_backup`
+   (`POST /admin/disaster-email-backup`、`DisasterEmailBackupForm`
+   構造体は`open_raid_z_core::offsite_backup::EmailBackupTargetConfig`と
+   同じフィールド構成)、`verify_disaster_email_backup`
+   (`POST /admin/disaster-email-backup/verify`、SMTP疎通確認のみ)。
+   `generate_handler!`マクロへ登録。
+3. **`admin/src/pages/backup/BackupManager.tsx`に「📧 ディザスタ用メール
+   退避(最後の砦)」セクションを新規追加**(既存の「バックアップ管理」
+   ページ内、新規ルーティングは追加せず既存ナビゲーションに相乗り):
+   SMTPホスト/ポート/ユーザー名/パスワード環境変数名/送信元/退避先の
+   各入力欄、平文接続許可チェックボックス、「設定を保存」「SMTP接続を
+   確認」ボタン、結果メッセージ表示。SMTPパスワードそのものはフォームに
+   入力させない設計(環境変数名のみ、既存の`open_raid_z_core`側の方針を
+   踏襲)。**発見した既存バグの修正**: 同ファイル124行目の`phaseColor`
+   関数が、`Phase`型の一部のケース(`Preparing`/`DumpingSchema`等)しか
+   持たないオブジェクトリテラルを`Record`的に扱っておりTypeScriptの
+   型エラーになっていた(`tsc`を初めて実際に実行して発覚)。
+   `Partial<Record<Phase, string>>`へキャストして解消(既存のフォール
+   バック`?? "text-orange-400"`の意図はそのまま)。
+4. **検証(実測、型チェック・ビルド成功だけで終わらせない方針の徹底)**:
+   - `npm install`→`npm run build`(`tsc && vite build`)が**初めて**
+     成功(`dist/`が実際に生成されることを確認)。
+   - `cargo build`(`admin/src-tauri`)が**初めて**成功。
+   - `npm run dev`で実際にVite開発サーバーを起動し(`http://localhost:1420`)、
+     実ブラウザ(Claude Code内蔵のBrowserツール)で実際にページを開いて
+     スクリーンショット・`get_page_text`で確認: (a) サイドバー・
+     ダッシュボードが実際にレンダリングされること、(b)「バックアップ」
+     ページへ実際に遷移でき、新設した「📧 ディザスタ用メール退避」
+     セクションの全フィールド・ボタン・注意書きの文言が実際にDOM上に
+     存在すること、(c)「SMTP接続を確認」ボタンを実際にクリックし、
+     Tauri IPCブリッジが無いブラウザ単体環境では`invoke`が失敗する
+     ことを利用して、エラー時のcatchハンドリングが実際に動作し
+     (「SMTP接続確認に失敗しました: TypeError: Cannot read properties
+     of undefined (reading 'invoke')」という具体的なエラーメッセージが
+     画面に表示される)、画面がクラッシュしないことを確認した。
+   - 上記(c)は「実Tauriデスクトップアプリ(WebView2)としての起動」では
+     ない(ブラウザ単体でのVite devサーバー確認)ため、実際の
+     `cargo tauri dev`でのネイティブウィンドウ起動・実SMTPサーバーへの
+     `set_disaster_email_backup`/`verify_disaster_email_backup`の
+     実際の疎通は今回未検証。
+5. **正直な開示(引き続き残る制約)**: (1) `icon.png`/`icon.ico`は
+   1x1のダミー画像であり、実際のアプリアイコン素材ではない(配布用
+   ビルド`tauri build`を行う前に差し替えが必要)。(2) `capabilities/`
+   ディレクトリ(Tauri v2のパーミッション定義)は今回作成しておらず、
+   ビルド時の警告等が出ていないか次回`cargo tauri dev`実行時に確認が
+   必要。(3) 実Tauriネイティブウィンドウでの動作確認・実SMTPサーバーへの
+   接続確認は未実施(上記4参照)。(4) GraphQL側の`disaster_email_backup`
+   専用resolverは引き続き存在しない(HTTP `/admin/*`経由のみ、
+   2026-07-25(続き2)の開示のまま変更なし)。
+- 次にすべきこと: (1) 実アイコン素材への差し替え、(2) `cargo tauri dev`
+  での実ネイティブウィンドウ起動確認、(3) 実SMTPサーバーでの
+  `set_disaster_email_backup`→`verify_disaster_email_backup`のE2E確認、
+  (4) `capabilities/`ディレクトリの要否確認、(5) GraphQL
+  `cluster_propose` resolverのRaftWriter経由統一(2026-07-25(続き2)から
+  継続する既知の次回候補)。
+
 ## エコシステム全体マップ(2026-07-21追記)
 
 同時並行開発の対象プロジェクト一覧・各リポジトリの現況は

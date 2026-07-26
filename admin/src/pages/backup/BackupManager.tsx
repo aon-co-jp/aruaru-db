@@ -49,6 +49,16 @@ export default function BackupManager({ baseUrl }: { baseUrl: string }) {
   const [schedule, setSchedule] = useState("0 2 * * *");
   const [scheduleEnabled, setScheduleEnabled] = useState(false);
 
+  // ディザスタ用メール退避(2026-07-26追加)
+  const [smtpHost, setSmtpHost] = useState("");
+  const [smtpPort, setSmtpPort] = useState(587);
+  const [smtpUsername, setSmtpUsername] = useState("");
+  const [smtpPasswordEnv, setSmtpPasswordEnv] = useState("ARUARU_DB_DISASTER_SMTP_PASSWORD");
+  const [fromAddress, setFromAddress] = useState("");
+  const [toAddress, setToAddress] = useState("");
+  const [allowPlaintextForTesting, setAllowPlaintextForTesting] = useState(false);
+  const [disasterStatus, setDisasterStatus] = useState<string | null>(null);
+
   // バックアップ一覧取得
   const fetchBackups = async () => {
     try {
@@ -114,7 +124,7 @@ export default function BackupManager({ baseUrl }: { baseUrl: string }) {
   const phaseColor = (phase: Phase) => ({
     Done: "text-green-400", Failed: "text-red-400",
     Idle: "text-gray-500",
-  }[phase] ?? "text-orange-400");
+  } as Partial<Record<Phase, string>>)[phase] ?? "text-orange-400";
 
   const formatBytes = (n: number) =>
     n < 1024 ? `${n} B`
@@ -275,6 +285,100 @@ export default function BackupManager({ baseUrl }: { baseUrl: string }) {
           className="px-4 py-1.5 bg-orange-500 hover:bg-orange-600 rounded text-sm text-white">
           スケジュールを適用
         </button>
+      </section>
+
+      {/* ── ディザスタ用メール退避(最後の砦) ── */}
+      <section className="bg-gray-900 rounded-xl p-5 space-y-3">
+        <h3 className="font-semibold text-gray-200">📧 ディザスタ用メール退避(最後の砦)</h3>
+        <p className="text-xs text-gray-500">
+          VPS間の分散同期・Raftクラスタ構成・ZFSスナップショット連携のいずれも設定しなくても、
+          メールアドレスひとつだけで有効化できる最小構成の安全網です。
+          断線・障害でRaft複製書き込みが過半数コミットに到達できなかった場合に、
+          失われかけている書き込みコマンドをこのメール宛先へ退避します。
+        </p>
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <label className="text-xs text-gray-500">SMTPホスト</label>
+            <input value={smtpHost} onChange={e => setSmtpHost(e.target.value)}
+              placeholder="smtp.example.com"
+              className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm text-gray-200 mt-0.5 font-mono" />
+          </div>
+          <div>
+            <label className="text-xs text-gray-500">SMTPポート</label>
+            <input type="number" value={smtpPort} onChange={e => setSmtpPort(Number(e.target.value))}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm text-gray-200 mt-0.5" />
+          </div>
+          <div>
+            <label className="text-xs text-gray-500">SMTPユーザー名</label>
+            <input value={smtpUsername} onChange={e => setSmtpUsername(e.target.value)}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm text-gray-200 mt-0.5 font-mono" />
+          </div>
+          <div>
+            <label className="text-xs text-gray-500">SMTPパスワードの環境変数名</label>
+            <input value={smtpPasswordEnv} onChange={e => setSmtpPasswordEnv(e.target.value)}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm text-gray-200 mt-0.5 font-mono" />
+          </div>
+          <div>
+            <label className="text-xs text-gray-500">送信元アドレス</label>
+            <input value={fromAddress} onChange={e => setFromAddress(e.target.value)}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm text-gray-200 mt-0.5 font-mono" />
+          </div>
+          <div>
+            <label className="text-xs text-gray-500">退避先アドレス</label>
+            <input value={toAddress} onChange={e => setToAddress(e.target.value)}
+              className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm text-gray-200 mt-0.5 font-mono" />
+          </div>
+        </div>
+        <label className="flex items-center gap-2 text-sm text-gray-400 cursor-pointer">
+          <input type="checkbox" checked={allowPlaintextForTesting}
+            onChange={e => setAllowPlaintextForTesting(e.target.checked)}
+            className="accent-orange-500" />
+          テスト用に平文接続を許可する(実運用では必ずオフのままにしてください)
+        </label>
+        <p className="text-xs text-gray-500">
+          注意: SMTPパスワードそのものはこのフォームに入力しません。上記の環境変数名を、
+          サーバーを起動しているプロセスの環境に事前に設定しておいてください。
+        </p>
+        <div className="flex gap-2">
+          <button
+            onClick={async () => {
+              try {
+                await invoke("set_disaster_email_backup", {
+                  baseUrl,
+                  config: {
+                    smtp_host: smtpHost,
+                    smtp_port: smtpPort,
+                    smtp_username: smtpUsername,
+                    smtp_password_env: smtpPasswordEnv,
+                    from_address: fromAddress,
+                    to_address: toAddress,
+                    allow_plaintext_for_testing: allowPlaintextForTesting,
+                  },
+                });
+                setDisasterStatus("設定を保存しました。");
+              } catch (e: any) {
+                setDisasterStatus(`設定の保存に失敗しました: ${String(e)}`);
+              }
+            }}
+            className="px-4 py-1.5 bg-orange-500 hover:bg-orange-600 rounded text-sm text-white">
+            設定を保存
+          </button>
+          <button
+            onClick={async () => {
+              try {
+                const result = await invoke<any>("verify_disaster_email_backup", { baseUrl });
+                setDisasterStatus(result?.message_ja ?? "SMTP接続を確認できました。");
+              } catch (e: any) {
+                setDisasterStatus(`SMTP接続確認に失敗しました: ${String(e)}`);
+              }
+            }}
+            className="px-4 py-1.5 bg-gray-700 hover:bg-gray-600 rounded text-sm text-gray-200">
+            SMTP接続を確認
+          </button>
+        </div>
+        {disasterStatus && (
+          <p className="text-xs text-gray-400">{disasterStatus}</p>
+        )}
       </section>
 
       {/* ── バックアップ履歴 ── */}

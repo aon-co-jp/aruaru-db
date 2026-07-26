@@ -2,6 +2,7 @@
   "name": "aruaru-db-admin",
   "version": "0.4.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
