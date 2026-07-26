@@ -193,7 +193,16 @@ async fn main() -> anyhow::Result<()> {
                     "Raft: multi-node cluster; consensus driver started (過半数コミットで書き込み確定)"
                 );
             }
-            replicator = Some(std::sync::Arc::new(aruaru_dist::RaftWriter::new(node)));
+            let raft_writer: std::sync::Arc<dyn aruaru_dist::ReplicatedWriter> =
+                std::sync::Arc::new(aruaru_dist::RaftWriter::new(node));
+            // gap (b)/(c) 対応(2026-07-25追記): pgwireサーバへ渡すのと同一の
+            // Arc<dyn ReplicatedWriter> を AdminState にも取り付ける。これにより
+            // (b) 管理API(POST /admin/disaster-email-backup)が稼働中のこの
+            // インスタンスへ set_disaster_email_backup で実際に注入でき、
+            // (c) 管理API経由の書き込み(/admin/cluster/propose)も RaftNode
+            // 直接経路ではなくこの RaftWriter を経由するようになる。
+            admin_state.attach_replicator(raft_writer.clone());
+            replicator = Some(raft_writer);
             // 合意ランタイムを常駐
             let _raft_handle = tokio::spawn(async move {
                 driver.run().await;

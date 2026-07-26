@@ -167,6 +167,18 @@ feature)。`open-raid-z`の`EmailBackupTarget`をそのまま再利用し、管�
 呼び出し元をブロックしないバックグラウンド送信。詳細・検証結果・
 残課題は `CLAUDE.md` の同日続編HANDOFF参照。
 
+**同日追記(続)**: 前回開示していた3つの未検証ギャップを解消/前進。
+(1) 到達不能ケースだけでなく、TCP接続は確立するがSMTP応答が数秒遅延する
+「真の低速SMTP」でも`propose_and_wait`が呼び出し元をブロックしないことを
+実測、(2) 管理API(`POST /admin/disaster-email-backup`)が、検証・保管
+だけでなく**稼働中のRaftWriterインスタンスへ実際に注入**するよう変更
+(`ReplicatedWriter`トレイトへ実行時セッター`set_disaster_email_backup`を
+追加)、(3) `RaftNode`を直接叩きRaftWriterを迂回する経路を棚卸しし、
+REST `/admin/cluster/propose`の迂回を発見・修正。GraphQL側の
+`cluster_propose` resolver(`crates/aruaru-graphql/src/admin_resolvers.rs`)
+は依然として`QueryEngine`への直接書き込みでRaftWriterを迂回しており、
+今回は未修正(次回候補)。詳細は`CLAUDE.md`の同日3件目HANDOFF参照。
+
 ---
 
 ## 🤝 コントリビュート
