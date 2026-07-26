@@ -1454,6 +1454,26 @@ open-web-serverがApache＋Nginxのハイブリッド仕様のWebサーバーと
   (c) `cluster.rs`の`propose_commit`(既に未使用)を、フォールバック経路
   以外で使う予定が無いなら削除するか、GraphQL側統一の際に活用するか判断する。
 
+## HANDOFF: 2026-07-27 前回エントリの「次にすべきこと(4) capabilities/
+ディレクトリの要否確認」を確認・解消
+
+`admin/src-tauri`で`capabilities/`ディレクトリを追加せずに`cargo build`
+を実行し、警告・エラーいずれも出ないことを確認した(`capabilities`という
+文字列を含む出力自体が皆無)。Tauri v2のパーミッション定義
+(`capabilities/*.json`)は、既定の`main`ウィンドウに対するデフォルト
+パーミッションセットで足りている限り省略可能で、このアプリ(既存の
+`tauri::Builder::default()`+標準プラグイン`shell`/`fs`/`dialog`のみ)は
+その範囲内であるため、現状は追加不要と判断する。**正直な開示**:
+`cargo tauri dev`での実ネイティブウィンドウ起動時に、特定の操作
+(ファイルダイアログ経由の書き込み等)でパーミッション拒否が実際に
+発生するかどうかまでは検証していない(`cargo build`が通ることの確認に
+留まる)——問題が実際に顕在化した場合に`capabilities/`を追加する、という
+方針で次回以降へ持ち越す。
+- 次にすべきこと: 前回エントリの(1)(2)(3)(5)から変更なし
+  (実アイコン素材への差し替え、`cargo tauri dev`での実ネイティブ
+  ウィンドウ起動確認、実SMTPサーバーでのE2E確認、GraphQL
+  `cluster_propose` resolverのRaftWriter経由統一)。
+
 ## HANDOFF: 2026-07-26 Tauri Admin GUIのディザスタバックアップ設定フォームを実装
 + アプリ自体が一度もビルドできていなかった重大な既知の欠落を発見・解消
 
