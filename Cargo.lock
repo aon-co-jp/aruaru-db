@@ -522,6 +522,7 @@ dependencies = [
  "anyhow",
  "aruaru-backup",
  "aruaru-core",
+ "aruaru-dist",
  "aruaru-query",
  "aruaru-registry",
  "async-graphql",
@@ -531,7 +532,9 @@ dependencies = [
  "poem",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

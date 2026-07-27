@@ -214,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
     // ── HTTP サーバ (Poem): GraphQL(Cosmoサブグラフ) + 管理REST を同居 ──
     let http_addr = format!("0.0.0.0:{}", cli.gql_port);
     let gql_engine = engine.clone();
+    let gql_replicator = replicator.clone();
     let http_handle = tokio::spawn(async move {
         use poem::middleware::Cors;
         use poem::{get, handler, listener::TcpListener, EndpointExt, Route, Server};
@@ -231,6 +232,11 @@ async fn main() -> anyhow::Result<()> {
                     engine: gql_engine.clone(),
                     registry: registry.clone(),
                     backup: backup_engine.clone(),
+                    // 2026-07-26追記: pgwireサーバ(wire_config.replicator)・
+                    // REST admin API(admin_state.attach_replicator)と同一の
+                    // Arc<dyn ReplicatedWriter> をGraphQL側にも共有する
+                    // (cluster_propose resolverのRaftWriter経由化のため)。
+                    replicator: gql_replicator.clone(),
                 },
             ))
             .at("/graphql/sdl", get(subgraph_sdl))
