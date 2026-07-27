@@ -10,6 +10,7 @@ aruaru-core     = { path = "../aruaru-core" }
 aruaru-query    = { path = "../aruaru-query" }
 aruaru-registry = { path = "../aruaru-registry" }
 aruaru-backup   = { path = "../aruaru-backup" }
+aruaru-dist     = { path = "../aruaru-dist" }
 
 poem.workspace             = true
 async-graphql.workspace    = true
@@ -20,3 +21,7 @@ anyhow.workspace           = true
 tracing.workspace          = true
 hex.workspace              = true
 chrono.workspace           = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid.workspace             = true

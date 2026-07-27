@@ -14,10 +14,20 @@ use aruaru_registry::Registry;
 use crate::admin_types::*;
 
 /// GraphQL Context に注入する管理状態
+///
+/// **2026-07-26追記**: 2026-07-25(続き2)のHANDOFFが「未解決」として正直に
+/// 記録していたギャップ(`cluster_propose` resolverが`RaftWriter`/
+/// `replicator`を経由せず`engine.execute`へ直接書き込んでいた)を解消する
+/// ため、`replicator`フィールドを追加した。`aruaru-server`のpgwire経路・
+/// REST admin API(`admin.rs`の`cluster_propose`)が共有しているのと
+/// **同一の**`Arc<dyn ReplicatedWriter>`を`main.rs`から注入する
+/// (`replicator: Option<..>` — クラスタ構築に成功した場合のみ`Some`、
+/// 単一ノード/非クラスタ構成では`None`のまま、既存動作を変えない)。
 pub struct AdminCtx {
     pub engine: Arc<QueryEngine>,
     pub registry: Arc<Registry>,
     pub backup: Arc<BackupEngine>,
+    pub replicator: Option<Arc<dyn aruaru_dist::ReplicatedWriter>>,
 }
 
 fn admin<'a>(ctx: &Context<'a>) -> Result<&'a AdminCtx> {
@@ -352,14 +362,44 @@ impl AdminMutation {
         })
     }
 
+    /// **2026-07-26追記**: 以前は`RaftNode`/`RaftWriter`を完全に迂回し
+    /// `a.engine.execute(&sql)`で`QueryEngine`へ直接書き込んでいた
+    /// (2026-07-25(続き2)HANDOFFが未解決ギャップとして記録)。稼働中の
+    /// `replicator`(`admin.rs`のREST `/admin/cluster/propose`・pgwire
+    /// サーバへ渡しているのと同一の`Arc<dyn ReplicatedWriter>`)が
+    /// 取り付けられていれば、そちらを優先して`propose_and_wait`
+    /// (quorum合意+disaster-backup配線込み)を経由する。`replicator`が
+    /// 無い(単一ノード/非クラスタ構成、またはクラスタ構築失敗)場合のみ、
+    /// 後方互換のため`engine.execute`直接経路へフォールタックし、
+    /// `message`に`raft_fallback_no_replicator`相当である旨を正直に含める
+    /// (REST側`admin.rs::cluster_propose`の`mode: "raft_fallback_no_replicator"`
+    /// と同じ意図)。
     async fn cluster_propose(
         &self,
         ctx: &Context<'_>,
         sql: String,
     ) -> Result<MutationResult> {
         let a = admin(ctx)?;
+        if let Some(replicator) = &a.replicator {
+            return match replicator.write_sql(&sql).await {
+                Ok(tag) => Ok(MutationResult {
+                    success: true,
+                    commit_id: None,
+                    message: format!("mode=raft: RaftWriter経由で提案・commit+適用が完了しました({tag})。"),
+                }),
+                Err(e) => Ok(MutationResult { success: false, commit_id: None, message: e }),
+            };
+        }
+        // フォールバック: replicator 未取り付け(単一ノード/非クラスタ構成、
+        // またはクラスタ構築失敗)の場合のみ、従来通り QueryEngine へ直接実行する。
+        // この経路は Raft コンセンサス・disaster-backup 配線を経由しない
+        // (複数ノードクラスタで replicator が無いのは異常系のみ想定)。
         match a.engine.execute(&sql) {
-            Ok(_) => Ok(MutationResult { success: true, commit_id: None, message: "ok".into() }),
+            Ok(_) => Ok(MutationResult {
+                success: true,
+                commit_id: None,
+                message: "mode=raft_fallback_no_replicator: replicator未取り付けのためQueryEngine直接実行(disaster-backup配線対象外)。".into(),
+            }),
             Err(e) => Ok(MutationResult { success: false, commit_id: None, message: e }),
         }
     }
@@ -535,3 +575,124 @@ fn wire_for_source(source: &str) -> Option<aruaru_registry::Wire> {
 // ── 再エクスポート用型 ────────────────────────────────────────
 
 use crate::{QueryResultGql, MutationResult};
+
+// ── テスト: cluster_propose の RaftWriter 経由化(2026-07-26追記) ──
+//
+// 既存の Raft クラスタシミュレーション機構(`aruaru-dist::raft::writer`の
+// `RaftWriter` + peers空=単一ノード即Leaderのパターン)をそのまま再利用する
+// (新しいクラスタシミュレーション機構は発明しない)。`aruaru-server::cluster::
+// EngineApplier`と同型の最小限のApplierをテスト内に用意する
+// (`aruaru-graphql`は`aruaru-server`に依存できない循環関係のため)。
+#[cfg(test)]
+mod cluster_propose_tests {
+    use std::sync::Arc;
+
+    use aruaru_dist::{Applier, Command, CommandResponse, RaftNode, RaftWriter, ReplicatedWriter};
+    use aruaru_query::QueryEngine;
+
+    use crate::{build_schema, AdminCtx};
+
+    /// `aruaru-server::cluster::EngineApplier`と同じ責務の最小再実装
+    /// (Raft commit を QueryEngine へ適用する)。
+    struct TestEngineApplier {
+        engine: Arc<QueryEngine>,
+    }
+
+    impl Applier for TestEngineApplier {
+        fn apply(&self, command: &Command) -> CommandResponse {
+            match command {
+                Command::Exec(sql) => match self.engine.execute(sql) {
+                    Ok(_) => CommandResponse::ok(),
+                    Err(e) => CommandResponse::err(e),
+                },
+                Command::Commit(msg) => {
+                    let safe = msg.replace('\'', "''");
+                    match self.engine.execute(&format!("SELECT aruaru_commit('{safe}')")) {
+                        Ok(_) => CommandResponse::ok(),
+                        Err(e) => CommandResponse::err(e),
+                    }
+                }
+                Command::Noop => CommandResponse::ok(),
+            }
+        }
+    }
+
+    fn test_backup_engine(engine: Arc<QueryEngine>) -> Arc<aruaru_backup::BackupEngine> {
+        let mut dest = std::env::temp_dir();
+        dest.push(format!("aruaru-graphql-test-backup-{}", uuid::Uuid::new_v4()));
+        Arc::new(aruaru_backup::BackupEngine::new(
+            aruaru_backup::BackupConfig {
+                destination: aruaru_backup::BackupDestination::Local { path: dest },
+                kind: aruaru_backup::BackupKind::Full,
+                compression: aruaru_backup::BackupCompression::None,
+                encrypt: false,
+                retention_days: 7,
+            },
+            engine,
+        ))
+    }
+
+    fn admin_ctx(engine: Arc<QueryEngine>, replicator: Option<Arc<dyn ReplicatedWriter>>) -> AdminCtx {
+        AdminCtx {
+            engine: engine.clone(),
+            registry: aruaru_registry::Registry::new(),
+            backup: test_backup_engine(engine),
+            replicator,
+        }
+    }
+
+    /// gap解消の中心的な検証: replicator が設定されていれば `cluster_propose`
+    /// が実際に RaftWriter (`propose_and_wait`) 経由で書き込まれ、
+    /// メッセージが `mode=raft` であることを確認する
+    /// (`engine.execute` 直接呼び出しでは到達できないRaft経路であることの
+    /// 傍証として、単一ノード=peers空でも propose/commit/apply が実際に
+    /// 進んでいることをテーブルの中身で確認する)。
+    #[tokio::test]
+    async fn cluster_propose_routes_through_raft_when_replicator_configured() {
+        let engine = Arc::new(QueryEngine::new());
+        let applier = TestEngineApplier { engine: engine.clone() };
+        let node = Arc::new(RaftNode::new(1, applier, vec![])); // peers空=単一ノード
+        node.become_leader();
+        let writer: Arc<dyn ReplicatedWriter> = Arc::new(RaftWriter::new(node));
+
+        let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), Some(writer)));
+        let resp = schema
+            .execute(
+                r#"mutation { clusterPropose(sql: "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)") { success message } }"#,
+            )
+            .await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        let data = resp.data.into_json().unwrap();
+        let result = &data["clusterPropose"];
+        assert_eq!(result["success"], true, "result: {result:?}");
+        assert!(
+            result["message"].as_str().unwrap().starts_with("mode=raft:"),
+            "replicator設定時はmode=rafトを経由するはず: {result:?}"
+        );
+
+        // Raft経由でも実際にQueryEngineへ反映されている(テーブルが作られている)ことを確認
+        assert!(engine.table_names().contains(&"t".to_string()));
+    }
+
+    /// フォールバック経路(replicator未設定)は従来通り動作すること
+    /// (単一ノード/非クラスタ構成・既存呼び出し元への無回帰の確認)。
+    #[tokio::test]
+    async fn cluster_propose_falls_back_to_direct_engine_execute_without_replicator() {
+        let engine = Arc::new(QueryEngine::new());
+        let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), None));
+        let resp = schema
+            .execute(
+                r#"mutation { clusterPropose(sql: "CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT)") { success message } }"#,
+            )
+            .await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        let data = resp.data.into_json().unwrap();
+        let result = &data["clusterPropose"];
+        assert_eq!(result["success"], true, "result: {result:?}");
+        assert!(
+            result["message"].as_str().unwrap().starts_with("mode=raft_fallback_no_replicator:"),
+            "replicator未設定時はフォールバックのはず: {result:?}"
+        );
+        assert!(engine.table_names().contains(&"t2".to_string()));
+    }
+}
