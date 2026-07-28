@@ -1082,35 +1082,70 @@ impl QueryEngine {
     /// 古い commit の root からでも辿れる (Prolly Treeの構造的共有により、
     /// 変更されていない部分木は複数コミット間で共有される)。
     ///
-    /// **スコープの限界 (正直な記載)**: 現状は単一行 (PK 一致の `WHERE`)
-    /// のみサポートする。フルスキャン (`WHERE`無し・複数行) の AS OF は、
-    /// このProllyTreeにテーブル横断の効率的なprefixスキャンAPIが今回追加
-    /// されていないため次回以降の拡張とする — `scan()` はテーブル区別なく
-    /// 全体を返すため、呼び出し側で`table\0`プレフィックスによる絞り込みが
-    /// 必要になる (実装は容易だが、このパスでは単一行の実証を優先した)。
+    /// **2026-07-27追記**: `WHERE`無し(複数行・フルテーブルスキャン)の
+    /// `AS OF COMMIT`にも対応した(旧コメントが「次回以降の拡張」と記載
+    /// していたギャップの解消)。`ProllyTree::scan()`はテーブル区別なく
+    /// 全ノードを返すため、キー先頭の`table\0`プレフィックス(`snapshot_root()`
+    /// が書き込む形式と同一)で絞り込む。単一行(PK一致の`WHERE`)経路は
+    /// 既存のポイントルックアップ(`tree.get`)のまま維持し、フルスキャンの
+    /// コストを不要に払わない。
     fn select_as_of(
         &self,
         table: String,
         filter: Option<(String, String)>,
         commit_id: String,
     ) -> Result<QueryResponse, String> {
-        let (_, pk_value) = filter.ok_or_else(|| {
-            "AS OF COMMIT queries require a WHERE clause identifying the primary key \
-             (full-table scans as of a commit are not yet supported)"
-                .to_string()
-        })?;
-
         let commit = self
             .version
             .get_commit_by_str(&commit_id)
             .ok_or_else(|| format!("commit not found: {commit_id}"))?;
+
+        let tree = ProllyTree::from_root(commit.root_hash, self.store.clone());
+
+        // 現在もテーブルが存在する場合は列名を引き継ぐ (無ければ位置ベースの
+        // 汎用列名にフォールバック — テーブルがその後DROPされていても
+        // 過去データ自体は読み出せることを優先する)。
+        let columns_for = |row_len: usize| -> Vec<String> {
+            let tables = self.tables.read();
+            match tables.get(&table) {
+                Some(t) if t.columns.len() == row_len => t.columns.clone(),
+                _ => (0..row_len).map(|i| format!("col{i}")).collect(),
+            }
+        };
+
+        let Some((_, pk_value)) = filter else {
+            // WHERE無し: table\0 プレフィックスでフルスキャンする。
+            let mut prefix = table.as_bytes().to_vec();
+            prefix.push(0);
+
+            let mut rows: Vec<Vec<String>> = tree
+                .scan()
+                .into_iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .map(|(_, raw)| {
+                    String::from_utf8_lossy(&raw)
+                        .split('\t')
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .collect();
+
+            let columns = columns_for(rows.first().map(|r| r.len()).unwrap_or(0));
+            rows.sort();
+            return Ok(QueryResponse::Rows {
+                columns,
+                rows: rows
+                    .into_iter()
+                    .map(|row| row.into_iter().map(Value::Text).collect())
+                    .collect(),
+            });
+        };
 
         // キー形式は snapshot_root() と揃える: `table_name\0pk`
         let mut key = table.as_bytes().to_vec();
         key.push(0);
         key.extend_from_slice(pk_value.as_bytes());
 
-        let tree = ProllyTree::from_root(commit.root_hash, self.store.clone());
         let Some(raw) = tree.get(&key) else {
             // その時点でまだ存在しなかった/既に削除されていた行
             return Ok(QueryResponse::Rows {
@@ -1124,16 +1159,7 @@ impl QueryEngine {
             .map(|s| s.to_string())
             .collect();
 
-        // 現在もテーブルが存在する場合は列名を引き継ぐ (無ければ位置ベースの
-        // 汎用列名にフォールバック — テーブルがその後DROPされていても
-        // 過去データ自体は読み出せることを優先する)。
-        let columns = {
-            let tables = self.tables.read();
-            match tables.get(&table) {
-                Some(t) if t.columns.len() == row.len() => t.columns.clone(),
-                _ => (0..row.len()).map(|i| format!("col{i}")).collect(),
-            }
-        };
+        let columns = columns_for(row.len());
 
         Ok(QueryResponse::Rows {
             columns,
@@ -1463,6 +1489,58 @@ mod tests {
         assert!(eng
             .execute("SELECT qty FROM items WHERE id = 'sword' AS OF COMMIT 'deadbeef'")
             .is_err());
+    }
+
+    /// **2026-07-27追記**: `WHERE`無し(複数行・フルテーブルスキャン)の
+    /// `AS OF COMMIT`が、その時点でテーブルに存在した全行を返すことを確認する
+    /// (open-raid-z/CLAUDE.mdが「未着手」と記録していたギャップの解消)。
+    /// 3行目はcommit後に追加されるため、AS OFでは含まれてはならない。
+    #[test]
+    fn as_of_commit_without_where_returns_all_rows_as_of_that_commit() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE items (id TEXT, qty INT)").unwrap();
+        eng.execute("INSERT INTO items (id, qty) VALUES ('sword', 1)")
+            .unwrap();
+        eng.execute("INSERT INTO items (id, qty) VALUES ('shield', 2)")
+            .unwrap();
+        let commit_1 = match eng.execute("SELECT aruaru_commit('two items')").unwrap() {
+            QueryResponse::Rows { rows, .. } => match &rows[0][0] {
+                Value::Text(s) => s.clone(),
+                _ => panic!("expected text commit id"),
+            },
+            _ => panic!("expected rows"),
+        };
+
+        // commit後に3行目を追加 — AS OF commit_1 には含まれてはならない。
+        eng.execute("INSERT INTO items (id, qty) VALUES ('potion', 3)")
+            .unwrap();
+
+        let as_of = eng
+            .execute(&format!("SELECT * FROM items AS OF COMMIT '{commit_1}'"))
+            .unwrap();
+        let QueryResponse::Rows { columns, rows } = as_of else {
+            panic!("expected rows");
+        };
+        assert_eq!(columns, vec!["id", "qty"]);
+        assert_eq!(rows.len(), 2, "potion must not appear, it was inserted after commit_1");
+        let ids: Vec<&str> = rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Text(s) => s.as_str(),
+                _ => panic!("expected text id"),
+            })
+            .collect();
+        assert!(ids.contains(&"sword"));
+        assert!(ids.contains(&"shield"));
+        assert!(!ids.contains(&"potion"));
+
+        // 現在の状態(最新)には3行とも存在する。
+        let latest = eng.execute("SELECT * FROM items").unwrap();
+        if let QueryResponse::Rows { rows, .. } = latest {
+            assert_eq!(rows.len(), 3);
+        } else {
+            panic!("expected rows");
+        }
     }
 
     #[test]

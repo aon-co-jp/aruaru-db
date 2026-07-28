@@ -1575,6 +1575,40 @@ open-directx/open-cuda/aruaru-llm等7リポジトリの未着手・未完成事�
   `cluster_propose` resolverのRaftWriter経由統一(2026-07-25(続き2)から
   継続する既知の次回候補)。
 
+## HANDOFF: 2026-07-27(続き) `AS OF COMMIT`のフルテーブルスキャン(WHERE無し)対応
+
+`open-raid-z/CLAUDE.md`が「VersionLessAPIハイブリッドバージョン管理の
+読み出し側=commit_id指定クエリは未着手」と記録していたが、調査の結果
+**単一行(PK一致の`WHERE`)経路は既に実装済み**で、未着手だったのは
+`WHERE`無し・複数行のフルテーブルスキャンのみだったと判明したため、
+そのギャップだけを埋めた(過大な既存実装の見落としを防ぐため、
+着手前に実装済み範囲を正直に確認してから作業した)。
+
+1. **`crates/aruaru-query/src/engine.rs::select_as_of`を拡張**:
+   `filter: None`(`WHERE`無し)の場合、`ProllyTree::scan()`で該当commitの
+   全ノードを取得し、`table\0`プレフィックス(`snapshot_root()`が書き込む
+   キー形式と同一)で対象テーブルの行だけに絞り込む。単一行経路
+   (`tree.get(&key)`によるポイントルックアップ)はそのまま維持し、
+   フルスキャンの計算コストを不要な場合に払わないようにした。
+2. **`parser.rs`は変更不要だった**: `AS OF COMMIT`の構文解析は既に
+   通常の`SELECT`を再パースして`table`/`filter`をそのまま流用する実装
+   だったため、`WHERE`無しの`SELECT * FROM t AS OF COMMIT '...'`は
+   追加実装なしで`filter: None`として正しくパースされていた。
+3. **検証**: 新規テスト`as_of_commit_without_where_returns_all_rows_as_of_that_commit`
+   を追加(2行commit後に3行目を追加し、`AS OF COMMIT`が3行目を含まず
+   commit時点の2行のみを返すこと、最新状態には3行とも存在することを
+   確認)。`cargo test -p aruaru-query`**43件全green**(既存
+   `as_of_commit_returns_the_value_from_that_commit_not_the_latest`含め
+   回帰なし)。
+4. **正直な未対応事項**: GraphQL/REST admin API側への配線は今回未実施
+   (現状は生SQL経由のみ)。列名の順序保証(`rows.sort()`で行の内容全体を
+   ソートしているため、複数列で最初の列の値が同じ場合はテーブル本来の
+   挿入順と一致しない可能性がある——determinism優先の簡易実装であり、
+   本来のINSERT順保持が必要になった場合は別途対応が要る)。
+- 次にすべきこと: (1) GraphQL/admin resolversから`AS OF COMMIT`
+  フルスキャンを呼び出せるようにする配線、(2) 行順序をINSERT順で
+  保持したい場合のソートキー見直し。
+
 ## エコシステム全体マップ(2026-07-21追記)
 
 同時並行開発の対象プロジェクト一覧・各リポジトリの現況は
