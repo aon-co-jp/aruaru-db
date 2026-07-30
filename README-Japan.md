@@ -29,6 +29,29 @@
 (Windows、要管理者権限)を実行してください。詳細は
 [install.sh](install.sh)/[install.ps1](install.ps1)冒頭のコメント参照。
 
+アンインストールは同梱の[uninstall.sh](uninstall.sh)/
+[uninstall.ps1](uninstall.ps1)を使用してください(2026-07-30追加)。
+実データディレクトリ(`/var/lib/aruaru-db`等)は意図的に削除しません
+(別バージョン再インストール時もデータはそのまま利用されます)。
+
+## セキュリティ(2026-07-30重要な修正)
+
+`/admin/*`管理API(cluster/backup/migrate/federation/registry/raft含む)
+は、以前は`disaster-email-backup`系エンドポイントのみ認証されており、
+大半が無認証でインターネットから到達可能という重大なギャップがあった。
+`ARUARU_DB_ADMIN_TOKEN`環境変数+`x-admin-token`ヘッダーによる認証を
+`/admin/*`全体へ遡及適用し、定数時間トークン比較(タイミングサイド
+チャネル対策)も導入した。**本番運用では`ARUARU_DB_ADMIN_TOKEN`を必ず
+設定してください**(未設定の場合、管理APIは503を返し機能しません)。
+
+## Web管理UI(2026-07-30新設、`web/`)
+
+RPoem(`open-runo-poem-compat`、Poem/Tauri非依存)による管理UI。既存の
+`aruaru-server`管理API(`/admin/cluster`等)へリバースプロキシする。
+ブラウザ↔Web層(`ARUARU_WEB_ADMIN_TOKEN`)・Web層↔aruaru-server
+(`ARUARU_UPSTREAM_ADMIN_TOKEN`)の2段階トークン、
+`ARUARU_WEB_READ_ONLY=1`によるread-onlyデモモードに対応。
+
 ---
 
 ## ✨ なぜ aruaru-DB か
