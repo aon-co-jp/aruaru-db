@@ -1609,6 +1609,71 @@ open-directx/open-cuda/aruaru-llm等7リポジトリの未着手・未完成事�
   フルスキャンを呼び出せるようにする配線、(2) 行順序をINSERT順で
   保持したい場合のソートキー見直し。
 
+## HANDOFF: 2026-07-30(続き) Web管理UI(RPoem)新規実装 + `/admin/*`認証の遡及適用(セキュリティ強化)
+
+ユーザー指示「Rust + RPoem(tokio/hyper直接実装)」でopen-raid-zと対の
+Web管理UIを構築。その過程でユーザーから複数回「aruaru-serverは外部から
+乗っ取られないようにセキュリティをしっかりして」との指示があり、実際に
+重大なギャップを発見・修正した。
+
+1. **重大な発見**: `crates/aruaru-server/src/admin.rs`の`/admin/*`は
+   `disaster-email-backup`系エンドポイント限定でのみ`x-admin-token`
+   認証を持ち、`cluster`/`backup`/`migrate`/`federation`/`registry`/
+   `raft/append`/`raft/vote`を含む**大半のエンドポイントには認証が
+   一切無かった**(`aruaru-db/CLAUDE.md`2026-07-24 HANDOFFで既知の
+   ギャップとして記録済みだったが未対応のままだった)。さらに
+   `main.rs`を確認したところHTTPサーバ(GraphQL/admin両方を配信)は
+   `0.0.0.0:{gql_port}`にbindするデフォルト設定であり、ファイア
+   ウォール等の追加防御が無い場合はクラスタ状態の閲覧だけでなく
+   バックアップ実行・移行実行・Raftノード操作まで**インターネットから
+   無認証で到達可能**という実際の露出だった。
+2. **修正**: `admin_routes()`が返す`Route`全体を`.around()`
+   ミドルウェアで包み、`check_admin_auth`(`x-admin-token`ヘッダー+
+   `ARUARU_DB_ADMIN_TOKEN`環境変数)を`/admin/*`配下の**全**
+   エンドポイントへ遡及適用した(2026-07-25(続き2)エントリの
+   「次回候補(b)」として明記されていた項目)。環境変数未設定なら503、
+   ヘッダー不一致なら401——`raft/append`/`raft/vote`も同じゲート配下
+   に入った(現状これらを実際に呼ぶノード間通信はまだ配線されていない
+   ため実害は無いが、将来配線される際は各ノードに同じ
+   `ARUARU_DB_ADMIN_TOKEN`を設定する必要がある点をコメントに明記)。
+3. **タイミングサイドチャネル対策**: 素の`!=`比較はCWE-208
+   (タイミング攻撃)のリスクがあるため、`constant_time_eq`
+   (全バイトを走査してからXOR累積判定、長さの違いも早期リターン
+   しない)を新設し、トークン比較をこれに置き換えた。新規crate依存
+   (`subtle`等)は追加せず、この用途限定の最小実装とした。
+4. **Web管理UI(`aruaru-db/web/`、新規独立クレート)**: RPoem
+   (`open-runo-poem-compat`)へのpath依存のみ。既存の`aruaru-server`
+   (常駐デーモン)の`/admin/cluster`(GET)・`/admin/cluster/rebalance`
+   (POST)をリバースプロキシする。**2段階の独立したトークン**:
+   ブラウザ↔本Web層(`ARUARU_WEB_ADMIN_TOKEN`)、本Web層↔aruaru-server
+   (`ARUARU_UPSTREAM_ADMIN_TOKEN`、aruaru-server起動時の
+   `ARUARU_DB_ADMIN_TOKEN`と同じ値)。`ARUARU_WEB_READ_ONLY=1`設定時は
+   正しいトークンでも常に403(rs-sync/open-raid-z/webと同じ多層防御
+   設計)。
+5. **実機検証(型チェックのみで完了と報告しない方針を徹底)**: 実際に
+   `aruaru-server`をローカルで起動し、(a) `ARUARU_DB_ADMIN_TOKEN`未設定
+   時は`/admin/cluster`が503(修正前は無条件200で実データが漏れて
+   いた)、(b) トークン設定後、誤ったトークンは401・正しいトークンは
+   200で実クラスタ状態を返す、(c) 同じ試験を`raft/append`にも実施し
+   401を確認、(d) 同じ長さ/異なる長さの誤トークンいずれも問題なく401、
+   (e) Web UI経由でも2段階トークンを通して実際にステータス取得・
+   リバランス実行が成功する、(f) `ARUARU_WEB_READ_ONLY=1`時は正しい
+   トークンでも403、をすべて実際のHTTPリクエストで確認した。
+   `cargo build --workspace`・`cargo test -p aruaru-server --features
+   disaster_email_backup`ともリグレッション無し(既存の
+   `propose_commit`未使用警告のみ、無関係)。
+6. **正直な開示・未着手**: (a) VPSへの実デプロイ・TLS終端の実運用
+   設定(`--tls-cert`/`--tls-key`フラグ自体はmain.rsに既存)は今回
+   未実施、(b) `aruaru-graphql`側の`cluster_propose` GraphQL resolver
+   (2026-07-25(続き2)で発見済みの別の迂回経路、`RaftWriter`を経由せず
+   `QueryEngine`へ直接書き込む)は今回も未対応のまま(GraphQL自体には
+   今回の`x-admin-token`ゲートを適用していない、別軸の認証方針のため
+   スコープ外とした)、(c) `/graphql`エンドポイント自体にもレート
+   制限・認証は無い(今回のスコープはREST `/admin/*`限定)。
+- 次にすべきこと: (1) VPS実デプロイ+TLS設定、(2) `aruaru-graphql`の
+  `cluster_propose` resolverをRaftWriter経由に統一(既知の残課題、
+  変更なし)、(3) `/graphql`エンドポイント自体の認証・レート制限。
+
 ## HANDOFF: 2026-07-30 安全なアンインストーラー(uninstall.sh/uninstall.ps1)を新設
 
 ユーザー指示「別バージョンをインストールし直す/アンインストールする際に
