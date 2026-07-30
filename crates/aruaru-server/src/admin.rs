@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::Mutex;
-use poem::{get, handler, post, web::Data, web::Json, EndpointExt, Request, Route};
+use poem::{get, handler, post, web::Data, web::Json, Endpoint, EndpointExt, Request, Route};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -91,18 +91,46 @@ impl AdminState {
     }
 }
 
-// ── 管理API認証(`x-admin-token`、2026-07-25追記) ───────────────
+// ── 管理API認証(`x-admin-token`、2026-07-25追記・2026-07-30遡及適用) ──
 //
 // このリポジトリの`/admin/*`は元々認証機構を持たなかった
 // (2026-07-24 HANDOFF「管理API自体に認証機構が現状無い」で明記済みの
-// 既知のギャップ)。新設のディザスタ・メールバックアップ管理API限定で、
+// 既知のギャップ)。当初はディザスタ・メールバックアップ管理API限定で
 // `open-web-server`/`open-easy-web`と同じ「`x-admin-token`ヘッダー +
-// 環境変数設定のトークン、未設定なら503」という規約を導入する
-// (既存の他の`/admin/*`エンドポイントへの遡及適用は今回のスコープ外)。
-#[cfg(feature = "disaster_email_backup")]
+// 環境変数設定のトークン、未設定なら503」という規約を導入していたが、
+// 2026-07-30、ユーザー指示「aruaru-serverは外部から乗っ取られないように
+// セキュリティをしっかりして」を受け、**`admin_routes()`が返すRoute全体を
+// `.around()`ミドルウェアで包み、`/admin/*`配下の全エンドポイント
+// (cluster/backup/migrate/federation/registry/raftを含む)に同じ認証を
+// 遡及適用した**(`aruaru-db/CLAUDE.md`の2026-07-25(続き2)エントリが
+// 「次回候補(b)」として明記していた項目そのもの)。`main.rs`側の
+// GraphQLエンドポイント(`/graphql`)には適用しない(既存のGraphQL認証
+// 方針は別軸のため、今回のスコープ外)。
 const ADMIN_TOKEN_ENV: &str = "ARUARU_DB_ADMIN_TOKEN";
 
-#[cfg(feature = "disaster_email_backup")]
+/// 定数時間文字列比較(2026-07-30追記、ユーザー指示「高速なランダム要素を
+/// 入れた暗号化とセキュリティをしっかりして」への対応の一つ)。
+///
+/// 素の`==`/`!=`によるトークン比較は、多くの言語処理系で先頭バイトから
+/// 逐次比較し不一致を検出した時点で早期リターンするため、**一致した
+/// 先頭バイト数に応じてわずかに応答時間が変化する**(タイミングサイド
+/// チャネル攻撃、CWE-208として知られる既知の脆弱性クラス)。外部から
+/// 到達可能な`/admin/*`の認証トークン比較にこの種の脆弱性を持ち込まない
+/// よう、全バイトを必ず走査してから結果をXOR累積で判定する定数時間実装
+/// に置き換えた。新規crateへの依存追加(`subtle`等)は行わず、この用途に
+/// 限定した最小実装とした。長さが異なる場合も早期リターンせず、常に
+/// `expected`の全長を走査する(長さの違いによるタイミング差も避ける)。
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn check_admin_auth(req: &Request) -> Result<(), (poem::http::StatusCode, &'static str)> {
     let Ok(expected) = std::env::var(ADMIN_TOKEN_ENV) else {
         return Err((
@@ -115,7 +143,7 @@ fn check_admin_auth(req: &Request) -> Result<(), (poem::http::StatusCode, &'stat
         .get("x-admin-token")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if provided.is_empty() || provided != expected {
+    if provided.is_empty() || !constant_time_eq(provided, &expected) {
         return Err((poem::http::StatusCode::UNAUTHORIZED, "invalid or missing x-admin-token header"));
     }
     Ok(())
@@ -284,6 +312,12 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         .at("/raft/append", post(raft_append))
         .at("/raft/vote", post(raft_vote))
         .data(state)
+        .around(|ep, req| async move {
+            if let Err((status, msg)) = check_admin_auth(&req) {
+                return Ok(poem::Response::builder().status(status).body(msg));
+            }
+            ep.call(req).await.map(poem::IntoResponse::into_response)
+        })
 }
 
 // ── ① バックアップ ─────────────────────────────────────────────

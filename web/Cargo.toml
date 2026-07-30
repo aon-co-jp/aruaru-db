@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "aruaru-db-web"
+version = "0.1.0"
+edition = "2021"
+description = "aruaru-db Web管理UI(RPoem/open-runo-poem-compat経由、Poem/Tauri直接依存無し)。既存aruaru-serverの管理API(/admin/cluster等)をリバースプロキシし、管理者のみクラスタ操作を許可、/demoはread-only。"
+
+[[bin]]
+name = "aruaru-db-web"
+path = "src/main.rs"
+
+[dependencies]
+# RPoem(poem-cosmo-tauri)のpoem互換ファサード。実体はtokio/hyper直接実装
+# (open_runo_router::hyper_compat)であり、poem本体には依存しない
+# (2026-07-30、ユーザー指示「Rust + RPoem(tokio/hyper直接実装)」に対応)。
+open-runo-poem-compat = { path = "../../RPoem/crates/open-runo-poem-compat" }
+hyper = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
