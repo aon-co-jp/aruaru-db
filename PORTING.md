@@ -28,6 +28,28 @@ Releasesへ添付)を追加。**移植時の注意**: `aruaru-core`が
 (`release.yml`内の`git clone`ステップを参照——他のクレート`open_raid_z_core`
 のpath依存も同様のパターン、`open_raid_z` feature有効時のみ影響)。
 
+## 0.5. アンインストーラー + 管理API認証の遡及適用 + Web管理UI(2026-07-30追加、重要)
+
+- `uninstall.sh`/`uninstall.ps1`: サービス停止・バイナリ削除のみ行い、
+  実データディレクトリ(`/var/lib/aruaru-db`等)は絶対に削除しない設計。
+- **セキュリティ上の重大な移植時の注意**: `crates/aruaru-server/src/
+  admin.rs`の`admin_routes()`は、以前は`disaster-email-backup`系
+  エンドポイントのみ`x-admin-token`認証されており、`cluster`/`backup`/
+  `migrate`/`federation`/`registry`/`raft/append`/`raft/vote`を含む
+  大半が無認証でインターネットから到達可能という重大なギャップが
+  あった。現在は`admin_routes()`が返す`Route`全体を`.around()`
+  ミドルウェアで包み、`check_admin_auth`(定数時間トークン比較、
+  CWE-208対策)を全エンドポイントへ適用済み。**移植先でも`/admin/*`
+  相当のエンドポイントを追加する際は、必ずこの`.around()`ラッパーの
+  適用範囲に含まれることを確認すること**(個別ハンドラごとに
+  認証を書き忘れるパターンの再発防止)。`ARUARU_DB_ADMIN_TOKEN`
+  環境変数が未設定の場合は503を返す(fail-closed設計)。
+- `web/`(新規独立クレート): RPoem(`open-runo-poem-compat`)による
+  管理UI。既存の`aruaru-server`管理APIへのリバースプロキシとして
+  実装、2段階トークン(ブラウザ↔Web層・Web層↔aruaru-server)+
+  read-onlyデモモードに対応。他プロジェクトでも「常駐デーモンの
+  既存管理APIへの薄いリバースプロキシ」パターンとして移植可能。
+
 ---
 
 ## 0.1. aruaru-DB とは何か・エコシステム内での位置づけ
