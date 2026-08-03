@@ -1698,6 +1698,56 @@ Web管理UIを構築。その過程でユーザーから複数回「aruaru-serve
 - 次にすべきこと: (1) 実環境(Linux実機/Windows実機)でのインストール→
   アンインストール→データ保全の実地検証。
 
+## HANDOFF: 2026-08-01(続き) GraphQL経由の管理操作にも認証を適用(2026-07-25(続き2)/07-27エントリの「未解決」を解消)
+
+過去のHANDOFF(2026-07-25続き2・07-27・07-30)が繰り返し「次にすべきこと」
+として記録していた`aruaru-graphql`側の認証欠如を解消した。
+
+1. **調査で判明したこと**: `cluster_propose` resolverの`RaftWriter`経由化
+   自体は既に**2026-07-26に実装・テスト済み**だった(`admin_resolvers.rs`
+   のdocコメント・`cluster_propose_tests`モジュールで確認、実際に
+   `cargo test`で再確認しgreen)——CLAUDE.mdの「次にすべきこと」記載が
+   古いまま更新されていなかっただけ(このエコシステムで繰り返し見られる
+   「ドキュメントの追従漏れ」パターン)。一方、**GraphQL `/graphql`
+   エンドポイント自体に認証機構が一切無い**という別の欠如は実際に
+   未解消のまま残っていた——REST側`/admin/*`は2026-07-30に
+   `x-admin-token`認証を遡及適用済みだったが、**同じ管理操作
+   (`clusterStatus`・`createBackup`・`runMigration`・`clusterPropose`等)を
+   GraphQL経由で呼べば無認証のまま実行できてしまう抜け穴**が残っていた。
+2. **修正**: `graphql_endpoint`を`async-graphql-poem`既定の
+   `GraphQL::new(schema)`から、`x-admin-token`ヘッダーを読み取り
+   `GraphqlAdminToken`としてリクエストデータへ注入する薄いハンドラへ
+   置き換えた。`admin_resolvers.rs`に`require_admin_token`
+   (REST側`admin.rs`の`check_admin_auth`/`constant_time_eq`と同じロジック・
+   同じ環境変数`ARUARU_DB_ADMIN_TOKEN`)を新設し、既に`admin(ctx)?`を
+   呼んでいたresolverはそのヘルパー経由で自動的に保護対象になるよう
+   `admin()`自体に検証を組み込み、`admin(ctx)`を呼んでいなかった残りの
+   resolver(`preview_source`・`test_registry_connection`・
+   `set_parallel_config`・`cluster_node_op`等)にも個別に追加した。
+   `VcsQuery`/`VcsMutation`(通常のバージョン管理系クエリ)は対象外——
+   `/graphql`は1つのスキーマに管理系と非管理系を統合しているため、
+   エンドポイント全体を一律に塞ぐと通常利用まで巻き込むと判断した。
+3. **検証(実測)**: 新規テスト4件
+   (`admin_query_without_token_is_rejected`・
+   `admin_query_with_wrong_token_is_rejected`・
+   `admin_query_with_correct_token_succeeds`・
+   `non_admin_vcs_query_does_not_require_a_token`)、既存2件
+   (`cluster_propose_*`)含め`cargo test -p aruaru-graphql`**6件全green**。
+   `cargo build --workspace`成功(既存の`propose_commit`未使用警告のみ、
+   無関係)。**本番デプロイ後、実際に`curl`で`/graphql`へ`x-admin-token`
+   無し→エラー、誤ったトークン→エラー、正しいトークン→実クラスタ状態
+   (`{"data":{"clusterStatus":{"stats":{"totalNodes":1}}}}`)、非管理系
+   `log`クエリはトークン無しでも成功**、の4パターンをすべて実際の
+   HTTPリクエストで確認した(型チェックのみでの完了報告ではない)。
+4. **正直な開示**: (a) 一部のAdmin resolver(`set_backup_schedule`・
+   `cluster_node_op`・`rebalance_cluster`・フェデレーション系)は元々
+   状態を持たないスタブ実装(入力をそのまま返すのみ)だが、一貫性・
+   将来の実装差し替えに備えて認証は同様に適用した、(b) `/graphql`
+   エンドポイント全体のレート制限は引き続き未実装(認証は追加したが
+   スロットリングは別軸の課題として残る)。
+- 次にすべきこと: 特に緊急の課題は無し。`/graphql`のレート制限は
+  今後の課題として残る。
+
 ## HANDOFF: 2026-08-01 Web管理UIをVPS本番へデプロイ+実バグ発見・修正(ユーザー指示「Bの横断バックログを優先順位を付けて進めて」)
 
 前回エントリの「次にすべきこと(2)」(Web管理UIのVPSデプロイ)に対応。
