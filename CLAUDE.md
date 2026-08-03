@@ -1696,10 +1696,54 @@ Web管理UIを構築。その過程でユーザーから複数回「aruaru-serve
    →データディレクトリが残っていることの実機検証は今回未実施(スクリプト
    のロジックレビューとシェル構文チェックのみ)。
 - 次にすべきこと: (1) 実環境(Linux実機/Windows実機)でのインストール→
-  アンインストール→データ保全の実地検証、(2) Web管理UIデモ
-  (`https://easy-web.tokyo/aruaru-db`本番+`/demo`)の新規構築
-  (ユーザー指示、複数ドメインでバイナリ共有・ログイン/登録/保存は
-  管理者のみ・デモはread-only、rs-syncと同じ構成パターンを踏襲予定)。
+  アンインストール→データ保全の実地検証。
+
+## HANDOFF: 2026-08-01 Web管理UIをVPS本番へデプロイ+実バグ発見・修正(ユーザー指示「Bの横断バックログを優先順位を付けて進めて」)
+
+前回エントリの「次にすべきこと(2)」(Web管理UIのVPSデプロイ)に対応。
+`open-raid-z`で同日実施した同種のデプロイ作業の直後に着手。
+
+1. **既存VPS上のチェックアウトを使わず、クリーンクローンで対応**:
+   VPS上の`/root/open-aruaru/aruaru-db`は未コミットの大量の削除・
+   追跡外ファイル(古いv0.5.0リリースzipの展開残骸等)を抱えた不安定な
+   状態だったため、誤って上書き・破棄しないよう**触れずに**
+   `/root/aruaru-db`へ新規クリーンクローンして作業した。
+2. **単一ノードのスタンドアロン構成でデプロイ**: `aruaru-server`
+   (`--raft-id 1`、peers無し)をport 4001/5433で起動
+   (`aruaru-server.service`)、Web管理UI(`aruaru-db-web`)をport 8111
+   で起動(`aruaru-db-web.service`)。`ARUARU_DB_ADMIN_TOKEN`/
+   `ARUARU_WEB_ADMIN_TOKEN`/`ARUARU_UPSTREAM_ADMIN_TOKEN`をそれぞれ
+   生成しsystemd環境変数として設定(値は`/root/.aruaru-db-admin-token`/
+   `/root/.aruaru-db-web-admin-token`にも保存)。`open-web-server`の
+   「分身の術」テナント登録(`path_prefix=/aruaru-db`)で
+   `https://easy-web.tokyo/aruaru-db/`へ接続。
+3. **実バグ発見・修正: 絶対パスfetchが`/aruaru-db`マウント配下で
+   壊れていた**: 実際に`https://easy-web.tokyo/aruaru-db/`を実ブラウザで
+   開いたところ、クラスタ状態が`{"error":"not found"}`と表示される
+   ことを発見。`web/src/main.rs`のJSが`fetch('/api/status')`という
+   絶対パスでリクエストしており、`/aruaru-db`マウント配下では常に
+   オリジン直下(`https://easy-web.tokyo/api/status`)を叩いてしまい
+   404になっていた——**open-redmine/open-gitea/RS-Syncが過去に繰り返し
+   踏んだのと全く同じ「絶対パスfetch罠」**(`PORTING.md`に記録済みの
+   既知パターン)がこのリポジトリでも初めて実際に踏まれた形。
+   `ARUARU_WEB_BASE_PATH`環境変数(既定は空文字列、後方互換)を追加し、
+   ページのJSへ`const BASE_PATH = '{base_path}';`として埋め込み、
+   両方の`fetch()`呼び出しに前置するよう修正。
+4. **検証(実測)**: `cargo build --release`(ローカル・VPS両方)成功。
+   本番へ`ARUARU_WEB_BASE_PATH=/aruaru-db`を設定して再起動後、
+   **実際にブラウザで`https://easy-web.tokyo/aruaru-db/`を開き**、
+   ページ読み込み時に自動でクラスタ状態(`total_nodes:1`,
+   `healthy_nodes:1`等)が正しく表示されること、コンソールエラーが
+   無いことを確認した(修正前は`{"error":"not found"}`だったことを
+   実際に確認した上での修正、型チェックのみでの完了報告ではない)。
+5. **正直な開示**: (a) `/aruaru-db/demo`という別テナントは今回登録
+   していない(`GET /api/status`は元々認証不要、`open-raid-z`の
+   デプロイ時と同じ判断)、(b) 単一ノード構成のため、Multi-Raft・
+   複数ノードクラスタとしての実地検証はまだ行っていない(スタンドアロン
+   での起動・疎通確認のみ)、(c) TLS終端は`open-web-server`側の
+   リバースプロキシに委ねている(このアプリ自体のTLS設定は未使用)。
+  - 次にすべきこと: 特に緊急の課題は無し。複数ノードクラスタとしての
+    実地検証は今後の課題として残る。
 
 ## エコシステム全体マップ(2026-07-21追記)
 
