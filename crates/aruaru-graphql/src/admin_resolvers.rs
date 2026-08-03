@@ -30,7 +30,40 @@ pub struct AdminCtx {
     pub replicator: Option<Arc<dyn aruaru_dist::ReplicatedWriter>>,
 }
 
+/// `x-admin-token`ヘッダーを検証する(2026-08-01追加、実バグ修正)。
+/// `admin.rs`(REST、`/admin/*`)の`check_admin_auth`/`constant_time_eq`と
+/// 同じロジック・同じ環境変数(`ARUARU_DB_ADMIN_TOKEN`)を使う——GraphQL
+/// (`/graphql`)経由でも同じ管理操作(`cluster_propose`・`create_backup`・
+/// `run_migration`等)を呼べてしまうため、REST側だけを認証で塞いでも
+/// 迂回経路になっていた実バグへの対応。新規crate依存(`subtle`等)は
+/// 追加せず、この用途限定の最小実装を複製している。
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn require_admin_token(ctx: &Context<'_>) -> Result<()> {
+    let Ok(expected) = std::env::var("ARUARU_DB_ADMIN_TOKEN") else {
+        return Err(async_graphql::Error::new("admin API is not configured (ARUARU_DB_ADMIN_TOKEN is not set)"));
+    };
+    let provided = ctx.data::<crate::GraphqlAdminToken>().ok().and_then(|t| t.0.clone()).unwrap_or_default();
+    if provided.is_empty() || !constant_time_eq(&provided, &expected) {
+        return Err(async_graphql::Error::new("invalid or missing x-admin-token header"));
+    }
+    Ok(())
+}
+
+/// `AdminCtx`を取り出す前に、必ず`require_admin_token`で認証する
+/// (このヘルパー経由で管理状態を取得する全resolverが自動的に保護対象に
+/// なる、DRYな適用箇所)。
 fn admin<'a>(ctx: &Context<'a>) -> Result<&'a AdminCtx> {
+    require_admin_token(ctx)?;
     ctx.data::<AdminCtx>()
         .map_err(|_| async_graphql::Error::new("AdminCtx not in context"))
 }
@@ -138,7 +171,8 @@ impl AdminQuery {
         Ok(manifests.into_iter().map(manifest_to_gql).collect())
     }
 
-    async fn backup_schedule(&self, _ctx: &Context<'_>) -> Result<Option<ScheduleGql>> {
+    async fn backup_schedule(&self, ctx: &Context<'_>) -> Result<Option<ScheduleGql>> {
+        require_admin_token(ctx)?;
         Ok(None)
     }
 
@@ -183,7 +217,8 @@ impl AdminQuery {
 
     // ── 並列実行 ────────────────────────────────────────────
 
-    async fn parallel_config(&self, _ctx: &Context<'_>) -> Result<ParallelConfigGql> {
+    async fn parallel_config(&self, ctx: &Context<'_>) -> Result<ParallelConfigGql> {
+        require_admin_token(ctx)?;
         Ok(ParallelConfigGql {
             enabled: false,
             max_workers: 4,
@@ -192,13 +227,15 @@ impl AdminQuery {
         })
     }
 
-    async fn parallel_jobs(&self, _ctx: &Context<'_>) -> Result<Vec<ParallelJobGql>> {
+    async fn parallel_jobs(&self, ctx: &Context<'_>) -> Result<Vec<ParallelJobGql>> {
+        require_admin_token(ctx)?;
         Ok(vec![])
     }
 
     // ── フェデレーション ────────────────────────────────────
 
-    async fn federated_sources(&self, _ctx: &Context<'_>) -> Result<Vec<FederatedSourceGql>> {
+    async fn federated_sources(&self, ctx: &Context<'_>) -> Result<Vec<FederatedSourceGql>> {
+        require_admin_token(ctx)?;
         Ok(vec![])
     }
 
@@ -206,10 +243,14 @@ impl AdminQuery {
 
     async fn preview_source(
         &self,
-        _ctx: &Context<'_>,
+        ctx: &Context<'_>,
         source: String,
         uri: String,
     ) -> Result<Vec<TableInfoGql>> {
+        // 呼び出し元が任意のURIへ接続を試みさせられる(サーバー自身に
+        // 外部/内部ネットワークへの接続を行わせる、SSRF類似の経路)ため、
+        // 管理者トークン必須とする(2026-08-01追加、実バグ修正)。
+        require_admin_token(ctx)?;
         use aruaru_registry::adapter::adapter_for;
         let wire = wire_for_source(&source)
             .ok_or_else(|| async_graphql::Error::new(format!("未対応ソース: {source}")))?;
@@ -252,10 +293,11 @@ impl AdminMutation {
 
     async fn test_registry_connection(
         &self,
-        _ctx: &Context<'_>,
+        ctx: &Context<'_>,
         id: String,
         uri: String,
     ) -> Result<ConnTestGql> {
+        require_admin_token(ctx)?;
         use aruaru_registry::{adapter::adapter_for, Wire};
         // id からワイヤを推定（レジストリ検索簡易版）
         let wire = if uri.starts_with("postgres") || uri.starts_with("cockroach") {
@@ -329,9 +371,10 @@ impl AdminMutation {
 
     async fn set_backup_schedule(
         &self,
-        _ctx: &Context<'_>,
+        ctx: &Context<'_>,
         input: ScheduleInput,
     ) -> Result<ScheduleGql> {
+        require_admin_token(ctx)?;
         Ok(ScheduleGql {
             enabled: input.enabled,
             cron: input.cron,
@@ -344,9 +387,10 @@ impl AdminMutation {
 
     async fn cluster_node_op(
         &self,
-        _ctx: &Context<'_>,
+        ctx: &Context<'_>,
         input: ClusterNodeInput,
     ) -> Result<MutationResult> {
+        require_admin_token(ctx)?;
         Ok(MutationResult {
             success: true,
             commit_id: None,
@@ -354,7 +398,8 @@ impl AdminMutation {
         })
     }
 
-    async fn rebalance_cluster(&self, _ctx: &Context<'_>) -> Result<MutationResult> {
+    async fn rebalance_cluster(&self, ctx: &Context<'_>) -> Result<MutationResult> {
+        require_admin_token(ctx)?;
         Ok(MutationResult {
             success: true,
             commit_id: None,
@@ -408,9 +453,10 @@ impl AdminMutation {
 
     async fn set_parallel_config(
         &self,
-        _ctx: &Context<'_>,
+        ctx: &Context<'_>,
         config: ParallelConfigInput,
     ) -> Result<ParallelConfigGql> {
+        require_admin_token(ctx)?;
         Ok(ParallelConfigGql {
             enabled: config.enabled,
             max_workers: config.max_workers,
@@ -421,9 +467,10 @@ impl AdminMutation {
 
     async fn explain_distributed(
         &self,
-        _ctx: &Context<'_>,
+        ctx: &Context<'_>,
         sql: String,
     ) -> Result<Vec<ExplainStepGql>> {
+        require_admin_token(ctx)?;
         Ok(vec![ExplainStepGql {
             step: 1,
             node: "node-1".into(),
@@ -437,9 +484,10 @@ impl AdminMutation {
 
     async fn register_federated_source(
         &self,
-        _ctx: &Context<'_>,
+        ctx: &Context<'_>,
         input: FederatedSourceInput,
     ) -> Result<FederatedSourceGql> {
+        require_admin_token(ctx)?;
         Ok(FederatedSourceGql {
             name: input.name,
             kind: input.kind,
@@ -451,9 +499,10 @@ impl AdminMutation {
 
     async fn drop_federated_source(
         &self,
-        _ctx: &Context<'_>,
+        ctx: &Context<'_>,
         name: String,
     ) -> Result<MutationResult> {
+        require_admin_token(ctx)?;
         Ok(MutationResult { success: true, commit_id: None, message: format!("'{name}' を削除しました。") })
     }
 
@@ -472,10 +521,11 @@ impl AdminMutation {
 
     async fn test_source_connection(
         &self,
-        _ctx: &Context<'_>,
+        ctx: &Context<'_>,
         source: String,
         uri: String,
     ) -> Result<ConnTestGql> {
+        require_admin_token(ctx)?;
         use aruaru_registry::adapter::adapter_for;
         let Some(wire) = wire_for_source(&source) else {
             return Ok(ConnTestGql { ok: false, message: format!("未対応ソース: {source}"), server_version: None });
@@ -585,12 +635,23 @@ use crate::{QueryResultGql, MutationResult};
 // (`aruaru-graphql`は`aruaru-server`に依存できない循環関係のため)。
 #[cfg(test)]
 mod cluster_propose_tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use aruaru_dist::{Applier, Command, CommandResponse, RaftNode, RaftWriter, ReplicatedWriter};
     use aruaru_query::QueryEngine;
 
-    use crate::{build_schema, AdminCtx};
+    use crate::{build_schema, AdminCtx, GraphqlAdminToken};
+
+    /// `ARUARU_DB_ADMIN_TOKEN`はプロセス全体のグローバル環境変数のため、
+    /// このモジュール内のテストが並行に読み書きすると競合する
+    /// (`open-easy-web`等、同種の環境変数依存テストで採用済みの既存
+    /// パターンと同じ対策)。
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const TEST_ADMIN_TOKEN: &str = "test-admin-token";
+
+    fn authorized_request(query: &str) -> async_graphql::Request {
+        async_graphql::Request::new(query).data(GraphqlAdminToken(Some(TEST_ADMIN_TOKEN.to_string())))
+    }
 
     /// `aruaru-server::cluster::EngineApplier`と同じ責務の最小再実装
     /// (Raft commit を QueryEngine へ適用する)。
@@ -649,6 +710,9 @@ mod cluster_propose_tests {
     /// 進んでいることをテーブルの中身で確認する)。
     #[tokio::test]
     async fn cluster_propose_routes_through_raft_when_replicator_configured() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
         let engine = Arc::new(QueryEngine::new());
         let applier = TestEngineApplier { engine: engine.clone() };
         let node = Arc::new(RaftNode::new(1, applier, vec![])); // peers空=単一ノード
@@ -657,9 +721,9 @@ mod cluster_propose_tests {
 
         let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), Some(writer)));
         let resp = schema
-            .execute(
+            .execute(authorized_request(
                 r#"mutation { clusterPropose(sql: "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)") { success message } }"#,
-            )
+            ))
             .await;
         assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
         let data = resp.data.into_json().unwrap();
@@ -678,12 +742,15 @@ mod cluster_propose_tests {
     /// (単一ノード/非クラスタ構成・既存呼び出し元への無回帰の確認)。
     #[tokio::test]
     async fn cluster_propose_falls_back_to_direct_engine_execute_without_replicator() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
         let engine = Arc::new(QueryEngine::new());
         let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), None));
         let resp = schema
-            .execute(
+            .execute(authorized_request(
                 r#"mutation { clusterPropose(sql: "CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT)") { success message } }"#,
-            )
+            ))
             .await;
         assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
         let data = resp.data.into_json().unwrap();
@@ -694,5 +761,61 @@ mod cluster_propose_tests {
             "replicator未設定時はフォールバックのはず: {result:?}"
         );
         assert!(engine.table_names().contains(&"t2".to_string()));
+    }
+
+    /// **2026-08-01追加(実バグ修正の検証)**: `/graphql`経由の管理操作は
+    /// REST `/admin/*`と同じ`x-admin-token`検証を受けること。修正前は
+    /// GraphQL経由なら無認証で`clusterStatus`等が読めてしまっていた。
+    #[tokio::test]
+    async fn admin_query_without_token_is_rejected() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), None));
+        // GraphqlAdminTokenを一切データへ注入しないリクエスト
+        // (実際のHTTPハンドラでヘッダーが送られなかった状態を再現)。
+        let resp = schema.execute("query { clusterStatus { stats { totalNodes } } }").await;
+        assert!(!resp.errors.is_empty(), "should be rejected without a token");
+        assert!(
+            resp.errors.iter().any(|e| e.message.contains("invalid or missing")),
+            "unexpected error: {:?}",
+            resp.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_query_with_wrong_token_is_rejected() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), None));
+        let req = async_graphql::Request::new("query { clusterStatus { stats { totalNodes } } }")
+            .data(GraphqlAdminToken(Some("wrong-token".to_string())));
+        let resp = schema.execute(req).await;
+        assert!(!resp.errors.is_empty(), "should be rejected with the wrong token");
+    }
+
+    #[tokio::test]
+    async fn admin_query_with_correct_token_succeeds() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), None));
+        let resp = schema.execute(authorized_request("query { clusterStatus { stats { totalNodes } } }")).await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+    }
+
+    /// 非管理系(`VcsQuery`)フィールドは今回のゲート対象外であること
+    /// (`AdminCtx`を一切要求しない既存のバージョン管理系クエリまで
+    /// 巻き込んでいないことの確認、`GraphqlAdminToken`未設定でも成功する)。
+    #[tokio::test]
+    async fn non_admin_vcs_query_does_not_require_a_token() {
+        let engine = Arc::new(QueryEngine::new());
+        let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), None));
+        let resp = schema.execute("query { log(limit: 1) { id } }").await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
     }
 }
