@@ -18,7 +18,7 @@ use async_graphql::{
     Context, EmptySubscription, MergedObject, Object, Result, Schema, SchemaBuilder,
     SimpleObject, SDLExportOptions, ID,
 };
-use async_graphql_poem::GraphQL;
+use async_graphql_poem::{GraphQLBatchRequest, GraphQLBatchResponse};
 
 use aruaru_query::{QueryEngine, QueryResponse};
 
@@ -204,9 +204,44 @@ pub fn subgraph_sdl() -> String {
         .sdl_with_options(SDLExportOptions::new().federation())
 }
 
-/// Poem エンドポイント
+/// GraphQLリクエストに同梱された`x-admin-token`ヘッダー値
+/// (2026-08-01追加、実バグ修正)。`/graphql`は`QueryRoot`/`MutationRoot`
+/// (`VcsQuery`/`VcsMutation`+`AdminQuery`/`AdminMutation`)を1つのスキーマに
+/// 統合しているため、エンドポイント全体を一律に認証で塞ぐと通常のVCS
+/// クエリ(認証不要であるべき)まで巻き込んでしまう。そのため
+/// エンドポイント自体は認証しない代わりに、この値をリクエストデータへ
+/// 注入し、`admin_resolvers::require_admin_token`が`AdminQuery`/
+/// `AdminMutation`配下の各フィールド解決時に個別に検証する。
+#[derive(Clone, Default)]
+pub(crate) struct GraphqlAdminToken(pub Option<String>);
+
+/// Poem エンドポイント。
+///
+/// **2026-08-01追記(実バグ修正)**: 従来は`GraphQL::new(schema)`
+/// (`async-graphql-poem`の既定エンドポイント)をそのまま使っており、
+/// `x-admin-token`ヘッダーがGraphQL実行コンテキストへ一切伝播していな
+/// かった——`admin.rs`(REST)側は2026-07-30に`/admin/*`全体へ認証を
+/// 遡及適用済みだったが、**同じ管理操作をGraphQL経由(`cluster_propose`・
+/// `create_backup`・`run_migration`等)で呼べば無認証のまま実行できて
+/// しまう抜け穴**が残っていた(ユーザー指示「aruaru-serverは外部から
+/// 乗っ取られないようにセキュリティをしっかりして」の趣旨に反する)。
+/// ヘッダーを読み取り`GraphqlAdminToken`としてリクエストデータへ注入する
+/// 薄いハンドラへ置き換え、実際の検証は各Admin resolverで行う
+/// (`admin_resolvers::require_admin_token`参照)。
+#[poem::handler]
+async fn graphql_handler(
+    req: &poem::Request,
+    gql_req: GraphQLBatchRequest,
+    schema: poem::web::Data<&AruaruSchema>,
+) -> GraphQLBatchResponse {
+    let token = req.header("x-admin-token").map(|v| v.to_string());
+    let batch_req = gql_req.0.data(GraphqlAdminToken(token));
+    schema.execute_batch(batch_req).await.into()
+}
+
 pub fn graphql_endpoint(engine: Arc<QueryEngine>, admin_ctx: AdminCtx) -> impl poem::Endpoint {
-    GraphQL::new(build_schema(engine, admin_ctx))
+    use poem::EndpointExt;
+    graphql_handler.data(build_schema(engine, admin_ctx))
 }
 
 // ── 変換ヘルパ ────────────────────────────────────────────────
