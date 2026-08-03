@@ -39,6 +39,15 @@ struct Config {
     upstream_admin_token: Option<String>,
     read_only: bool,
     http_client: reqwest::Client,
+    /// ブラウザ側JSが`fetch()`する際に前置するパスプレフィックス
+    /// (2026-08-01追加、実バグ修正)。`open-web-server`の「分身の術」
+    /// テナントルーティング(`path_prefix`剥がし転送)配下にマウントする
+    /// 場合、ブラウザは絶対パス`/api/...`だと常にオリジン直下を叩いて
+    /// しまう——open-redmine/open-gitea/RS-Syncが過去に繰り返し踏んだのと
+    /// 全く同じ罠が、実際に`https://easy-web.tokyo/aruaru-db/`への
+    /// 実デプロイ後の実ブラウザ確認で再現した(`GET /api/status`ではなく
+    /// `GET /aruaru-db/api/status`が呼ばれる必要があった)。
+    base_path: String,
 }
 
 impl Config {
@@ -49,11 +58,12 @@ impl Config {
             upstream_admin_token: std::env::var("ARUARU_UPSTREAM_ADMIN_TOKEN").ok(),
             read_only: matches!(std::env::var("ARUARU_WEB_READ_ONLY").as_deref(), Ok("1") | Ok("true")),
             http_client: reqwest::Client::new(),
+            base_path: std::env::var("ARUARU_WEB_BASE_PATH").unwrap_or_default(),
         }
     }
 }
 
-fn page_html(demo: bool) -> String {
+fn page_html(demo: bool, base_path: &str) -> String {
     let banner = if demo {
         r#"<div class="banner demo">これはread-onlyデモです。ログイン・登録・保存(クラスタ操作)は実際には出来ません。</div>"#
     } else {
@@ -92,11 +102,12 @@ fn page_html(demo: bool) -> String {
   <pre id="rebalance-result"></pre>
 </section>
 <script>
+const BASE_PATH = '{base_path}';
 async function refreshStatus() {{
   const el = document.getElementById('status');
   el.textContent = '取得中...';
   try {{
-    const res = await fetch('/api/status');
+    const res = await fetch(BASE_PATH + '/api/status');
     const body = await res.text();
     el.textContent = body;
   }} catch (e) {{
@@ -109,7 +120,7 @@ document.getElementById('rebalance').addEventListener('click', async () => {{
   const el = document.getElementById('rebalance-result');
   el.textContent = '実行中...';
   try {{
-    const res = await fetch('/api/rebalance', {{
+    const res = await fetch(BASE_PATH + '/api/rebalance', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json', 'X-Admin-Token': token }},
       body: '{{}}'
@@ -129,11 +140,15 @@ refreshStatus();
 fn main() {
     let config = Arc::new(Config::from_env());
 
+    let index_config = Arc::clone(&config);
     let index_handler = std::sync::Arc::new(move |_req: Request, _params: Params| {
-        Box::pin(async move { html_response(StatusCode::OK, page_html(false)) }) as hyper_compat::BoxFuture<Response>
+        let config = Arc::clone(&index_config);
+        Box::pin(async move { html_response(StatusCode::OK, page_html(false, &config.base_path)) }) as hyper_compat::BoxFuture<Response>
     }) as hyper_compat::Handler;
+    let demo_config = Arc::clone(&config);
     let demo_handler = std::sync::Arc::new(move |_req: Request, _params: Params| {
-        Box::pin(async move { html_response(StatusCode::OK, page_html(true)) }) as hyper_compat::BoxFuture<Response>
+        let config = Arc::clone(&demo_config);
+        Box::pin(async move { html_response(StatusCode::OK, page_html(true, &config.base_path)) }) as hyper_compat::BoxFuture<Response>
     }) as hyper_compat::Handler;
 
     let status_config = Arc::clone(&config);
