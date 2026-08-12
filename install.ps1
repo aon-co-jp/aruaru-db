@@ -1,4 +1,4 @@
-# aruaru-db インストールスクリプト(Windows / Windows Server 共通)。
+﻿# aruaru-db インストールスクリプト(Windows / Windows Server 共通)。
 #
 # 使い方(管理者権限のPowerShellで):
 #   Invoke-WebRequest -Uri "https://github.com/aruaru-db/aruaru-db/releases/latest/download/aruaru-db-windows-x86_64.zip" -OutFile aruaru-db.zip
