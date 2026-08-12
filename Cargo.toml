@@ -17,7 +17,7 @@ version      = "0.5.0"
 edition      = "2021"
 authors      = ["aruaru-DB Contributors"]
 license      = "Apache-2.0"
-repository   = "https://github.com/aruaru-db/aruaru-db"
+repository   = "https://github.com/aon-co-jp/aruaru-db"
 homepage     = "https://aruaru-db.dev"
 rust-version = "1.82"
 
