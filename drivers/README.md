@@ -32,7 +32,7 @@ aruaru-core (Git-on-SQL + HTAP Engine + fjall 永続化)
 | Java | `aruaru-db-java/` | `dev.aruaru:aruaru-db-java` (Maven) | `AruaruDb` (class) | `dev.aruaru` |
 | Python | `aruaru-db-python/` | `aruaru-db-python` (PyPI) | `AruaruDb` / `AruaruDbSync` (class) | `aruaru_db` (module) |
 | Node.js/TS | `aruaru-db-nodejs/` | `@aruaru-db/nodejs` (npm) | `AruaruDb` (class) | named export |
-| Go | `aruaru-db-go/` | `github.com/aruaru-db/aruaru-db-go` | `Client` (struct) | `package aruarudb` |
+| Go | `aruaru-db-go/` | `github.com/aon-co-jp/aruaru-db-go` | `Client` (struct) | `package aruarudb` |
 | PHP | `aruaru-db-php/` | `aruaru-db/aruaru-db-php` (Composer) | `AruaruDb` (class) | `namespace AruaruDB` |
 | Ruby | `aruaru-db-ruby/` | `aruaru-db-ruby` (RubyGems) | `Client` (class) | `module AruaruDB` |
 | .NET | `aruaru-db-dotnet/` | `AruaruDB.Dotnet` (NuGet) | `AruaruDb` (class) | `namespace AruaruDB` |
@@ -337,16 +337,16 @@ await db.end();
 
 ---
 
-### Go (`github.com/aruaru-db/aruaru-db-go`)
+### Go (`github.com/aon-co-jp/aruaru-db-go`)
 
 ```bash
-go get github.com/aruaru-db/aruaru-db-go
+go get github.com/aon-co-jp/aruaru-db-go
 ```
 
 ```go
 import (
     "context"
-    aruarudb "github.com/aruaru-db/aruaru-db-go"
+    aruarudb "github.com/aon-co-jp/aruaru-db-go"
 )
 
 ctx := context.Background()

@@ -3,10 +3,10 @@
 > **Гибридная распределённая база данных, говорящая на языке Git.**  
 > Распределённая строгая согласованность CockroachDB × разделение хранения и вычислений Snowflake × версионирование Git-on-SQL — всё на Pure Rust.
 
-[![Version](https://img.shields.io/badge/version-0.5.0-orange.svg)](https://github.com/aruaru-db/aruaru-db/releases)
+[![Version](https://img.shields.io/badge/version-0.5.0-orange.svg)](https://github.com/aon-co-jp/aruaru-db/releases)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
-[![CI](https://github.com/aruaru-db/aruaru-db/actions/workflows/ci.yml/badge.svg)](https://github.com/aruaru-db/aruaru-db/actions)
+[![CI](https://github.com/aon-co-jp/aruaru-db/actions/workflows/ci.yml/badge.svg)](https://github.com/aon-co-jp/aruaru-db/actions)
 [![Discord](https://img.shields.io/badge/Discord-community-5865F2.svg)](https://discord.gg/aruaru-db)
 
 📖 Другие языки: [日本語](README-Japan.md) / [English](README-English.md) /

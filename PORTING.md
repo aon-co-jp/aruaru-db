@@ -121,7 +121,7 @@ aruaru-wire     = { path = "../aruaru-db/crates/aruaru-wire" }
 aruaru-graphql  = { path = "../aruaru-db/crates/aruaru-graphql" }
 
 # GitHub 公開後は git 依存でも可
-# aruaru-core = { git = "https://github.com/aruaru-db/aruaru-db" }
+# aruaru-core = { git = "https://github.com/aon-co-jp/aruaru-db" }
 
 tokio = { version = "1", features = ["full"] }
 openraft = { version = "0.9", features = ["serde"] }

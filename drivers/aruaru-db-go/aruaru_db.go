@@ -1,7 +1,7 @@
 // aruaru-DB Go ドライバー
 //
-// パッケージ名: github.com/aruaru-db/aruaru-db-go
-// go get github.com/aruaru-db/aruaru-db-go
+// パッケージ名: github.com/aon-co-jp/aruaru-db-go
+// go get github.com/aon-co-jp/aruaru-db-go
 //
 // 内部依存: github.com/jackc/pgx/v5
 //
@@ -10,7 +10,7 @@
 //
 // 使用例:
 //
-//	import aruarudb "github.com/aruaru-db/aruaru-db-go"
+//	import aruarudb "github.com/aon-co-jp/aruaru-db-go"
 //
 //	ctx := context.Background()
 //	db, err := aruarudb.Connect(ctx, "postgres://root@localhost:5432/aruaru")
