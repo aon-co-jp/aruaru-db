@@ -63,9 +63,18 @@ fn self_update_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// E2Eテスト専用のオーバーライド。未設定時は本番同様
+/// `https://api.github.com`を使う(既定動作は不変)。
+/// 実GitHubへ影響を与えずローカルモックサーバーで
+/// 検知〜自己更新〜ロールバックの一気通貫を検証するために追加
+/// (2026-08-20、`ARUARU_DB_UPDATE_API_BASE`)。
+fn api_base() -> String {
+    std::env::var("ARUARU_DB_UPDATE_API_BASE").unwrap_or_else(|_| "https://api.github.com".to_string())
+}
+
 async fn fetch_latest_release() -> anyhow::Result<LatestRelease> {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
-    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
+    let url = format!("{}/repos/{GITHUB_REPO}/releases/latest", api_base());
     let res = client.get(&url).header("User-Agent", "aruaru-db-self-updater").send().await?;
     if !res.status().is_success() {
         anyhow::bail!("GitHub releases API returned HTTP {}", res.status());
