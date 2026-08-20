@@ -2244,3 +2244,119 @@ Snowflakeのマルチクラスタ共有データは設計思想が根本的に�
 Paxos変種(ストレージレスproposer+ストレージ保持acceptorの分離)は
 `aruaru-db`が将来OLAP専用の弾力的読み取り層を検討する際の参考実装候補
 として記録しておく(今回は実装判断・コード変更は行わない、調査のみ)。
+
+## HANDOFF: 2026-08-20(続き3) 「既に合致している」で済ませず、3パターンを実装レベルで検証・Neon型ブランチングを実装
+
+前回・前々回のHANDOFF(直上2件)が「aruaru-dbの現行実装は既にこの
+パターンに合致している」という**概念レベルの結論**で止まっていた点に
+ユーザーから強い指摘があり、実装コードを実際に読み直し、一致度を
+正直に再評価した上で、Neon型ブランチングを実装レベルで追加した。
+
+### (a) 3パターンの実装レベルでの現状確認(前回までの概念比較の訂正)
+
+1. **TiDB/TiFlash方式(Raft learnerによる非同期HTAP列レプリカ)**:
+   `aruaru-query/src/olap.rs`の`OlapCache`を実際に読み直した結果、
+   **「Raft learnerロールでの非同期購読」ではない**ことを確認した
+   ——これは前回までの「合致している」という評価の誤り。実際の
+   `OlapCache::refresh()`は`QueryEngine`の`olap_delta_pks`/
+   `olap_schema_dirty`という共有メモリ上のダーティフラグを、OLAP
+   クエリ実行のたびに同期的にポーリング的に読む方式であり、TiFlashの
+   ようにRaftログ(`raftstore`)を独立したlearnerピアとして購読し、
+   コンセンサス層のログエントリから非同期にリアルタイム変換するのとは
+   異なる(単一プロセス内の共有メモリ経由であり、`aruaru-dist`の
+   Raft複製ログを経由していない)。**一致度は「TiFlashのDelta Tree設計
+   〈ベース列+デルタ行、周期コンパクション〉という発想を単一プロセス内
+   で模した実装」であり、「Raft learnerでの非同期購読」という核心機構
+   そのものではない** — この区別をコード内ドキュメント
+   (`olap.rs`冒頭コメント)は既に正直に書いていたが、CLAUDE.mdの
+   HANDOFF側の要約が「合致している」と過度に単純化していた。
+2. **CockroachDB Serverless方式(SQL層とKV層の分離)**:
+   `aruaru-dist/src/raft/writer.rs`の`ReplicatedWriter`トレイト
+   (object-safe、`aruaru-wire`が具体的な`Applier`/ストレージ型を知らず
+   `write_sql`/`write_commit`だけを呼ぶ)を確認した結果、**SQL層と
+   複製書き込み層(KV相当)がRustのトレイト境界で疎結合になっている点は
+   実装レベルで実在する**——ここは前回評価が正しかった。ただし
+   CockroachDB Serverlessの核心である「テナントごとのephemeralなSQL
+   pod、KV層とは別のオーケストレーション層によるスケジューリング」に
+   相当する仕組みは存在しない(単一プロセス内でSQL層と複製層が同居)。
+   SIGMOD 2025論文(`10.1145/3722212.3724432`)は前回セッションで
+   `WebFetch`によるアクセス試行を行ったが、有料壁のため本文取得は
+   できておらず(未検証)、アーキテクチャの詳細確認はGitHub上の
+   `cockroachdb/cockroach`の`pkg/sql`(SQL層)と`pkg/kv`(KV層)の
+   ディレクトリ分離という公開情報の水準にとどまる(今回も追加の深掘り
+   はできていない、正直な開示)。
+3. **Neon方式(Paxos変種+ブランチング)**: `neondatabase/neon`の
+   ブランチングは、公式アーキテクチャドキュメント・ブログ
+   ("Why Neon uses Paxos, not Raft"等で周知されている設計、ストレージ
+   レスなproposer〈compute〉+ストレージ保持のacceptor〈Pageserver/
+   Safekeeper〉分離)により、任意のLSN地点から実データを複製せず
+   ポインタ付け替えのみでブランチを作成できる。**aruaru-dbには
+   `aruaru_branch`/`aruaru_checkout`が既存していたが、実装を読み直した
+   結果、ブランチ切替が`VersionController`内のコミットグラフの
+   ポインタを動かすだけで、ライブの行データ(`QueryEngine::tables`)は
+   単一の共有可変状態のまま——つまりSELECT/INSERTが返す実データは
+   ブランチを切り替えても一切変化しない「見せかけのブランチング」
+   だったことが判明した**。これが今回最も大きな「概念レベルでは近いが
+   実装レベルでは実現していなかった」ギャップであり、今回はここを
+   実装した(下記(c))。
+
+### (b) 一致度の正直な再評価(前回結論の訂正)
+
+前回・前々回HANDOFFの「aruaru-dbの現行実装は既にこのパターンに合致
+している」という結論を、**TiDB/TiFlashとNeonの2点について訂正する**:
+- TiFlash: 「Delta Tree設計の発想を模した実装」への格下げ(Raft learner
+  購読という核心機構は実装していない、今後の課題として明記)。
+- Neon: 「ブランチングAPIは存在するが、実データは切り替わらなかった」
+  という致命的なギャップがあったことを認め、今回この部分を実装した。
+- CockroachDB Serverless: SQL層/複製層のトレイト境界分離は実装レベルで
+  確認済み、この点のみ前回評価を維持。
+
+### (c) 実装した内容: Neon方式CoWブランチング(実データが実際に切り替わる)
+
+過大なフルスケール再実装(TiFlashのRaft learner化・CockroachDBの
+マルチテナントSQL pod化)は見送り、実現可能かつ価値のある増分として
+**Neon型ブランチングの実データ切替**のみを実装した:
+
+- `aruaru-core/src/version/mod.rs`: `VersionController::create_branch_from
+  (name, commit_id)`を新設。従来の`create_branch`は現在のHEADからしか
+  分岐できなかったのに対し、**任意の過去コミットから**ブランチを作成
+  できるようにした(Neonの「任意のLSNからブランチ作成」に相当)。
+  実データはコピーせず、Prolly Tree(コンテンツアドレッサブル、構造
+  共有)上の既存ノードへの新しいポインタを1つ追加するだけ——CoWの
+  性質はProlly Treeの設計上もともと備わっていたものを、任意コミット
+  からのブランチ作成という操作として初めて利用可能にした形。
+- `aruaru-query/src/engine.rs`: `aruaru_checkout`実行時に
+  `load_tables_from_commit()`を呼び、切替先ブランチのHEADコミットの
+  `root_hash`からProlly Tree経由で実際に行データを読み直し、
+  `QueryEngine::tables`を置き換えるようにした——これが「見せかけの
+  ブランチング」だったギャップの直接的な解消。
+  SQL面では新規`aruaru_branch_from('branch_name', 'commit_id')`関数
+  (`parser.rs`にも追加)で任意コミットからのブランチ作成を公開。
+- **既知の限界(正直な開示)**: (1) ブランチ切替は現在のテーブル
+  スキーマ(列定義)を引き継ぐ設計であり、切替先コミット時点にしか
+  存在せず現在は`DROP TABLE`済みのテーブルは復元しない
+  (`select_as_of`と同じ既存の設計判断を踏襲)。(2) `dirty`/
+  `olap_delta_pks`等の補助追跡集合はブランチ切替時にクリアしない
+  ——正しさは保たれる(次回コミット/OLAPクエリで保守的に全体再構築
+  される)が、無駄な再構築が1回発生し得る。(3) TiFlash方式の
+  Raft learner化・CockroachDB Serverlessのマルチテナント化は今回も
+  見送り(過大な再設計になるため、正直な開示として明記)。
+
+### 検証結果
+
+- `cargo test -p aruaru-query`(debug): 44 passed / 0 failed
+  (新規`test_neon_style_branch_from_historical_commit_diverges_independently`
+  含む——過去コミットからのブランチ作成、切替後に実データが過去
+  スナップショットへ実際に切り替わること、ブランチ上の書き込みが
+  mainへ波及しないことを直接検証)。
+- `cargo test --release --workspace`: 全クレート成功
+  (0 failed、pgwire統合テスト2件は実サーバ起動を要するため既存の
+  `#[ignore]`設定のまま、その他は全て実行され成功)。
+- `cargo build --release --workspace`: 成功。
+
+### 次にすべきこと
+
+TiFlash方式のRaft learner化(`aruaru-dist`のRaft複製ログを`OlapCache`
+が独立ピアとして購読する設計への刷新)と、CockroachDB Serverless方式の
+マルチテナントSQL pod化は、いずれも単一プロセス前提の現行アーキテク
+チャ全体の再設計を要するため次回以降の課題として持ち越す。

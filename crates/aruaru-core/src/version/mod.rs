@@ -33,6 +33,8 @@ pub enum VersionError {
     BranchNotFound(String),
     #[error("commit not found: {0}")]
     CommitNotFound(CommitId),
+    #[error("commit not found: {0}")]
+    CommitNotFoundStr(String),
     #[error("merge conflict: {0} rows conflicted")]
     MergeConflict(usize),
     #[error("cannot fast-forward: branches have diverged")]
@@ -97,6 +99,39 @@ impl VersionController {
         let mut branches = self.branches.write();
         branches.insert(name.to_string(), head_id);
         tracing::info!(branch = name, "Branch created");
+        Ok(())
+    }
+
+    /// ブランチを、現在のHEADではなく**任意の過去コミット**から作成する
+    /// (Neon方式のブランチング、2026-08-20新設)。
+    ///
+    /// Neonは`neondatabase/neon`のPaxos変種(ストレージレスproposer+
+    /// ストレージ保持acceptorの分離、公式ブログ"Why does Neon use Paxos
+    /// instead of Raft"で明言)によりcompute/storageを分離し、任意の
+    /// LSN(Log Sequence Number)からブランチを作成できる——ブランチ作成は
+    /// 実データをコピーせず、既存のストレージ上のポイントへの新しい
+    /// ポインタを立てるだけのCoW(Copy-on-Write)操作。
+    ///
+    /// このメソッドは同じ発想をこのエコシステムのProlly Tree
+    /// (コンテンツアドレッサブル、構造共有)上で実現する:
+    /// `commit_id`が指す過去コミットの`root_hash`が指すProlly Treeの
+    /// ノード群は`NodeStore`上に既に存在する(削除されない限り)ため、
+    /// 新しいブランチはそのコミットIDへのポインタを1つ追加するだけで
+    /// 済み、実データの複製は一切発生しない——`create_branch`(現在の
+    /// HEADからのみ分岐可能)を、**任意の時点**から分岐できるよう拡張
+    /// したもの。
+    pub fn create_branch_from(&self, name: &str, commit_id: &str) -> Result<()> {
+        let target_id = {
+            let commits = self.commits.read();
+            commits
+                .values()
+                .find(|c| c.id.as_str() == commit_id)
+                .map(|c| c.id.clone())
+                .ok_or_else(|| VersionError::CommitNotFoundStr(commit_id.to_string()))?
+        };
+        let mut branches = self.branches.write();
+        branches.insert(name.to_string(), target_id);
+        tracing::info!(branch = name, commit = commit_id, "Branch created from historical commit (Neon-style CoW branching)");
         Ok(())
     }
 
