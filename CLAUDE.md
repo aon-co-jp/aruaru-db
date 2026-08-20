@@ -2122,3 +2122,125 @@ RS-Git・RS-JSON・RS-Chiketto・RS-Blog・RS-EC。このリポジトリ自身�
 3. Snowflakeのマルチクラスタ共有データパターンは今回「無理に統合しない」
    と判断したが、将来OLAP専用の読み取りレプリカ層としてなら部分的に
    価値があり得るため、需要が具体化した時点で再検討する。
+
+## HANDOFF: 2026-08-20(続き2) 「Raft強整合+Snowflake型弾力的マルチクラスタ」両立の可否を9言語で再調査
+
+**依頼内容**: 直上のHANDOFF(同日)で「Raftの強整合書き込みパスと
+Snowflakeのマルチクラスタ共有データは設計思想が根本的に相性が悪い」と
+結論したことに対し、ユーザーから「本当に世界のどこかで両立させる
+研究・実装が無いか」を日・英・中(簡体)・台(繁体)・独・露・仏・西・韓の
+9言語でWebSearchツールを使い再確認するよう指示。コード変更は無し。
+
+### 調査結果(言語ごと、出典付き)
+
+- **英語**: 最も情報が豊富。TiDBの論文
+  ([VLDB 2020, "TiDB: A Raft-based HTAP Database"](https://www.vldb.org/pvldb/vol13/p3072-huang.pdf)、
+  [ACM DL](https://dl.acm.org/doi/10.14778/3415478.3415535))がRaftの
+  learnerロールをAPレプリカ(TiFlash、列指向)に割り当てる方式を報告。
+  CockroachDB Serverlessは
+  [SIGMOD/ACM Companion 2025論文](https://dl.acm.org/doi/10.1145/3722212.3724432)
+  ([Jack Vanlightly氏の解説](https://jack-vanlightly.com/analyses/2023/11/21/serverless-cockroachdb-asds-chapter-4-part-1))
+  でSQL層(計算、テナントごとにephemeralな"SQL Pod")とKV層(ストレージ+
+  Raft)を分離し、SQL Podをテナント単位でスケールする方式を報告。TiDB
+  Serverlessも同様にSQL層とストレージ層(S3ベース)を分離し計算プールを
+  共有([PingCAP公式](https://www.pingcap.com/article/transforming-database-management-with-serverless-architecture/))。
+  Neonは
+  [公式ブログ「Why does Neon use Paxos instead of Raft」](https://neon.com/blog/paxos)
+  で明言している通り、**純粋なRaftではなくPaxos的な合意
+  (ストレージを持たないproposerとストレージを持つacceptorの分離、
+  Raft的なリーダー選出手続きを組み合わせた独自変種、TLA+で検証)**を
+  採用しており、計算(Postgres compute node)とWAL/ストレージ
+  (safekeeper群)を分離してオートスケーリング・ブランチングを実現
+  ([GitHub: neondatabase/neon](https://github.com/neondatabase/neon))。
+- **日本語**: Raftの基礎解説記事は多数見つかったが
+  ([Qiita](https://qiita.com/torao@github/items/5e2c0b7b0ea59b475cce)、
+  [Zenn](https://zenn.dev/collabostyle/articles/c24b575a5803f7))、
+  「強整合性と弾力的スケーリングの両立」を正面から論じた日本語記事は
+  見当たらなかった(正直な開示)。
+- **中国語(簡体字)**: TiDBのRaft+HTAPアーキテクチャ解説記事は豊富
+  ([CSDN](https://blog.csdn.net/Post_Yuan/article/details/134468594)、
+  [伴魚技術団隊](https://tech.ipalfish.com/blog/2020/09/08/tidb_htap/))。
+  「learnerロールでAP系レプリカを最小干渉で同期する」という実装詳細が
+  確認できたが、Snowflake型マルチクラスタ共有データとの統合を論じた
+  中国語記事は見当たらなかった。
+- **台湾語(繁体字)**: 検索結果は簡体字圏と同じTiDB論文・HTAPサーベイ
+  ([arxiv HTAP survey](https://arxiv.org/pdf/2404.15670))が中心で、
+  台湾特有の視点・情報源は見当たらなかった(正直な開示)。
+- **ドイツ語**: db-engines比較記事等はヒットしたが、今回のクエリでは
+  Raft/HTAP/Snowflake型マルチクラスタを横断する独自のドイツ語情報源は
+  見当たらず、前回調査(db-engines比較)の範囲を超える新情報は無かった。
+- **ロシア語**: RAFT解説
+  ([BigdataSchool](https://bigdataschool.ru/wiki/raft-kraft/))・HTAP解説
+  ([tarantool.io](https://tarantool.io/blog/kak-primenyat-arhitekturu-htap-v-biznese-i-real-time-analitike/))は
+  見つかったが、「HTAPのスケーリングは実装依存」という一般論に留まり、
+  Raft+Snowflake型弾力性の両立を扱った記事は見当たらなかった。
+- **フランス語**: 独自のフランス語情報源は見当たらず、検索結果は英語の
+  TiDB/HTAP資料が中心だった(正直な開示)。
+- **スペイン語**: OLTP/OLAP比較記事
+  ([Dataprix](https://www.dataprix.com/blog-it/dataprix/oltp-vs-olap-patrones-y-anti-patrones-consistencia-latencia-y-particionado))・
+  HTAP解説記事はあったが、CockroachDB/YugabyteDBがRaftを使うという
+  一般的事実の確認に留まり、両立の独自研究は見当たらなかった。
+- **韓国語**: 独自の韓国語情報源は見当たらず、検索結果は英語のTiDB論文が
+  中心だった(正直な開示)。
+
+### 実在する「部分的な両立」の実例(GitHub/論文で実在確認済み)
+
+1. **TiDB (Raft + learner-based HTAP)**: `pingcap/tidb`。書き込みは
+   Raftで強整合、AP用レプリカ(TiFlash)はRaftのlearnerとして非同期に
+   列形式へ変換——これは「HTAP」であり「Snowflake型マルチクラスタ
+   共有データ」とは別物(TiFlashは共有データに複数の独立課金クラスタが
+   同時アクセスする構造ではない)。
+2. **CockroachDB Serverless (SQL/KV分離)**: SQL層(計算、テナントごとに
+   ephemeral)とKV層(ストレージ+Raft)を分離し、SQL層だけを弾力的に
+   スケール。ただしKV層自体(Raftが動く層)は依然として単一の
+   multi-tenant共有プロセスであり、Snowflakeのような「複数の独立した
+   計算クラスタが同一データに同時アクセス」構造そのものではない。
+3. **TiDB Serverless / TiDB X**: 計算プールをテナント間で共有しつつ
+   S3ベースの共有ストレージから独立にスケール
+   ([PingCAP公式](https://www.pingcap.com/blog/tidbx-origins-architecture/))。
+   これはSnowflakeのマルチクラスタ共有データに最も近い実例だが、
+   OLTPの書き込み経路(強整合Raft)とOLAP計算プールの弾力性は依然として
+   レイヤーとして分離されており、「1つの合意グループが両方を兼務する」
+   形にはなっていない。
+4. **Neon**: 前回調査で見落としていた重要な事実——Neonは**Raftではなく
+   Paxos変種**を採用している。これは「Raft限定」で探すと見つからない
+   だけで、「合意アルゴリズム全般+ストレージ/コンピュート分離+
+   ブランチング」という枠で見ればNeonが最も先進的な部分的両立の実例。
+   ただしNeonはOLTP(PostgreSQL互換)用途であり、Snowflake型の分析
+   ワークロード向けマルチクラスタ共有ではない。
+
+### 技術的結論
+
+**「1つの合意グループ(Raftログ)自体が、Snowflakeのような複数独立
+計算クラスタによる同一データへの弾力的同時アクセスを直接兼務する」
+という意味での完全な両立(真のトライブリッド)は、今回9言語で調査した
+範囲でも実例・論文とも見つからなかった。** 理由は前回調査の結論と
+変わらず技術的に一貫している:
+- Raftは「単一リーダーへの書き込み直列化」によって強整合性を保証する
+  設計であり、リーダーはボトルネックとして意図的に単一化されている。
+- Snowflakeのマルチクラスタ共有データは「複数の独立した計算クラスタが
+  同一の列指向ストレージを非同期に読み書きし、課金・スケーリングを
+  クラスタ単位で弾力化する」設計であり、そもそも単一の直列化ポイントを
+  避けることで弾力性を得ている。
+- この2つは「強整合の直列化ポイントを持つ」vs「直列化ポイントを持たず
+  弾力的に水平分散する」という、CAP定理よりも手前の**設計目的そのものが
+  対立**している(前回結論から変更なし)。
+
+**ただし、実在する現実的な回答は「役割分担による部分的両立」**であり、
+これは前回結論を裏付ける形で今回も再確認された:
+- 書き込みパス: Raftで強整合(TiDB TiKV、CockroachDB KV層、Neon
+  safekeeper)。
+- 読み取り/分析パス: 別の弾力的スケール層(TiFlash列ストア、
+  CockroachDB/TiDB ServerlessのephemeralなSQL/計算Pod、Neonの
+  autoscaling compute)。
+- aruaru-dbの現行実装(`aruaru-dist/src/raft/`によるOLTP書き込み +
+  `aruaru-query/src/olap.rs`の`OlapCache`によるHTAP読み取り分離)は、
+  この「実在する現実的な回答」と同じ設計パターンに既に合致している。
+  今回の再調査でもこの方針を変更する新たな根拠は見つからなかった。
+
+### 次にすべきこと
+
+前回HANDOFF(直上)の次回候補(1)(2)(3)は変更なし。加えて、Neonの
+Paxos変種(ストレージレスproposer+ストレージ保持acceptorの分離)は
+`aruaru-db`が将来OLAP専用の弾力的読み取り層を検討する際の参考実装候補
+として記録しておく(今回は実装判断・コード変更は行わない、調査のみ)。
