@@ -2,6 +2,14 @@
 
 > 📌 Pending task (2026-08-06): a plan exists to incorporate Toshiba SBM / DeepSeek techniques. See [CLAUDE.md](CLAUDE.md) for details.
 
+> **Updated 2026-08-20**: Added an optional self-update feature
+> (GitHub Releases detection + health check + automatic rollback),
+> **disabled by default** (`ARUARU_DB_ENABLE_SELF_UPDATE=1` to opt
+> in). Verified end-to-end against a mock GitHub Releases server:
+> detect → download → self-replace → `/healthz` check → rollback to
+> the previous binary on failure. See the `CLAUDE.md` HANDOFF entries
+> for that date for details and known limitations.
+
 > **Updated 2026-07-25**: The dev-policy file (`CLAUDE.md`) heading was
 > renamed from "Development Policy & Dev Environment Rules" to
 > "Design Philosophy & Development Policy & Dev Environment Rules",
@@ -238,6 +246,15 @@ REST `/admin/cluster/propose`. The GraphQL `cluster_propose` resolver
 (`crates/aruaru-graphql/src/admin_resolvers.rs`) still writes directly to
 `QueryEngine`, bypassing `RaftWriter` entirely — left undocumented^Wunfixed
 this pass (follow-up). See the 3rd same-day HANDOFF entry in `CLAUDE.md`.
+
+**Self-update (added 2026-08-20)**: `aruaru-server` can optionally detect
+new GitHub Releases, download and self-replace the running binary, verify
+`/healthz` within a short window, and automatically roll back to the
+previous binary if the health check fails. Off by default
+(`ARUARU_DB_ENABLE_SELF_UPDATE=1` to enable) since this is a stateful DB
+server holding real data — an unintended restart is treated as unsafe.
+End-to-end verified against a local mock GitHub Releases server (success
+path and rollback path); see `CLAUDE.md`'s 2026-08-20 HANDOFF entries.
 
 ---
 
