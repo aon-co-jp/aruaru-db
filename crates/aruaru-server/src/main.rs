@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 mod admin;
 mod cluster;
+mod self_update;
 
 /// aruaru-DB server
 #[derive(Debug, Parser)]
@@ -225,7 +226,14 @@ async fn main() -> anyhow::Result<()> {
             aruaru_graphql::subgraph_sdl()
         }
 
+        // ヘルスチェック(2026-08-19新設、self_update.rs参照)。
+        #[handler]
+        fn healthz() -> &'static str {
+            "ok"
+        }
+
         let app = Route::new()
+            .at("/healthz", get(healthz))
             .at("/graphql", aruaru_graphql::graphql_endpoint(
                 gql_engine.clone(),
                 aruaru_graphql::AdminCtx {
@@ -244,6 +252,10 @@ async fn main() -> anyhow::Result<()> {
             // Web 版 Admin (別オリジン) からのアクセスを許可
             .with(Cors::new());
         tracing::info!(addr = %http_addr, "HTTP server (Cosmo subgraph /graphql + /admin) starting");
+        // 自動アップデート機能(2026-08-19新設、既定off、self_update.rs参照)。
+        if let Ok(addr) = http_addr.parse::<std::net::SocketAddr>() {
+            tokio::spawn(self_update::check_and_apply_update(addr));
+        }
         if let Err(e) = Server::new(TcpListener::bind(&http_addr)).run(app).await {
             tracing::error!("HTTP server error: {e}");
         }

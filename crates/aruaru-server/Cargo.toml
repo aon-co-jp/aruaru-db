@@ -30,6 +30,10 @@ chrono.workspace      = true
 # DUAL DATABASE構成(`DUAL_DATABASE_URL`)向け。aruaru-dist/aruaru-wireと
 # 同じsqlx postgres featureセット。
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+# 自動アップデート機能(2026-08-19新設、src/self_update.rs参照)向けの
+# GitHub Releases API問い合わせ+アセットダウンロード用HTTPクライアント。
+# 他クレート(aruaru-registry等)と同じrustls-tls構成に揃える。
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [features]
 # スタンドアロンのメール・ディザスタバックアップ(2026-07-25追記)。

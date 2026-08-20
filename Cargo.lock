@@ -612,6 +612,7 @@ dependencies = [
  "clap",
  "parking_lot",
  "poem",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",
