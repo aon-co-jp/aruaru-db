@@ -1181,9 +1181,56 @@ impl QueryEngine {
                     rows: vec![vec![Value::Text(format!("branch '{}' created", branch))]],
                 })
             }
+            "aruaru_branch_from" => {
+                // 引数は "name, commit_id" の1文字列(parser::extract_fn_arg
+                // が丸ごと渡してくる、カンマ区切りの2引数関数はaruaru_fnの
+                // 呼び出し規約が単一Option<String>のためここで分割する)。
+                let raw = arg.ok_or("aruaru_branch_from requires 'name, commit_id'")?;
+                let mut parts = raw.splitn(2, ',');
+                let name = parts
+                    .next()
+                    .map(|s| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
+                    .filter(|s| !s.is_empty())
+                    .ok_or("aruaru_branch_from requires a branch name")?;
+                let commit_id = parts
+                    .next()
+                    .map(|s| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
+                    .filter(|s| !s.is_empty())
+                    .ok_or("aruaru_branch_from requires a commit_id as the second argument")?;
+                self.version
+                    .create_branch_from(&name, &commit_id)
+                    .map_err(|e| e.to_string())?;
+                Ok(QueryResponse::Rows {
+                    columns: vec!["aruaru_branch_from".into()],
+                    rows: vec![vec![Value::Text(format!(
+                        "branch '{}' created from commit {}",
+                        name, commit_id
+                    ))]],
+                })
+            }
             "aruaru_checkout" => {
                 let branch = arg.ok_or("aruaru_checkout requires a name")?;
                 self.version.checkout(&branch).map_err(|e| e.to_string())?;
+                // **Neon方式ブランチングの核心(2026-08-20新設)**: 従来は
+                // ブランチ切替がVersionController内のポインタ(コミット
+                // グラフのメタデータ)を動かすだけで、ライブの行データ
+                // (`self.tables`)は単一の共有可変状態のままだった
+                // ——つまり`aruaru_branch`/`aruaru_checkout`はメタデータ
+                // 上の分岐を記録するだけで、実際にSELECT/INSERTする
+                // データはブランチが変わっても一切変化しない、という
+                // 「見せかけのブランチング」だった(ユーザー指摘により
+                // 発覚した実装レベルでのギャップ)。
+                // ここで、切替先ブランチのHEADコミットのroot_hashから
+                // Prolly Tree経由でテーブル行データを実際に読み直し、
+                // `self.tables`をそのブランチの状態へ置き換える
+                // ——Prolly Treeはコンテンツアドレッサブルで構造共有される
+                // ため、この読み直しはネットワーク越しの複製やディスクの
+                // 複製を一切必要としない(同一`NodeStore`上の既存ノードを
+                // 指し直すだけ)、Neonの「ストレージはコピーせずポインタを
+                // 切り替えるだけ」というCoWブランチングと同じ性質を持つ。
+                if let Some(commit) = self.version.head() {
+                    self.load_tables_from_commit(&commit)?;
+                }
                 Ok(QueryResponse::Rows {
                     columns: vec!["aruaru_checkout".into()],
                     rows: vec![vec![Value::Text(format!("switched to '{}'", branch))]],
@@ -1306,6 +1353,38 @@ impl QueryEngine {
         let tree = ProllyTree::new(self.store.clone());
         tree.build(entries);
         tree.root_hash()
+    }
+
+    /// 指定コミットのroot_hashから、現在既知の全テーブルの行データを
+    /// 実際に読み直し`self.tables`を置き換える(Neon方式ブランチングの
+    /// 実データ切替、`aruaru_checkout`から呼ばれる。2026-08-20新設)。
+    ///
+    /// **スコープの限界(正直な開示)**: (1) 列定義(`columns`/`types`)は
+    /// 現在の`self.tables`のスキーマをそのまま引き継ぐ——切替先コミットの
+    /// 時点で存在したが現在は`DROP TABLE`済みのテーブルは復元しない
+    /// (`select_as_of`と同じ設計判断: 過去のコミットにしか存在しない
+    /// テーブルへの汎用的なスキーマ復元は今回のスコープ外)。
+    /// (2) `olap_delta_pks`/`dirty`等の補助的な追跡集合はこの切替では
+    /// クリアしない——ブランチ切替直後の次回コミット/OLAPクエリで
+    /// 保守的に「全部変更あり」として再構築される分には安全(正しさは
+    /// 保たれる、無駄な再構築が1回発生するだけ)。
+    fn load_tables_from_commit(&self, commit: &aruaru_core::version::Commit) -> Result<(), String> {
+        let tree = ProllyTree::from_root(commit.root_hash, self.store.clone());
+        let all = tree.scan();
+
+        let mut tables = self.tables.write();
+        for (name, table) in tables.iter_mut() {
+            let mut prefix = name.as_bytes().to_vec();
+            prefix.push(0);
+            let mut new_rows: std::collections::BTreeMap<Vec<u8>, Vec<String>> = std::collections::BTreeMap::new();
+            for (key, raw) in all.iter().filter(|(k, _)| k.starts_with(&prefix)) {
+                let pk = key[prefix.len()..].to_vec();
+                let row: Vec<String> = String::from_utf8_lossy(raw).split('\t').map(|s| s.to_string()).collect();
+                new_rows.insert(pk, row);
+            }
+            table.rows = new_rows;
+        }
+        Ok(())
     }
 }
 
@@ -1870,6 +1949,66 @@ mod tests {
             .diff_branches(eng.store(), "main", "feature")
             .unwrap();
         assert_eq!(diff.added_count(), 1, "id=2 の行が追加されているはず");
+    }
+
+    /// Neon方式ブランチング(2026-08-20新設)の核心的な正しさ検証:
+    /// (1) `aruaru_branch_from`で**任意の過去コミット**(HEADではない)
+    /// からブランチを作成できる、(2) `aruaru_checkout`後、実際にSELECTで
+    /// 返る行データがそのブランチのHEADコミット時点のスナップショットに
+    /// 一致する(単なるメタデータポインタの切替ではなく実データが切り替わる
+    /// こと)、(3) ブランチ上での書き込みがmainブランチのデータに影響しない
+    /// (真の分岐)ことを実証する。
+    #[test]
+    fn test_neon_style_branch_from_historical_commit_diverges_independently() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE items (id INT, qty INT)").unwrap();
+        eng.execute("INSERT INTO items (id, qty) VALUES (1, 10)").unwrap();
+        let old_commit = {
+            let resp = eng.execute("SELECT aruaru_commit('v1: qty=10')").unwrap();
+            match resp {
+                QueryResponse::Rows { rows, .. } => match &rows[0][0] {
+                    Value::Text(s) => s.clone(),
+                    _ => panic!("expected commit id"),
+                },
+                _ => panic!("expected rows"),
+            }
+        };
+
+        // main を先に進める(qty=10 -> qty=99)。
+        eng.execute("UPDATE items SET qty = 99 WHERE id = 1").unwrap();
+        eng.execute("SELECT aruaru_commit('v2: qty=99')").unwrap();
+
+        // 現在のmainは最新値(99)を持つはず。
+        let resp = eng.execute("SELECT * FROM items").unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows[0][1], Value::Text("99".into()), "main should have the latest value");
+        } else { panic!("expected rows"); }
+
+        // HEADではなく過去コミット(v1、qty=10時点)からブランチを作成——
+        // create_branchは常にHEADからのみ分岐可能だったのに対し、これが
+        // Neon方式の「任意時点からのCoWブランチ」の核心的な差分。
+        eng.execute(&format!("SELECT aruaru_branch_from('old-branch', '{}')", old_commit)).unwrap();
+        eng.execute("SELECT aruaru_checkout('old-branch')").unwrap();
+
+        // 切替後、実際のSELECTがv1時点のスナップショット(qty=10)を返す
+        // ——メタデータ上のポインタが動いただけでなく、実データが
+        // 実際に切り替わったことの直接証明。
+        let resp = eng.execute("SELECT * FROM items").unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows[0][1], Value::Text("10".into()), "old-branch should show the historical value, not main's latest");
+        } else { panic!("expected rows"); }
+
+        // ブランチ上で独立に書き込み(qty=10 -> qty=1)。
+        eng.execute("UPDATE items SET qty = 1 WHERE id = 1").unwrap();
+        eng.execute("SELECT aruaru_commit('old-branch: qty=1')").unwrap();
+
+        // mainへ戻ると、ブランチでの書き込みの影響を受けず最新値(99)の
+        // ままであること(真の分岐、mainを汚染していないこと)を確認。
+        eng.execute("SELECT aruaru_checkout('main')").unwrap();
+        let resp = eng.execute("SELECT * FROM items").unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows[0][1], Value::Text("99".into()), "main must be unaffected by old-branch's independent write");
+        } else { panic!("expected rows"); }
     }
 
     #[test]

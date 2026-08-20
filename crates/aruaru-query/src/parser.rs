@@ -113,7 +113,7 @@ pub fn parse(sql: &str) -> Result<Statement, String> {
         let limit = extract_limit(&upper);
         return Ok(Statement::AruaruLog { limit });
     }
-    for fname in ["aruaru_branch", "aruaru_checkout", "aruaru_commit", "aruaru_merge"] {
+    for fname in ["aruaru_branch_from", "aruaru_branch", "aruaru_checkout", "aruaru_commit", "aruaru_merge"] {
         if let Some(arg) = extract_fn_arg(trimmed, fname) {
             return Ok(Statement::AruaruFn {
                 name: fname.to_string(),
