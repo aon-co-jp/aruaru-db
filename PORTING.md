@@ -52,6 +52,25 @@ Releasesへ添付)を追加。**移植時の注意**: `aruaru-core`が
 
 ---
 
+## 0.6. 自動アップデート機能(2026-08-20、既定off)
+
+`crates/aruaru-server/src/self_update.rs`: GitHub Releases API
+(`aon-co-jp/aruaru-db`)を問い合わせ、semver比較で新版を検知すると
+プラットフォーム別アセット(`aruaru-db-windows-x86_64.zip`/
+`aruaru-db-linux-x86_64.tar.gz`)をダウンロード・展開し、新バイナリを
+起動時と同じコマンドライン引数で起動、`GET /healthz`
+(このコミットで新設)への到達を`HEALTH_CHECK_SECS`(12秒)以内に確認
+できなければ旧バイナリへ自動ロールバックする。`open-english`/
+`aruaru-llm`/`rs-sync`/`RPoem`と同じ設計思想。**既定で無効**
+(`ARUARU_DB_ENABLE_SELF_UPDATE=1`を明示設定しない限り何もしない)——
+常駐DBサーバーである本リポジトリの特性上、意図せぬ自己更新による
+不意の再起動を避けるため他リポジトリより慎重な既定off。移植時は
+(1) `.github/workflows/release.yml`が同じ命名規則でアセットを
+添付する構成になっているか、(2) `/healthz`相当のエンドポイントが
+存在するか、を確認すること。実機でのGitHub Release検知→自己更新→
+ロールバックの一気通貫E2E検証は未実施(`/healthz`単体の実HTTP応答
+確認のみ実施済み、詳細は`CLAUDE.md`2026-08-20 HANDOFF参照)。
+
 ## 0.1. aruaru-DB とは何か・エコシステム内での位置づけ
 
 CockroachDB 的な分散強整合(openraft)と Snowflake 的なストレージ/コンピュート

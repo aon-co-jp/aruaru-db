@@ -1838,6 +1838,59 @@ Web管理UIを構築。その過程でユーザーから複数回「aruaru-serve
 RS-Git・RS-JSON・RS-Chiketto・RS-Blog・RS-EC。このリポジトリ自身の状況は
 このファイルの他の節・HANDOFFを参照)。
 
+## HANDOFF: 2026-08-20 自動アップデート機能(GitHub Releases検知+ヘルスチェック+自動ロールバック)を新設・実機検証
+
+前回セッションでAPI利用上限により未コミットのまま残っていた
+`self_update.rs`(`open-english`/`aruaru-llm`/`rs-sync`/`RPoem`等で
+確立済みのパターンに追従)を検証・完成させた。
+
+1. **発見した未コミット変更**: `Cargo.lock`・
+   `crates/aruaru-server/Cargo.toml`(`reqwest`依存追加)・
+   `crates/aruaru-server/src/main.rs`(`self_update`モジュール登録、
+   `/healthz`ハンドラ新設、起動時に`self_update::check_and_apply_update`
+   を`tokio::spawn`)・`crates/aruaru-server/src/self_update.rs`
+   (新規、未追跡)。実装は既に完成していた: GitHub Releases API
+   (`aon-co-jp/aruaru-db`)からの最新リリース取得・semver比較
+   (`parse_version`/`is_newer`)・プラットフォーム別アセット判定
+   (Windows `.zip`/Linux `.tar.gz`)・ダウンロード・展開
+   (`Expand-Archive`/`tar`)・新バイナリの起動+`HEALTH_CHECK_SECS`
+   (12秒)以内の`/healthz`到達確認+失敗時の旧バイナリへの自動
+   ロールバックを、Windows用`.bat`スクリプト・Unix用`.sh`スクリプト
+   それぞれで実装済みだった。**既定で無効**
+   (`ARUARU_DB_ENABLE_SELF_UPDATE=1`を明示設定しない限り何もしない)
+   ——`aruaru-server`は`--data`に実データを保持する常駐DBサーバーで
+   あるため、意図せぬ自己更新による不意の再起動を避ける、より慎重な
+   既定off設計。単体テスト3件(`parses_version_strings_with_and_
+   without_v_prefix`・`is_newer_compares_semver_correctly`・
+   `platform_asset_finds_expected_naming`)も既に実装・green済みで
+   あり、今回のパスでは追加実装は不要だった。
+2. **ビルド・テスト結果(実測)**: `cargo build --release -p
+   aruaru-server` → `Finished`(既存の`propose_commit`未使用警告1件
+   のみ、無関係)。`cargo test --release -p aruaru-server` →
+   **3 passed; 0 failed**。`cargo test --release --workspace`も
+   実行しリグレッション無しを確認(既存クレート全件green)。
+3. **実機E2E検証(実HTTP、型チェックのみで終わらせない方針の徹底)**:
+   実際に`aruaru-server.exe`をビルド済みバイナリから起動し
+   (`--data`に一時ディレクトリ、`--gql-port 4099`)、
+   `Invoke-WebRequest http://127.0.0.1:4099/healthz`で**実際に
+   `200 ok`が返る**ことを確認した。GitHub Releaseを実際に検知して
+   自己更新する一連の流れ(ダウンロード→展開→旧バイナリへの
+   ロールバック含む)自体は、前回セッションのdocコメント
+   (`self_update.rs`冒頭)が既に正直に記載している通り**実機E2E
+   検証は引き続き未実施**(コンパイル成功・単体テスト・
+   `/healthz`単体到達確認までが今回検証できた範囲)。
+4. **安全性への配慮(ユーザー指示「既存データやHDDのデータへ悪影響を
+   与えないように」を踏襲)**: 既定off・ヘルスチェック失敗時の
+   自動ロールバック・起動時と同じコマンドライン引数での再起動
+   (`std::env::args()`を再利用し設定漏れでのデフォルト起動を防止)
+   という設計は前回セッションの時点で既に安全側に倒されており、
+   今回の検証でもその設計を変更する必要は見つからなかった。
+- 次にすべきこと: (1) 実際にGitHub Releaseへ新バージョンをpushし、
+  `ARUARU_DB_ENABLE_SELF_UPDATE=1`を設定した実プロセスが検知→
+  ダウンロード→自己更新→ヘルスチェックの一連の流れを最初から最後まで
+  実行する統合検証(このセッションでは未実施)、(2) ロールバック経路
+  (新バイナリが`/healthz`に応答しない状況を意図的に作る)の実地検証。
+
 ## HANDOFF追記(2026-07-31) インストーラーの電源プロファイル選択機能(未実装、エコシステム標準方針として記録)
 
 `open-raid-z`のCLAUDE.md(全リポジトリ共通の設計思想セクション)に、
