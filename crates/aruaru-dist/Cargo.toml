@@ -35,6 +35,10 @@ open_raid_z_core = { path = "../../../open-raid-z/open_runo_zfs_source/open_raid
 
 [features]
 open_raid_z = ["dep:open_raid_z_core"]
+# Raft決定的シミュレーションテスト(DST)モジュール(raft/sim.rs)を
+# 通常ビルドでも公開する(既定は`cfg(test)`のみでビルドされるため、
+# `cargo test`以外からシミュレーションを直接呼びたい場合に有効化する)。
+sim-testing = []
 # スタンドアロンのメール・ディザスタバックアップ(2026-07-25追記)。
 # `open_raid_z`機能(commit x ZFSスナップショット連携)とは別軸——
 # こちらはVPS間分散同期・ZFSスナップショット連携のいずれも未設定の
