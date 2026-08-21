@@ -569,6 +569,7 @@ dependencies = [
  "rust-json",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlparser 0.52.0",
  "thiserror 1.0.69",
  "tokio",
