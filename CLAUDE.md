@@ -3117,3 +3117,151 @@ MultiRaftCluster`として参照できなかった)。
 管理APIエンドポイントの追加、(2) `ShardedRowStore`をテナント別
 キャッシュ層など、既存のOLTP経路と衝突しない具体的な用途へ本格接続する、
 (3) 複数ノード構成での`multi-raft/*`操作の実地検証。
+
+## HANDOFF: 2026-08-21(続き4) DuckDB見送り判断の深掘り再調査(8言語)+
+「埋もれた技術」探索、辞書エンコーディング+ゾーンマップを実装
+
+**経緯**: 直上のHANDOFF(同日)がDuckDBの見送り理由を「aruaru-query::olap
+が既にDataFusion(同系統のベクトル化列指向エンジン)を統合済み」とした
+ことに対し、ユーザーから「本当に十分な調査か、世界中の言語で調査をやり
+直し、埋もれた最先端技術を見逃していないか」との指示。日英に加え中・独・
+仏・韓・西・露の**8言語**で実際にWebSearchを複数回実行し、DuckDBと
+DataFusionの詳細な設計差分・他の埋もれた技術を再調査した。
+
+### 調査結果(言語ごと、出典付き)
+
+- **英語**: DuckDBのストレージ層固有技術として、(1) **ゾーンマップ
+  (min/maxブロック統計によるRow Groupスキップ)**、(2) **辞書エンコー
+  ディング**(重複文字列を辞書へ集約)、(3) 定数エンコード・RLE・
+  ビットパッキング・FSST・Chimp/Patasを含む**型認識軽量圧縮**、(4)
+  ハッシュ結合・GROUP BY・ソート・ウィンドウ関数全てに対応した
+  **out-of-coreスピル**(バッファマネージャが全メモリを統括管理)、
+  を確認
+  ([Lightweight Compression in DuckDB](https://duckdb.org/2022/10/28/lightweight-compression)、
+  [DuckDB in Depth](https://endjin.com/blog/duckdb-in-depth-how-it-works-what-makes-it-fast)、
+  [TaDa-04 slides](https://blobs.duckdb.org/slides/TaDa-04.pdf)、
+  [Memory Management in DuckDB](https://duckdb.org/2024/07/09/memory-management)、
+  [Storage dictionary compression PR #3109](https://github.com/duckdb/duckdb/pull/3109))。
+  **これらは前回HANDOFFが見落としていた、DataFusionのベクトル化実行
+  エンジンとは別軸のDuckDB固有技術要素**——前回の「同系統のエンジンだから
+  重複」という判断は、実行モデル(ベクトル化)は同系統でも、**ストレージ
+  フォーマット固有の最適化(ゾーンマップ・辞書エンコード)は別軸**であり
+  aruaru-query側に実装が無かった、という点を見落としていたことが判明した。
+- **中国語(簡体字)**: PolarDBの新ベクトル化実行エンジンがコア演算子性能
+  40〜400%向上、ソートスループット23倍という2026年の実例、Apache Doris
+  4.1.0のIVF/IVF_ON_DISKベクトルインデックス(INT8/INT4/PQ量子化)による
+  ベクトル検索性能4倍向上等を確認したが、これらはベクトル検索・大規模
+  実行エンジン最適化であり、aruaru-dbの現在の規模には過大
+  ([半年度盤点2026上半年版](https://zhuanlan.zhihu.com/p/2063922209849193484))。
+- **ロシア語**: Tantor Labsの「Tantor XData」がHTAP(トランザクション+
+  分析同時処理)の第3世代DBマシンとして発表されたことを確認、Tarantool
+  Column Store(TCS)がB-tree(OLTP)+ビットマップインデックス(OLAP)の
+  ハイブリッドインデックスでHTAPを実現していることも確認したが、
+  いずれもaruaru-dbが既に持つHTAP路線(Multi-Raft+OlapCache)と同方向で
+  新規性は薄い
+  ([TAdviser 2026レビュー](https://www.tadviser.ru/index.php)、
+  [Tarantool HTAP解説](https://tarantool.io/blog/kak-primenyat-arhitekturu-htap-v-biznese-i-real-time-analitike/))。
+- **ドイツ語**: ゾーンマップ自体のドイツ語一次資料は見当たらず(検索結果は
+  一般的な列指向DB解説のみ)、ビットマップインデックス+ソートの組み合わせ
+  でRLE圧縮率が桁違いに向上するという一般論を確認
+  ([spaltenorientierte Datenbank解説](https://de.wikipedia.org/wiki/Spaltenorientierte_Datenbank))。
+- **フランス語**: DuckDBが列ごとにセグメント化してメモリ格納し、必要な
+  列・行のみ読むことで計算高速化・メモリ削減を実現するという一般的な
+  アーキテクチャ解説を確認したが、ゾーンマップ/辞書エンコードそのものに
+  言及する独自のフランス語資料は見当たらなかった(正直な開示)
+  ([next-decision.fr DuckDB解説](https://www.next-decision.fr/wiki/creation-dun-data-lakehouse-avec-duckdb-et-dbt))。
+- **韓国語**: 列指向格納がキャッシュ効率・圧縮率を高めるという一般論
+  ([IvoryRabbit DuckDBブログ](https://ivoryrabbit.github.io/posts/DuckDB/))
+  を確認したが、「ゾーンマップ」「辞書エンコーディング」という具体的な
+  用語に言及する韓国語資料は見当たらなかった(正直な開示)。
+- **スペイン語**: 「compresión adaptativa」「índice zonal」という
+  クエリでは、ベクトルDB(Pinecone/ChromaDB/Weaviate等)の2026年ランキング
+  記事が中心に返り、目的の技術(ゾーンマップ)に特化したスペイン語資料は
+  見当たらなかった(正直な開示、検索結果からベクトルDBという別分野の
+  情報が優勢だったことを記録)。
+
+**「埋もれた最先端技術」の探索結果**: 8言語での再調査を通じて、DuckDB以外
+に**aruaru-dbへ新規に取り込む価値のある、実在し実装確認できる技術**は
+見つからなかった(PolarDBの新ベクトル化エンジン・Apache Dorisのベクトル
+検索量子化は実在するが、いずれも本リポジトリの現在の規模・用途からは
+過大、または既存のOLTP中心設計と方向性が異なると判断)。**唯一の実質的な
+発見は、DuckDB自体の中でも「ベクトル化実行」ではなく「ストレージ層固有の
+最適化(ゾーンマップ・辞書エンコード)」という、前回見落としていた別軸の
+技術要素だった。**
+
+### 判断: DuckDB本体の見送りは維持するが、ストレージ層固有技術2点は
+コストを理由にせず実装
+
+DuckDB本体(独立した実行エンジン・ストレージフォーマットの全面採用)は
+引き続き見送る——理由は「DataFusionと重複するから」ではなく、
+**「DuckDBが持つストレージ層固有の最適化(ゾーンマップ・辞書エンコード)
+は、DuckDB本体を導入しなくても、aruaru-query側で直接実装できる独立した
+技術要素だから」**へ再度差し替える(前回の「重複」という評価も、
+今回の8言語再調査でより正確に「実行モデルは重複するがストレージ最適化は
+別軸で未実装だった」と訂正)。この2点はコストを理由に見送らず実装した。
+
+### 実装した内容(`crates/aruaru-query/src/olap.rs`)
+
+1. **辞書エンコーディング**: `arrow_type`のText/デフォルト分岐を
+   `DataType::Utf8`(生のStringArray)から`DataType::Dictionary(Int32, Utf8)`
+   へ変更。`build_array`で`StringDictionaryBuilder<Int32Type>`を使い、
+   重複する文字列値を辞書へ1回だけ格納するよう構築。
+2. **ゾーンマップ**: `TableCache`に`zone_maps: HashMap<String, (f64, f64)>`
+   を新設、`compute_zone_maps`(Arrow標準の`compute::min`/`compute::max`
+   カーネルを使用)で数値列(Int64/Float64)ごとのmin/maxを計算し
+   `rebuild_full`/`rebuild_incremental`の両方で更新。`OlapCache::query`に
+   `extract_simple_range_predicate`(`SELECT ... FROM t WHERE col > N`
+   という最も単純な範囲述語だけを緩く抽出する正規表現ベースの抽出器、
+   GROUP BY/JOIN/OR句を含む場合は必ずマッチしない=安全側)と
+   `zone_map_disproves`(その範囲に該当行が絶対に無いと証明できるかの
+   判定)を追加。証明できる場合はDataFusionへ一切クエリを投げず即座に
+   空の結果を返す——DuckDBのRow Groupスキップと同じ「偽陽性は絶対に
+   起こさず、証明できない場合は常に安全側で通常実行する」設計。
+
+### 正直な簡略化点(誇張しない)
+
+1. **ゾーンマップの粒度はテーブル全体で1つ**——DuckDBはRow Group
+   (物理ブロック)単位で複数の統計区間を持ちブロック単位の部分スキップが
+   できるが、本実装は「テーブル全体が対象外」と証明できる場合のみ
+   スキップする、最も粗い粒度。
+2. **`extract_simple_range_predicate`は正規表現ベースの簡易抽出**であり、
+   完全なSQL式パーサではない——`col > N`/`col >= N`/`col < N`/`col <= N`
+   という最も単純な単一条件のみ対応、複合WHERE(AND/OR)・カラム同士の
+   比較・関数呼び出しを含む述語は対象外(マッチしなければ常に通常の
+   DataFusion経路にフォールバックするため、正しさへの影響はない)。
+3. **型認識軽量圧縮(RLE・ビットパッキング・FSST等)・out-of-core
+   スピル**は今回も実装していない——DataFusion自体がストリーミング実行・
+   パーティション並列を提供するため、aruaru-dbの現在の想定データ規模
+   (単一プロセス内メモリ常駐)では優先度が低いと判断した。
+4. **DuckDB本体の起動の軽さ・単一バイナリ配布**という別の強みは、
+   `aruaru-server`が既にプロセス内蔵型サーバーであるため引き続き
+   新規性を生まない(前回評価を維持)。
+
+### 検証結果(実測)
+
+- `cargo build -p aruaru-query --tests` → 成功。
+- `cargo test -p aruaru-query` → **56 passed / 0 failed**(前回52件+
+  新規4件: `text_columns_are_dictionary_encoded_and_still_aggregate_
+  correctly`〈辞書エンコードの実型検証+集計結果の正しさ〉、
+  `zone_map_prunes_queries_that_cannot_possibly_match_and_normal_
+  queries_still_work`〈枝刈りが機能すること+通常クエリが壊れないこと〉、
+  `extract_simple_range_predicate_only_matches_simple_range_queries`、
+  `zone_map_disproves_boundary_conditions`〈境界値7パターン〉)。
+- `cargo build --workspace` → 成功(既存警告2件のみ、無関係)。
+- `cargo test --workspace` → 全19テストバイナリで`test result: ok`、
+  失敗0件。
+- **実プロセスでのHTTP動作確認**: `aruaru-server.exe`を実際に起動し、
+  `POST /admin/federation/query`経由で`CREATE TABLE orders`→2行`INSERT`
+  (`region`列に`east`/`west`)→`SELECT region, SUM(amount) AS total FROM
+  orders GROUP BY region ORDER BY region`を実行、**辞書エンコードされた
+  `region`列を含むGROUP BYクエリが実際に正しい結果
+  (`{"region":"east","total":"100"}`/`{"region":"west","total":"999"}`)
+  を返す**ことを確認(型チェック・単体テストのみでの完了報告ではない)。
+
+### 次にすべきこと(次回候補)
+
+(1) ゾーンマップをRow Group相当の複数統計区間へ細分化する、
+(2) `extract_simple_range_predicate`をAND結合の複合述語(例:
+`WHERE a > 10 AND b < 20`)にも対応させる、(3) 型認識軽量圧縮
+(RLE/ビットパッキング)の要否は、実際のデータ規模がボトルネックになった
+時点で再評価する。
