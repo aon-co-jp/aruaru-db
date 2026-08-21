@@ -52,6 +52,27 @@ pub struct AdminState {
     /// 使うことで、`RaftNode`を直接叩く旧経路(`cluster::propose_write`)を
     /// 迂回しなくなる(=disaster-backup配線を必ず経由する)。
     replicator: Mutex<Option<Arc<dyn aruaru_dist::ReplicatedWriter>>>,
+    /// 【2026-08-21新設・Vitess Reshard/VTGate scatter-gatherの実配線】
+    /// `aruaru-dist::MultiRaftCluster`(Range単位の独立Raftグループ+
+    /// キー空間トポロジ)を実際に保持する。既存の`cluster`(単一の
+    /// `ClusterNode`、pgwire/GraphQL/REST書き込みが実際に使う本番経路)とは
+    /// **独立した並行コンポーネント**として`main.rs`起動時に単一ノード構成
+    /// (`MultiRaftCluster::single_node`)で初期化する——既存のOLTP書き込み
+    /// 経路には一切影響を与えないオプトイン方式(ユーザー指示「既存機能を
+    /// 壊さないことを優先」に基づく選択)。`POST /admin/multi-raft/split`・
+    /// `POST /admin/multi-raft/merge`・`GET /admin/multi-raft/scatter-query`
+    /// から実際に呼び出せる。
+    multi_raft: Mutex<Option<Arc<aruaru_dist::MultiRaftCluster<crate::cluster::EngineApplier>>>>,
+    /// 【2026-08-21新設・ScyllaDB shard-per-coreストアの実配線】
+    /// `aruaru-query::sharded_store::ShardedRowStore<String>`を実際に
+    /// 保持する。既存の`QueryEngine::tables`(`parking_lot::RwLock`)を
+    /// 置き換えるのはRaft/Prolly Tree/OLAPキャッシュ全体への影響が大きい
+    /// ため見送り、`POST /admin/sharded-store`・`GET
+    /// /admin/sharded-store/{key}`という**オプトインの独立ストレージ経路**
+    /// として公開する(ユーザー指示「無理のない方を選んでよい」に基づく
+    /// 選択)。値は文字列固定(JSON文字列をそのまま保持、`ShardedRowStore<V>`
+    /// の型パラメータを固定した最小構成)。
+    sharded_store: aruaru_query::sharded_store::ShardedRowStore<String>,
 }
 
 impl AdminState {
@@ -68,7 +89,20 @@ impl AdminState {
             #[cfg(feature = "disaster_email_backup")]
             disaster_email_backup: Mutex::new(None),
             replicator: Mutex::new(None),
+            multi_raft: Mutex::new(None),
+            // shard_count=0 -> このマシンの論理コア数を自動採用
+            // (ScyllaDBの既定「コア数と同数のシャード」を踏襲、`sharded_store.rs`docコメント参照)。
+            sharded_store: aruaru_query::sharded_store::ShardedRowStore::new(0),
         })
+    }
+
+    /// `MultiRaftCluster`を取り付ける(`main.rs`起動時、単一ノード構成で初期化)。
+    pub fn attach_multi_raft(&self, cluster: Arc<aruaru_dist::MultiRaftCluster<crate::cluster::EngineApplier>>) {
+        *self.multi_raft.lock() = Some(cluster);
+    }
+
+    pub fn multi_raft(&self) -> Option<Arc<aruaru_dist::MultiRaftCluster<crate::cluster::EngineApplier>>> {
+        self.multi_raft.lock().clone()
     }
 
     /// Raft ノードを取り付ける (クラスタモード起動時)
@@ -306,6 +340,14 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         .at("/cluster/propose", post(cluster_propose))
         // 【2026-08-21新設】ephemeral SQL pod (計算資源の使い捨てプロセス分離)
         .at("/ephemeral-query", post(ephemeral_query))
+        // 【2026-08-21新設・実配線】Vitess Reshard(併合)+ VTGate scatter-gather
+        .at("/multi-raft/split", post(multi_raft_split))
+        .at("/multi-raft/merge", post(multi_raft_merge))
+        .at("/multi-raft/scatter-query", get(multi_raft_scatter_query))
+        // 【2026-08-21新設・実配線】ScyllaDB shard-per-coreストア
+        .at("/sharded-store", post(sharded_store_put))
+        .at("/sharded-store/:key", get(sharded_store_get))
+        .at("/sharded-store-stats", get(sharded_store_stats))
         .at("/registry", get(registry_list))
         .at("/registry/summary", get(registry_summary))
         .at("/registry/crawl", post(registry_crawl))
@@ -897,6 +939,147 @@ async fn cluster_propose(state: Data<&Arc<AdminState>>, Json(req): Json<SqlReque
         })),
         Err(e) => Json(json!({ "success": false, "message": e })),
     }
+}
+
+// ── Vitess Reshard(併合)+ VTGate scatter-gather の実配線(2026-08-21) ──
+//
+// `aruaru_dist::MultiRaftCluster`(Range単位の独立Raftグループ+キー空間
+// トポロジ)を、`main.rs`起動時に単一ノード構成で初期化し`AdminState`へ
+// 取り付けたものを実際にHTTP経由で操作する。既存の本番書き込み経路
+// (`cluster_propose`が使う`ClusterNode`/`replicator`)とは独立した並行
+// コンポーネント——`multi_raft`が未初期化(構築失敗等)の場合は503を返す。
+
+#[derive(Debug, Deserialize)]
+struct MultiRaftSplitRequest {
+    range_id: u64,
+    /// 分割キー(UTF-8文字列として受け取り、バイト列へ変換して使う)
+    split_key: String,
+}
+
+/// `POST /admin/multi-raft/split` — CockroachDB方式のRange分割を実際に
+/// 実行する(既存の`MultiRaftCluster::split`をHTTP経由で呼べるようにする)。
+#[handler]
+fn multi_raft_split(state: Data<&Arc<AdminState>>, Json(req): Json<MultiRaftSplitRequest>) -> Json<Value> {
+    let Some(cluster) = state.multi_raft() else {
+        return Json(json!({
+            "success": false,
+            "message": "MultiRaftCluster未初期化です(main.rsでの構築に失敗している可能性があります)。"
+        }));
+    };
+    let applier = crate::cluster::EngineApplier::new(state.engine.clone());
+    match cluster.split(req.range_id, req.split_key.into_bytes(), applier) {
+        Some(new_range_id) => Json(json!({
+            "success": true, "new_range_id": new_range_id, "range_count": cluster.range_count(),
+        })),
+        None => Json(json!({ "success": false, "message": format!("range_id {} が見つかりません", req.range_id) })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MultiRaftMergeRequest {
+    range_a: u64,
+    range_b: u64,
+}
+
+/// `POST /admin/multi-raft/merge` — Vitess Reshard(併合方向)を実際に
+/// 実行する(`ClusterTopology::merge_ranges`+`MultiRaftCluster::merge`を
+/// HTTP経由で呼べるようにする、`CLAUDE.md`2026-08-21(続き2)HANDOFF参照)。
+#[handler]
+fn multi_raft_merge(state: Data<&Arc<AdminState>>, Json(req): Json<MultiRaftMergeRequest>) -> Json<Value> {
+    let Some(cluster) = state.multi_raft() else {
+        return Json(json!({
+            "success": false,
+            "message": "MultiRaftCluster未初期化です(main.rsでの構築に失敗している可能性があります)。"
+        }));
+    };
+    match cluster.merge(req.range_a, req.range_b) {
+        Some(merged_id) => Json(json!({
+            "success": true, "merged_range_id": merged_id, "range_count": cluster.range_count(),
+        })),
+        None => Json(json!({
+            "success": false,
+            "message": format!("range {} と {} は併合できません(隣接していないか、存在しません)", req.range_a, req.range_b),
+        })),
+    }
+}
+
+/// `GET /admin/multi-raft/scatter-query` — VTGate scatter-gatherを実際に
+/// 実行する(全Rangeのcommit_indexをrange_id順に集約して返す)。
+#[handler]
+fn multi_raft_scatter_query(state: Data<&Arc<AdminState>>) -> Json<Value> {
+    let Some(cluster) = state.multi_raft() else {
+        return Json(json!({
+            "success": false,
+            "message": "MultiRaftCluster未初期化です(main.rsでの構築に失敗している可能性があります)。"
+        }));
+    };
+    let gathered = cluster.scatter_gather(|node| {
+        json!({ "commit_index": node.commit_index(), "role": format!("{:?}", node.role()) })
+    });
+    let ranges: Vec<Value> = gathered
+        .into_iter()
+        .map(|(range_id, v)| json!({ "range_id": range_id, "reading": v }))
+        .collect();
+    Json(json!({ "success": true, "range_count": ranges.len(), "ranges": ranges }))
+}
+
+// ── ScyllaDB shard-per-coreストアの実配線(2026-08-21) ──────────────
+//
+// `AdminState::sharded_store`(`ShardedRowStore<String>`)へ実際に
+// HTTP経由で読み書きする。専用シャードスレッドとの通信は`std::sync::
+// mpsc`のみ(`sharded_store.rs`のdocコメント参照)——このハンドラ自体は
+// tokioの非同期タスク上で動くが、`mpsc::Receiver::recv()`はブロッキング
+// なので`tokio::task::spawn_blocking`で包み、tokioワーカースレッドを
+// 占有しないようにする。
+
+#[derive(Debug, Deserialize)]
+struct ShardedStorePutRequest {
+    key: String,
+    value: String,
+}
+
+/// `POST /admin/sharded-store` — 指定キーをShardedRowStoreへ書き込む。
+/// 実際にキーのSHA-256から担当シャードを決定し、そのシャード専用スレッド
+/// (`std::sync::mpsc`経由)へ値を送って書き込む。
+#[handler]
+async fn sharded_store_put(state: Data<&Arc<AdminState>>, Json(req): Json<ShardedStorePutRequest>) -> Json<Value> {
+    let state = state.0.clone();
+    let shard_id = state.sharded_store.shard_for(req.key.as_bytes());
+    tokio::task::spawn_blocking(move || {
+        state.sharded_store.put(req.key.clone().into_bytes(), req.value.clone());
+        json!({ "success": true, "key": req.key, "shard_id": shard_id })
+    })
+    .await
+    .map(Json)
+    .unwrap_or_else(|e| Json(json!({ "success": false, "message": e.to_string() })))
+}
+
+/// `GET /admin/sharded-store/{key}` — 指定キーをShardedRowStoreから読む。
+#[handler]
+async fn sharded_store_get(state: Data<&Arc<AdminState>>, poem::web::Path(key): poem::web::Path<String>) -> Json<Value> {
+    let state = state.0.clone();
+    let shard_id = state.sharded_store.shard_for(key.as_bytes());
+    let key_for_get = key.clone();
+    let value = tokio::task::spawn_blocking(move || state.sharded_store.get(key_for_get.as_bytes()))
+        .await
+        .unwrap_or(None);
+    Json(json!({ "success": true, "key": key, "shard_id": shard_id, "found": value.is_some(), "value": value }))
+}
+
+/// `GET /admin/sharded-store-stats` — 各シャードのエントリ数(ScyllaDBの
+/// "hot shard"検知に相当する観測用エンドポイント)を返す。
+#[handler]
+async fn sharded_store_stats(state: Data<&Arc<AdminState>>) -> Json<Value> {
+    let state = state.0.clone();
+    tokio::task::spawn_blocking(move || {
+        let shard_count = state.sharded_store.shard_count();
+        let per_shard: Vec<usize> = (0..shard_count).map(|i| state.sharded_store.shard_len(i)).collect();
+        let total: usize = per_shard.iter().sum();
+        json!({ "success": true, "shard_count": shard_count, "per_shard_len": per_shard, "total_len": total })
+    })
+    .await
+    .map(Json)
+    .unwrap_or_else(|e| Json(json!({ "success": false, "message": e.to_string() })))
 }
 
 /// 【2026-08-21新設・ephemeral SQL pod化】指定テナントのテーブルを

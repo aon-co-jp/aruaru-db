@@ -229,6 +229,18 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let admin_state = admin::AdminState::new(engine.clone(), registry.clone());
+    // 【2026-08-21新設・Vitess Reshard/VTGate scatter-gatherの実配線】
+    // 既存の単一`ClusterNode`(本番のOLTP書き込み経路、pgwire/GraphQL/REST
+    // `/admin/cluster/propose`が実際に使う)とは独立した、
+    // `MultiRaftCluster`(Range単位の独立Raftグループ)を単一ノード構成で
+    // 初期化しAdminStateへ取り付ける。既存の書き込み経路には一切触れない
+    // オプトイン方式(`/admin/multi-raft/*`からのみ操作可能)。
+    let multi_raft_cluster = std::sync::Arc::new(aruaru_dist::MultiRaftCluster::single_node(
+        cli.raft_id,
+        format!("127.0.0.1:{}", cli.gql_port),
+        cluster::EngineApplier::new(engine.clone()),
+    ));
+    admin_state.attach_multi_raft(multi_raft_cluster);
     // 【課金アイテムの権利消失防止】書き込みをRaft経由で複製するレプリケータ。
     // クラスタ構築に成功した場合のみ設定される (推奨構成: 自ノード+peers 2台=計3ノード)。
     let mut replicator: Option<std::sync::Arc<dyn aruaru_dist::ReplicatedWriter>> = None;

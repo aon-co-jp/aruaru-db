@@ -32,6 +32,7 @@ pub use raft::{
 pub use shard::{
     ClusterTopology, NodeInfo, Range, RouteTarget, DEFAULT_RANGE_SIZE, SPLIT_THRESHOLD,
 };
+pub use multi_raft::MultiRaftCluster;
 pub use snapshot_pairing::{wire_to_node, InMemorySnapshotBackend, SnapshotBackend, SnapshotPairingRegistry};
 pub use dual_database::{DualDatabaseError, DualDatabaseMirror, MirroredMutation, SCHEMA_SQL as DUAL_DATABASE_SCHEMA_SQL};
 #[cfg(feature = "disaster_email_backup")]
