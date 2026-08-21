@@ -2847,3 +2847,144 @@ DST自体が想定通りバグを検出したことになる。
 (現状は固定Leaderのみ)、(3) 実行時間に余裕があるCI環境では反復シード数を
 数千程度まで引き上げる、(4) DuckDBのベクトル化実行を`aruaru-query::olap`
 の内部実装高速化の参考にする(見送りではなく保留、上記2-4節参照)。
+
+## HANDOFF: 2026-08-21(続き2) 前回の見送り判断(ScyllaDB/Vitess/DuckDB)を
+再検証、コストを理由にせず2件を実装レベルで統合
+
+**経緯**: 直上のHANDOFF(同日)がScyllaDB shard-per-core・Vitessシャーディング・
+DuckDB組み込みOLAPの3技術を「実装コストが高い」「既存機能と重複する」として
+見送っていたことに対し、ユーザーから「本当にそこまで調査したのか」「本当に
+完全に重複しているのか」「多少時間がかかる程度なら開発してほしい」という
+強い指摘を受けた。実装コストの高さのみを理由にした見送りは行わず、実際に
+ソースコードを再読・追加調査した上で、部分的にでも良いとこ取りできる要素を
+洗い出し、2件(ScyllaDB・Vitess)は実装レベルで統合した。DuckDBのみ、コストで
+はなくアーキテクチャ上の具体的な重複を示して見送りとした。
+
+### 1. ScyllaDB shard-per-core — 「全体書き換えが必要」という前回理由は
+過大なスコープの誤り、核心思想のみを部分適用して実装
+
+前回理由(「tokioランタイム全体をSeastar型イベントループへ置き換える規模」)
+を検証した結果、**この理由は「ScyllaDB全体の移植」という過大なスコープを
+前提にしており、「shared-nothingの核心(データのコア単位分割+ロックレスな
+メッセージパッシング通信)だけを切り出して部分適用する」という選択肢を
+検討していなかった**と判明した。
+
+`crates/aruaru-query/src/sharded_store.rs`(新規)に`ShardedRowStore<V>`を
+実装: `shard_count`個の専用OSスレッドがそれぞれ独立した`HashMap`を排他的に
+所有し(呼び出し元スレッドから直接アクセスする手段が構造的に存在しない)、
+通信は`std::sync::mpsc`によるメッセージパッシングのみ(`RwLock`/`Mutex`で
+データそのものを共有する既存`QueryEngine::tables`とは対照的)。キーから
+シャードへの割り当ては`SHA-256(key) % shard_count`(ScyllaDBのtoken-aware
+routingの簡略版、既存の`aruaru-core`ZFS互換チェックサムと同じSHA-256を
+再利用)。テスト6件で(a)キーの決定的ルーティング、(b)実際の複数シャードへの
+分散、(c)複数スレッドからの並行書き込みがロック無しで安全に成立すること
+を直接検証。
+
+**正直な開示**: (1) CPUピニング・専用I/Oスケジューラ(Seastarの核心である
+「1コアに1スレッドを物理的に固定」)は実装していない——OSデフォルトの
+スケジューラに委ねる。(2) `QueryEngine`の本番書き込み経路
+(`parking_lot::RwLock<HashMap>`)は今回置き換えていない——Raft・Prolly Tree・
+OLAPキャッシュがテーブル単位の単一HashMapを前提に設計されているため、
+全面移行は影響範囲が広く今回のスコープ外(独立コンポーネントとして追加、
+既存の`snapshot_pairing`/`raid_z_backend`と同じ段階的アプローチ)。
+
+### 2. Vitess/PlanetScaleシャーディング — 「VTGate相当は既に代替済み」
+という前回理由は不正確、実際には無い要素(Range併合・scatter-gather)が
+あったため実装
+
+前回理由を検証するため`crates/aruaru-dist/src/shard/topology.rs`・
+`multi_raft.rs`を再読した結果、**「既に代替済み」という前回の評価は
+不正確だった**——`ClusterTopology`は`split_range`(Range分割)は実装済み
+だったが、Vitessの[Reshard](https://vitess.io/docs/reference/vreplication/reshard/)
+が持つ双方向操作のうち**併合(複数シャードを1つへ戻す)は一件も実装されて
+いなかった**。また、CockroachDB型のポイントルーティング(`propose`、キーが
+分かっている場合)はあったが、Vitess VTGateの核心機能である
+**scatter-gather(シャーディングキー不明なクエリを全シャードへ展開し結果を
+集約する)も未実装**だった。この2点を実装した:
+
+- `ClusterTopology::merge_ranges(range_a, range_b)`(`shard/topology.rs`):
+  隣接する2つのRangeを1つへ統合(隣接性チェック付き、飛び地の統合は拒否)。
+  レプリカ集合は和集合、`range_id`は小さい方を引き継ぐ。テスト3件
+  (併合が分割を正しく逆転させる、非隣接Range併合の拒否、存在しないRangeの
+  安全な処理)。
+- `MultiRaftCluster::merge`(`multi_raft.rs`): トポロジ統合に加え、消えた
+  側のRaftグループを`groups`から除去。
+- `MultiRaftCluster::scatter_gather<T, F>`(`multi_raft.rs`): 全Range
+  (全Raftグループ)へ同じ読み取りクロージャを適用し、range_id順に結果を
+  集約する——VTGateの「シャーディングキー不明なクエリを全シャードへ展開し
+  マージする」と同じ形。テスト2件(併合後のキー空間再統合、3Rangeからの
+  scatter-gather集約)。
+
+**正直な開示**: (1) `merge`はトポロジ構造の統合(キー空間ルーティングが
+1本化されること)のみを扱い、消えた側のRaftグループが保持していたログ・
+状態機械の内容を統合先へマージする処理は行わない(`split`が新グループを
+空ログから始める簡略化と対になる簡略化)。(2) `scatter_gather`は読み取り
+専用の集約であり、書き込み(合意を伴う`propose`)はこの関数の対象外。
+(3) `aruaru-server`の実運用経路(pgwire/GraphQL/REST admin API)からの
+呼び出し配線は今回未実施——`multi_raft`モジュール自体が既存HANDOFFの
+時点で「疎結合コンポーネントとして実装、呼び出し元への配線は次段階」と
+されており、今回もその段階に留まる。
+
+### 3. DuckDB組み込みOLAPエンジン — 見送りを維持するが、理由を「コスト」
+から「アーキテクチャ上の具体的重複」へ差し替え
+
+前回の見送り理由(「既存のTiFlash型OLAPキャッシュと重複」)は正しい方向
+だったが根拠が薄かったため、`crates/aruaru-query/src/olap.rs`を実際に
+読み直し、具体的な重複箇所を特定した:
+
+- DuckDBの性能の核心は[MonetDB/X100由来のベクトル化実行エンジン]
+  (列指向データをバッチ〈ベクトル〉単位でCPUキャッシュ効率よく処理する)
+  にある。
+- `aruaru-query/src/olap.rs`は**既にApache DataFusionを使っており、
+  DataFusion自体がArrow(列指向メモリフォーマット)ベースの同系統の
+  ベクトル化実行エンジン**である——`build_table_batch`が`Int64Array`/
+  `Float64Array`等のArrow列配列を構築し(28〜73行目)、
+  `rebuild_incremental`が`arrow::compute::filter_record_batch`という
+  列指向の軽量フィルタカーネル(文字列パース不要のバッチ処理、
+  240〜248行目)を使い、`session_context`が`target_partitions`で
+  マルチコア並列実行を構成する(75〜82行目)——これらはDuckDBが
+  MonetDB/X100から受け継ぐ設計そのもの(列指向・バッチ処理・
+  SIMDフレンドリー)と**同一系統**である。
+- したがって見送り理由は「実装コストが高い」ではなく、**「DuckDBを
+  追加導入しても、既存のDataFusion統合が既に提供している性能特性
+  (ベクトル化列指向実行)と機能的に重複するAPI・実行エンジンをもう1つ
+  抱えることになるだけで、新規の実行方式上の能力を追加しない」**という、
+  コードで裏付けられた具体的なアーキテクチャ上の理由に差し替える。
+  (DuckDBの「組み込み・依存ゼロで動く」という別の強みはあるが、
+  `aruaru-server`は既にDataFusionを組み込み依存として持つプロセス
+  内蔵型サーバーであり、この強みも新規性を生まない。)
+
+### 検証結果(実測)
+
+- `cargo test -p aruaru-dist multi_raft` → 5 passed / 0 failed
+  (新規`merge_reunifies_ranges_and_removes_the_absorbed_raft_group`・
+  `scatter_gather_collects_a_reading_from_every_range_like_vitess_vtgate`
+  含む)。
+- `cargo test -p aruaru-dist shard` → 9 passed / 0 failed(新規
+  `test_merge_reverses_split_like_vitess_reshard`・
+  `test_merge_rejects_non_adjacent_ranges`・
+  `test_merge_unknown_range_returns_none`含む)。
+- `cargo test -p aruaru-query sharded_store` → 6 passed / 0 failed。
+- `cargo build --workspace` → 成功(既存の`build_cluster`/`propose_commit`
+  未使用警告2件のみ、いずれも今回の変更と無関係な既知の警告)。
+- `cargo test --workspace` → 全19クレート/テストバイナリで
+  `test result: ok`、失敗0件(既存テストへの回帰無し)。
+
+### 正直な開示・今回も残る未着手事項
+
+(1) `ShardedRowStore`・`merge`/`scatter_gather`とも`aruaru-server`の
+実運用経路への配線は未実施(独立コンポーネントとしての実装段階)、
+(2) ScyllaDBのCPUピニング・Vitessのログマージを伴う真の併合は見送り
+(上記の各節参照、理由はコストではなく「単一プロセス前提の現行実装が
+ネットワーク越し複製・OSレベルCPU制御の前提を持たない」という構造的
+制約)、(3) DuckDBは今回もコード追加なし(見送り理由をアーキテクチャ上の
+重複へ差し替えたのみ)。
+
+### 次にすべきこと(次回候補)
+
+(1) `ShardedRowStore`を`aruaru-server`の実際のテーブルストレージ経路へ
+段階的に配線する場合の設計(Raft/Prolly Tree/OLAPキャッシュとの整合性を
+どう保つか)、(2) `MultiRaftCluster::merge`にログ内容のマージ(消える側の
+未適用エントリを統合先へ引き継ぐ)を追加する場合の設計、(3)
+`scatter_gather`を実際のクロスシャードSQL(`aruaru-query::QueryEngine`)
+から呼び出せるようにする配線。
