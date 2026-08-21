@@ -13,6 +13,7 @@
 pub mod engine;
 pub mod olap;
 pub mod parser;
+pub mod sharded_store;
 
 pub use engine::{QueryEngine, QueryResponse, Value};
 
