@@ -25,6 +25,8 @@ pub mod driver;
 pub mod log;
 pub mod node;
 pub mod rpc;
+#[cfg(any(test, feature = "sim-testing"))]
+pub mod sim;
 pub mod transport;
 pub mod writer;
 
@@ -33,6 +35,8 @@ pub use driver::RaftDriver;
 pub use log::ReplicatedLog;
 pub use node::{AppendResult, Applier, RaftNode, VoteResult};
 pub use rpc::{AppendEntriesReq, AppendEntriesResp, RequestVoteReq, RequestVoteResp};
+#[cfg(any(test, feature = "sim-testing"))]
+pub use sim::{run_simulation, FaultConfig, SimReport};
 pub use transport::{HttpTransport, Transport};
 pub use writer::{RaftWriter, ReplicatedWriter, DEFAULT_COMMIT_TIMEOUT};
 

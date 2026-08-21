@@ -130,6 +130,12 @@ impl<A: Applier> RaftNode<A> {
     pub fn last_log_term(&self) -> u64 {
         self.log.read().last_term()
     }
+    /// 指定インデックスの term (`ReplicatedLog::term_at` への薄い委譲)。
+    /// 【2026-08-21 sim.rs向けに新設】決定的シミュレーションテスト(DST)で
+    /// Leader/Follower間のログ一致性 (Log Matching Property) を検証するために使う。
+    pub fn term_at_index(&self, index: u64) -> Option<u64> {
+        self.log.read().term_at(index)
+    }
     pub fn peers(&self) -> &[u64] {
         &self.peers
     }
