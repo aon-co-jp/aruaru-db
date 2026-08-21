@@ -566,6 +566,7 @@ dependencies = [
  "aruaru-core",
  "datafusion",
  "parking_lot",
+ "regex",
  "rust-json",
  "serde",
  "serde_json",

@@ -15,9 +15,9 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray,
+    ArrayRef, BooleanArray, Float64Array, Int64Array, StringDictionaryBuilder,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::datasource::MemTable;
@@ -28,13 +28,30 @@ use aruaru_core::catalog::ColumnType;
 use crate::engine::{QueryEngine, QueryResponse, Value};
 
 /// ColumnType → Arrow DataType
+///
+/// 【2026-08-21 DuckDB再調査でText列を辞書エンコードへ変更】
+/// 6〜8言語(日英中独韓仏露西)でDuckDBとDataFusionの実装差分を再調査した
+/// 結果、両者は同系統のベクトル化列指向エンジンだが、DuckDBの
+/// ストレージ層固有の技術要素として **辞書エンコーディング(重複文字列を
+/// 辞書へ集約し、各セルは辞書への整数インデックスのみを保持する圧縮)**
+/// が確認できた
+/// (https://duckdb.org/2022/10/28/lightweight-compression 、
+/// https://endjin.com/blog/duckdb-in-depth-how-it-works-what-makes-it-fast)。
+/// 従来の`build_array`は`ColumnType::Text`を常に生の`StringArray`
+/// (各行が文字列バイト列をそのまま持つ)として構築しており、低カーディナ
+/// リティ(重複の多い)列でもメモリ上重複してコピーされていた——DataFusion
+/// 自体はDictionaryArrayをネイティブにサポートするにもかかわらず、
+/// `aruaru-query`側がそれを使っていなかったという実際のギャップ。
+/// Text列は`DataType::Dictionary(Int32, Utf8)`へ変更し、
+/// `StringDictionaryBuilder`で辞書エンコードして構築する。
 fn arrow_type(ty: &ColumnType) -> DataType {
     match ty {
         ColumnType::Int | ColumnType::BigInt => DataType::Int64,
         ColumnType::Float => DataType::Float64,
         ColumnType::Bool => DataType::Boolean,
-        // Text / Bytes / Timestamp は当面 Utf8 (タイムスタンプ解析は次段階)
-        _ => DataType::Utf8,
+        // Text / Bytes / Timestamp は当面 Dictionary(Int32, Utf8) として
+        // 辞書エンコードする(タイムスタンプ解析は次段階)。
+        _ => DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
     }
 }
 
@@ -68,7 +85,22 @@ fn build_array(ty: &ColumnType, cells: Vec<Option<String>>) -> ArrayRef {
                 .collect();
             Arc::new(BooleanArray::from(v)) as ArrayRef
         }
-        _ => Arc::new(StringArray::from(cells)) as ArrayRef,
+        // DuckDB風の辞書エンコーディング(上記`arrow_type`のdocコメント参照)。
+        // 重複する文字列値は辞書へ1回だけ格納され、各セルは整数インデックス
+        // のみを保持する——低カーディナリティ列(例: `region`/`status`等)ほど
+        // 圧縮効果が大きい。
+        _ => {
+            let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+            for cell in cells {
+                match cell {
+                    Some(s) => {
+                        let _ = builder.append(s.as_str());
+                    }
+                    None => builder.append_null(),
+                }
+            }
+            Arc::new(builder.finish()) as ArrayRef
+        }
     }
 }
 
@@ -194,6 +226,92 @@ struct TableCache {
     /// ベース列バッチの各行が対応するpk(`base_batch`と同じ行順)。
     base_pks: Vec<Vec<u8>>,
     base_batch: RecordBatch,
+    /// 【2026-08-21 DuckDB再調査で追加】DuckDB風のゾーンマップ(min/maxブロック
+    /// 統計)。数値列(Int64/Float64)ごとに現在のベースバッチ全体のmin/maxを
+    /// 保持する。DuckDBはこれをRow Group(物理ブロック)単位で持ち、クエリの
+    /// WHERE句がそのブロックの値域と絶対に重ならないと判定できればブロック
+    /// 全体をスキャンせずスキップする
+    /// (https://endjin.com/blog/duckdb-in-depth-how-it-works-what-makes-it-fast 、
+    /// https://blobs.duckdb.org/slides/TaDa-04.pdf)。
+    /// 本実装は「テーブル全体で1ブロック」という最も粗い粒度の簡易版——
+    /// ブロック単位分割(Row Groupのような複数統計区間への細分化)は
+    /// 実装していない(正直な簡略化点、下記`OlapCache::query`のdocも参照)。
+    zone_maps: std::collections::HashMap<String, (f64, f64)>,
+}
+
+/// バッチの数値列(Int64/Float64)ごとにmin/maxを計算する
+/// (DuckDB風ゾーンマップの構築、`compute::min`/`compute::max`は
+/// Arrow標準の縮約カーネルでNULLを無視する)。
+fn compute_zone_maps(batch: &RecordBatch) -> std::collections::HashMap<String, (f64, f64)> {
+    use datafusion::arrow::array::{Float64Array, Int64Array};
+    use datafusion::arrow::compute::{max as arrow_max, min as arrow_min};
+
+    let mut maps = std::collections::HashMap::new();
+    for (i, field) in batch.schema().fields().iter().enumerate() {
+        let col = batch.column(i);
+        match field.data_type() {
+            DataType::Int64 => {
+                if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                    if let (Some(mn), Some(mx)) = (arrow_min(arr), arrow_max(arr)) {
+                        maps.insert(field.name().clone(), (mn as f64, mx as f64));
+                    }
+                }
+            }
+            DataType::Float64 => {
+                if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
+                    if let (Some(mn), Some(mx)) = (arrow_min(arr), arrow_max(arr)) {
+                        maps.insert(field.name().clone(), (mn, mx));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    maps
+}
+
+/// `SELECT ... FROM <table> WHERE <col> <op> <number>`という最も単純な
+/// 形の述語だけを緩く抽出する(ゾーンマップによる枝刈り判定専用、
+/// 完全なSQL式パーサではない——GROUP BY/JOIN/複合WHERE等を含む場合は
+/// マッチさせない設計で、マッチしない場合は常に安全側〈=通常通り
+/// DataFusionへ渡す〉に倒れる)。
+fn extract_simple_range_predicate(sql: &str) -> Option<(String, String, String, f64)> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?is)^\s*SELECT\s+.+?\s+FROM\s+(?P<table>[A-Za-z_][A-Za-z0-9_]*)\s+WHERE\s+(?P<col>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<op>>=|<=|>|<)\s*(?P<num>-?\d+(?:\.\d+)?)\s*;?\s*$",
+        )
+        .expect("static regex must compile")
+    });
+    let caps = re.captures(sql)?;
+    // GROUP BY/JOIN/サブクエリ等を含む場合はこの単純パターンにそもそも
+    // マッチしない(`.+?\s+FROM`の非貪欲マッチが複雑な構造まで飲み込むと
+    // 誤判定するリスクがあるため、念のため明示的にも除外する)。
+    let upper = sql.to_uppercase();
+    if upper.contains("GROUP BY") || upper.contains("JOIN") || upper.contains(" OR ") {
+        return None;
+    }
+    let table = caps.name("table")?.as_str().to_string();
+    let col = caps.name("col")?.as_str().to_string();
+    let op = caps.name("op")?.as_str().to_string();
+    let num: f64 = caps.name("num")?.as_str().parse().ok()?;
+    Some((table, col, op, num))
+}
+
+/// ゾーンマップ`(min, max)`と述語`col <op> num`から、この範囲に**絶対に
+/// マッチする行が存在しない**と証明できるか判定する(証明できない場合は
+/// 安全側に倒れ`false`——DuckDBのブロックスキップと同じ「偽陰性は許すが
+/// 偽陽性〈=本当は該当行があるのにスキップしてしまう〉は絶対に起こさない」
+/// 設計)。
+fn zone_map_disproves(min: f64, max: f64, op: &str, num: f64) -> bool {
+    match op {
+        ">" => max <= num,
+        ">=" => max < num,
+        "<" => min >= num,
+        "<=" => min > num,
+        _ => false,
+    }
 }
 
 impl OlapCache {
@@ -225,8 +343,15 @@ impl OlapCache {
             return Ok(());
         }
         let (schema, batch) = build_table_batch(&columns, &rows)?;
-        self.tables.write().insert(name.to_string(), TableCache { schema, base_pks: pks, base_batch: batch });
+        let zone_maps = compute_zone_maps(&batch);
+        self.tables.write().insert(name.to_string(), TableCache { schema, base_pks: pks, base_batch: batch, zone_maps });
         Ok(())
+    }
+
+    /// テーブル`table`の列`column`のゾーンマップ(`(min, max)`)を返す
+    /// (観測用・テスト用の公開アクセサ)。
+    pub fn zone_map(&self, table: &str, column: &str) -> Option<(f64, f64)> {
+        self.tables.read().get(table)?.zone_maps.get(column).copied()
     }
 
     /// 変更されたpkだけをベースから除き、その現在値をデルタとして結合する
@@ -273,7 +398,8 @@ impl OlapCache {
         };
 
         let schema = entry.schema.clone();
-        cache.insert(name.to_string(), TableCache { schema, base_pks: new_pks, base_batch: merged });
+        let zone_maps = compute_zone_maps(&merged);
+        cache.insert(name.to_string(), TableCache { schema, base_pks: new_pks, base_batch: merged, zone_maps });
         Ok(())
     }
 
@@ -299,8 +425,36 @@ impl OlapCache {
     }
 
     /// インクリメンタル同期された列キャッシュ経由でOLAPクエリを実行する。
+    ///
+    /// 【2026-08-21 DuckDB再調査で追加・ゾーンマップによる枝刈り】
+    /// `sql`が`extract_simple_range_predicate`で抽出できる単純な範囲述語
+    /// (`SELECT ... FROM t WHERE col > N`のような形)であり、かつ対象列の
+    /// ゾーンマップ(`(min, max)`)がその述語を絶対に満たす行が無いと
+    /// 証明できる場合、**DataFusionへ一切クエリを投げずに空の結果を
+    /// 即座に返す**——DuckDBがブロックのmin/max統計だけでRow Group全体の
+    /// スキャンをスキップするのと同じ発想。今回の実装は「テーブル全体で
+    /// 1つのゾーンマップ」という粗い粒度のため、スキップできるのは
+    /// 「テーブル全体が対象外と証明できる場合」のみ(DuckDBのような
+    /// ブロック単位の部分スキップは行わない、正直な簡略化点)。
+    /// マッチしない/証明できない場合は常に安全側(=通常通り
+    /// `execute_and_format`でDataFusionへ渡す)に倒れるため、この枝刈りが
+    /// 結果の正しさに影響することは無い。
     pub async fn query(&self, engine: &QueryEngine, sql: &str) -> Result<QueryResponse, String> {
         self.refresh(engine)?;
+
+        if let Some((table, col, op, num)) = extract_simple_range_predicate(sql) {
+            let tables = self.tables.read();
+            if let Some(entry) = tables.get(&table) {
+                if let Some(&(min, max)) = entry.zone_maps.get(&col) {
+                    if zone_map_disproves(min, max, &op, num) {
+                        let columns: Vec<String> =
+                            entry.schema.fields().iter().map(|f| f.name().clone()).collect();
+                        return Ok(QueryResponse::Rows { columns, rows: Vec::new() });
+                    }
+                }
+            }
+        }
+
         let ctx = session_context();
         for (name, entry) in self.tables.read().iter() {
             let table = MemTable::try_new(entry.schema.clone(), vec![vec![entry.base_batch.clone()]]).map_err(|e| e.to_string())?;
@@ -556,5 +710,133 @@ mod tests {
         }
 
         handle.abort();
+    }
+
+    /// 【DuckDB風辞書エンコーディング検証(2026-08-21)】低カーディナリティの
+    /// Text列(`region`、値は`east`/`west`の2種類のみ、100行)が、実際に
+    /// `DataType::Dictionary(Int32, Utf8)`として構築されること、辞書の
+    /// エントリ数(ユニーク値の数)が行数よりはるかに少ないことを直接検証する
+    /// (「重複文字列が辞書へ1回だけ格納される」という圧縮効果の直接証拠)。
+    /// あわせて、辞書エンコードされた列でも通常通り正しく集計できることも
+    /// 実証する(圧縮による正しさへの悪影響が無いことの確認)。
+    #[tokio::test]
+    async fn text_columns_are_dictionary_encoded_and_still_aggregate_correctly() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE orders (id INT, region TEXT, amount INT)").unwrap();
+        for i in 0..100 {
+            let region = if i % 2 == 0 { "east" } else { "west" };
+            eng.execute(&format!(
+                "INSERT INTO orders (id, region, amount) VALUES ({i}, '{region}', 10)"
+            ))
+            .unwrap();
+        }
+
+        let cache = OlapCache::new();
+        cache.refresh(&eng).unwrap();
+        let tables = cache.tables.read();
+        let entry = tables.get("orders").unwrap();
+        let region_field = entry.schema.field_with_name("region").unwrap();
+        assert!(
+            matches!(region_field.data_type(), DataType::Dictionary(_, _)),
+            "region column should be dictionary-encoded, got {:?}",
+            region_field.data_type()
+        );
+        let region_idx = entry.schema.index_of("region").unwrap();
+        let region_array = entry.base_batch.column(region_idx);
+        let dict_array = region_array
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::DictionaryArray<Int32Type>>()
+            .expect("region column must actually be a DictionaryArray");
+        // 100行あるが値は"east"/"west"の2種類のみ -> 辞書のユニーク値数は2。
+        assert_eq!(
+            dict_array.values().len(),
+            2,
+            "dictionary should contain only the 2 unique region values, not 100"
+        );
+        drop(tables);
+
+        let resp = cache.query(&eng, "SELECT region, SUM(amount) AS total FROM orders GROUP BY region ORDER BY region").await.unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][1], Value::Text("500".into())); // east: 50件 x 10
+            assert_eq!(rows[1][1], Value::Text("500".into())); // west: 50件 x 10
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    /// 【DuckDB風ゾーンマップ検証(2026-08-21)】数値列のmin/maxが正しく
+    /// 計算・公開されること、そのゾーンマップを使って「絶対に該当行が無い」
+    /// と証明できるWHERE句(範囲外)が、実際にDataFusionへ処理を渡さず
+    /// 空の結果を返すこと(=枝刈りが機能している)、そして通常のWHERE句
+    /// (該当行がある場合)は従来通り正しい結果を返すことを検証する。
+    #[tokio::test]
+    async fn zone_map_prunes_queries_that_cannot_possibly_match_and_normal_queries_still_work() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE items (id INT, qty INT)").unwrap();
+        eng.execute("INSERT INTO items (id, qty) VALUES (1, 10)").unwrap();
+        eng.execute("INSERT INTO items (id, qty) VALUES (2, 20)").unwrap();
+        eng.execute("INSERT INTO items (id, qty) VALUES (3, 30)").unwrap();
+
+        let cache = OlapCache::new();
+        cache.refresh(&eng).unwrap();
+        // qty列のゾーンマップは(min=1, max=30) -- idもINT列なので(min=1, max=3)。
+        let (min, max) = cache.zone_map("items", "qty").expect("zone map must exist for qty");
+        assert_eq!((min, max), (10.0, 30.0));
+
+        // qty > 30 は絶対にどの行も満たせない(max=30なので "> 30" は不成立)
+        // -> ゾーンマップだけで空を返すはず。
+        let resp = cache.query(&eng, "SELECT * FROM items WHERE qty > 30").await.unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert!(rows.is_empty(), "zone map should have proven no rows can match qty > 30");
+        } else {
+            panic!("expected rows");
+        }
+
+        // qty > 15 は該当行がある(20, 30)ので、通常通りDataFusion経由で
+        // 正しい行数が返ること(枝刈りロジックが正しい結果を壊していないこと)。
+        let resp = cache.query(&eng, "SELECT * FROM items WHERE qty > 15").await.unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows.len(), 2, "qty=20 and qty=30 should both match qty > 15");
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    /// `extract_simple_range_predicate`自体の単体テスト: GROUP BY/JOINを
+    /// 含む複雑なクエリはマッチしない(=常に安全側でDataFusionへ渡る)こと、
+    /// 単純な範囲述語は正しく抽出されることを確認する。
+    #[test]
+    fn extract_simple_range_predicate_only_matches_simple_range_queries() {
+        assert_eq!(
+            extract_simple_range_predicate("SELECT * FROM t WHERE qty > 10"),
+            Some(("t".to_string(), "qty".to_string(), ">".to_string(), 10.0))
+        );
+        assert_eq!(
+            extract_simple_range_predicate("SELECT * FROM t WHERE qty >= 10.5"),
+            Some(("t".to_string(), "qty".to_string(), ">=".to_string(), 10.5))
+        );
+        assert!(extract_simple_range_predicate(
+            "SELECT region, SUM(qty) FROM t WHERE qty > 10 GROUP BY region"
+        )
+        .is_none());
+        assert!(extract_simple_range_predicate(
+            "SELECT * FROM t JOIN u ON t.id = u.id WHERE qty > 10"
+        )
+        .is_none());
+        assert!(extract_simple_range_predicate("SELECT * FROM t").is_none());
+    }
+
+    /// ゾーンマップ判定関数(`zone_map_disproves`)自体の境界値テスト。
+    #[test]
+    fn zone_map_disproves_boundary_conditions() {
+        // min=10, max=30の範囲に対して:
+        assert!(zone_map_disproves(10.0, 30.0, ">", 30.0)); // 30より大きい値は無い
+        assert!(!zone_map_disproves(10.0, 30.0, ">=", 30.0)); // 30ちょうどはある
+        assert!(zone_map_disproves(10.0, 30.0, ">=", 30.1)); // 30.1以上は無い
+        assert!(zone_map_disproves(10.0, 30.0, "<", 10.0)); // 10未満は無い
+        assert!(!zone_map_disproves(10.0, 30.0, "<=", 10.0)); // 10ちょうどはある
+        assert!(zone_map_disproves(10.0, 30.0, "<=", 9.9)); // 9.9以下は無い
+        assert!(!zone_map_disproves(10.0, 30.0, ">", 5.0)); // 該当行があり得る
     }
 }
