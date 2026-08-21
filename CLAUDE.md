@@ -2988,3 +2988,132 @@ OLAPキャッシュがテーブル単位の単一HashMapを前提に設計され
 未適用エントリを統合先へ引き継ぐ)を追加する場合の設計、(3)
 `scatter_gather`を実際のクロスシャードSQL(`aruaru-query::QueryEngine`)
 から呼び出せるようにする配線。
+
+## HANDOFF: 2026-08-21(続き3) ScyllaDB `ShardedRowStore`とVitess
+`merge`/`scatter_gather`を`aruaru-server`本体の運用経路へ実配線、
+実プロセスでHTTP動作確認
+
+**経緯**: 直上のHANDOFF(同日)が両者とも「独立コンポーネントとしての実装
+段階」に留めていたことに対し、ユーザーから「実際にaruaru-server本体の
+運用経路へ配線し、実プロセスを起動してHTTP経由で動作確認せよ」との指示。
+既存機能(pgwire/GraphQL/REST経由のOLTP書き込み経路)を壊さないことを
+優先し、両者とも**オプトインの独立エンドポイント**として`/admin/*`配下に
+追加する方式を選んだ(置き換えではなく追加)。
+
+### 1. ScyllaDB `ShardedRowStore` の配線
+
+`crates/aruaru-server/src/admin.rs`の`AdminState`に
+`sharded_store: aruaru_query::sharded_store::ShardedRowStore<String>`
+フィールドを追加(`AdminState::new`で`ShardedRowStore::new(0)`により
+論理コア数ぶんのシャードスレッドを起動)。新規エンドポイント3つ:
+`POST /admin/sharded-store`(put)・`GET /admin/sharded-store/:key`
+(get)・`GET /admin/sharded-store-stats`(シャードごとのエントリ数)。
+ハンドラは`tokio::task::spawn_blocking`で`std::sync::mpsc`の
+ブロッキング`recv()`をtokioワーカースレッドから退避している(シャード
+スレッドとの通信がブロッキングI/Oである設計上の性質を、非同期HTTP
+ハンドラ側で正しく扱うための配慮)。
+
+**既存ストレージ(`QueryEngine::tables`)を置き換えるか追加するかの判断**:
+置き換えは選ばなかった——Raft・Prolly Tree・OLAPキャッシュ全てが
+テーブル単位の単一`HashMap`を前提に設計されており、影響範囲が広い
+(前回HANDOFFで既に正直に開示済みの制約)。オプトインの独立ストレージ
+(`/admin/sharded-store`)として追加する方式が「既存機能を壊さない」
+というユーザー指示に最も合致すると判断した。
+
+### 2. Vitess `merge`/`scatter_gather` の配線
+
+`AdminState`に`multi_raft: Mutex<Option<Arc<MultiRaftCluster
+<EngineApplier>>>>`を追加。`main.rs`起動時、既存の単一`ClusterNode`
+(本番のOLTP書き込み経路)とは別に、`MultiRaftCluster::single_node`で
+単一ノード構成のMulti-Raftクラスタを初期化し`admin_state.attach_
+multi_raft(..)`で取り付ける。新規エンドポイント3つ:
+`POST /admin/multi-raft/split`(Range分割)・`POST /admin/multi-raft/merge`
+(Vitess Reshard併合)・`GET /admin/multi-raft/scatter-query`
+(VTGate scatter-gather、全Rangeのcommit_index+roleをrange_id順に集約)。
+`aruaru_dist::lib.rs`に`MultiRaftCluster`のトップレベル再エクスポートを
+追加(従来`multi_raft`モジュール内のみで、クレート外から`aruaru_dist::
+MultiRaftCluster`として参照できなかった)。
+
+### 3. 実プロセスでのHTTP動作確認(実測、型チェック・ビルド成功では終わらせない)
+
+実際に`aruaru-server.exe`(`cargo build -p aruaru-server`で生成した
+実バイナリ)を`--raft-id 1 --gql-port 7301`で起動し、
+`ARUARU_DB_ADMIN_TOKEN`を設定した上で以下を全て実HTTPリクエストで確認:
+
+1. `GET /healthz` → `ok`(起動確認)。
+2. `POST /admin/sharded-store`を3回(`alpha`/`beta`/`gamma`)実行 →
+   それぞれ`shard_id`が30/9/0という異なるシャードへ実際に振り分けられた
+   ことを確認(SHA-256ベースのtoken-aware routingが実際に機能している
+   直接証拠)。
+3. `GET /admin/sharded-store/alpha`・`/beta` → 書き込んだ値
+   (`apple`/`banana`)が正しく読み戻せることを確認。
+4. `GET /admin/sharded-store-stats` → `shard_count: 32`
+   (このマシンの論理コア数)、`per_shard_len`の該当インデックスのみ`1`、
+   `total_len: 3`——分散状況を実際に観測できることを確認。
+5. `POST /admin/multi-raft/split`を2回(range 1を`m`で分割→range 2、
+   range 2を`t`で分割→range 3)実行 → `range_count`が1→2→3と実際に
+   増加することを確認。
+6. `GET /admin/multi-raft/scatter-query`(分割直後) → 3つの独立した
+   Rangeそれぞれの`commit_index`/`role`が実際に返ることを確認
+   (`range_id: 1,2,3`全て`Leader`・`commit_index: 0`)。
+7. `POST /admin/multi-raft/merge`(range 1と2を併合) →
+   `merged_range_id: 1`・`range_count: 2`を確認。
+8. `GET /admin/multi-raft/scatter-query`(併合後) → range 1と3の
+   **2件**のみが返り、統合が実際にscatter-gatherの結果へ反映される
+   ことを確認。
+9. 存在しないrange_idでの併合(`range_a:1, range_b:999`) →
+   `success: false`で安全にエラーメッセージが返ることを確認
+   (パニックしない)。
+10. `x-admin-token`ヘッダー無しで`GET /admin/multi-raft/scatter-query`
+    を呼ぶ → **401**(既存の全`/admin/*`共通認証ミドルウェアが新規
+    エンドポイントにも自動的に適用されていることを確認——`admin_routes()`
+    の`.around()`ラッパー内にルートを追加しただけで個別の認証実装は
+    不要だった)。
+
+検証後、起動していたプロセスを`Stop-Process`で終了し、標準エラー
+ログ(`err.log`)にエラー・パニックが一切無いことを確認した上で
+一時検証用データディレクトリを削除した(リポジトリへの影響なし)。
+
+### 検証結果(実測、コマンド・出力込み)
+
+- `cargo build -p aruaru-server` → 成功(既存の`build_cluster`/
+  `propose_commit`未使用警告2件のみ、いずれも今回の変更と無関係)。
+- `cargo test -p aruaru-server -p aruaru-dist -p aruaru-query` →
+  全green(aruaru-dist 41 passed/1 ignored、aruaru-query 52 passed、
+  aruaru-server 3 passed/1 ignored)、リグレッション無し。
+- `cargo build --workspace` → 成功。
+- `cargo test --workspace` → 全19テストバイナリで`test result: ok`、
+  失敗0件。
+- 上記の実HTTP検証10項目すべて実施・成功。
+
+### 配線中に見つけた不整合・バグ
+
+**無し**。実装・実HTTP検証を通じて新規のバグは発見しなかった
+(既存のRaftNode/MultiRaftCluster/ShardedRowStoreのロジック自体は
+前回HANDOFFで既にテスト済みだったため、今回は「配線」作業が主体)。
+
+### 正直な開示・残る制約
+
+1. **`ShardedRowStore`は依然として独立ストレージ**——`QueryEngine`の
+   本番テーブルデータとは無関係(キー・値ともに任意の文字列を保持する
+   汎用KVとしての公開に留まる)。テーブルデータそのものをシャード分割
+   したいという要求には、Raft/Prolly Tree/OLAPキャッシュ全体の再設計が
+   必要で、今回もそこには踏み込んでいない。
+2. **`MultiRaftCluster`は`ClusterTopology`の構造操作+読み取り集約のみ
+   を実配線した**——`multi-raft/split`/`multi-raft/merge`は実際に
+   独立したRaftグループの生成・除去を行うが、これらのRangeへの実際の
+   書き込み(`propose`)・複数物理ノードへのネットワーク複製は今回の
+   配線対象外(既存の`propose_write`/pgwire経路は引き続き単一の
+   `ClusterNode`を使う——2つのRaft関連コンポーネントが並行して存在する
+   状態のまま)。
+3. **`ShardedRowStore`・`MultiRaftCluster`とも認証(`x-admin-token`)は
+   `/admin/*`共通ミドルウェア経由で自動的に適用されるが、複数ノード
+   クラスタでの`multi-raft/*`操作の整合性(全ノードでトポロジが同期
+   されるか)は単一ノード構成でしか検証していない**。
+
+### 次にすべきこと(次回候補)
+
+(1) `MultiRaftCluster`のRangeへ実際に書き込み(`propose`)できる
+管理APIエンドポイントの追加、(2) `ShardedRowStore`をテナント別
+キャッシュ層など、既存のOLTP経路と衝突しない具体的な用途へ本格接続する、
+(3) 複数ノード構成での`multi-raft/*`操作の実地検証。
