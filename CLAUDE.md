@@ -2507,3 +2507,189 @@ TiFlash方式のRaft learner化(`aruaru-dist`のRaft複製ログを`OlapCache`
 余地がある、(3) 真のRaft learner化・ephemeral SQL pod化は、
 `aruaru-dist`のopenraft統合完了後、あるいはマルチプロセス化を
 本格検討するタイミングで再評価する。
+
+## HANDOFF: 2026-08-21(続き) 「プロセスモデル自体の再設計が必要」として
+見送っていた2点(真のRaft learner化・ephemeral SQL pod化)を実際に
+実装・実プロセス間で検証
+
+直上のHANDOFF(同日)が「次回候補(3)」として「openraft統合完了後、または
+マルチプロセス化を本格検討するタイミングで再評価する」と先送りしていた
+2点に対し、ユーザーから「見送りとせず、実際に手を動かして最低限の一歩
+(同一マシン上での複数プロセス構成)を実装せよ」との指示を受け、実装まで
+進めた。
+
+### 段階1: 調査結果の要約(日英中(簡体)台(繁体)独露仏西韓、9言語)
+
+1. **`openraft`のlearnerサポート**: 本リポジトリの既存Raft実装
+   (`aruaru-dist/src/raft/`)は`openraft`クレートに実際には依存しておらず
+   (`raft/mod.rs`冒頭のdocコメントに「本番のリーダー選挙・ハートビート・
+   スナップショット・ネットワークRPCはopenraftへ委譲する計画」と明記
+   された**将来計画のまま**、自前実装のログ/適用セマンティクスのみ)、
+   `RaftRole::Learner`という列挙子と、`driver.rs`の`RaftDriver::run`
+   ループ内に`RaftRole::Learner => { self.node.apply_committed(); }`
+   という**受け皿となる分岐だけ**が既に存在していた——投票権を持たない
+   非同期複製先という**概念**は既にコードに現れていたが、(a)実際に
+   このロールへ遷移させる経路(CLIフラグ等)、(b)Leaderの複製先
+   ・quorum計算からの扱い分け、(c)別プロセスとして起動した際の
+   ネットワーク到達性、のいずれも配線されていなかった——「部品は
+   あったが繋がっていなかった」という、このエコシステムで過去に
+   繰り返し発見されてきたパターンの新たな実例。
+2. **CockroachDB Serverlessのephemeral SQL pod**: 前回HANDOFF
+   (直上)で参照した英語文献
+   ([Jack Vanlightly氏の解説](https://jack-vanlightly.com/analyses/2023/11/21/serverless-cockroachdb-asds-chapter-4-part-1))
+   の内容を踏襲し、「テナントごとの使い捨て計算単位」という発想を、
+   Kubernetes pod単位のオーケストレーションではなく、`tokio::process::
+   Command`による**OSプロセスレベルの生成・終了**で単一マシン上でも
+   模擬できると判断した(詳細は段階2参照)。
+
+### 段階2: 実装した再設計の内容
+
+**(1) 真のRaft learner化(マルチプロセス化・実ネットワーク複製)**
+
+- `crates/aruaru-dist/src/raft/node.rs`: `RaftNode`に`learners: Vec<u64>`
+  (投票権を持たないpeer)・`self_is_learner: bool`(自ノードがlearnerと
+  して構築されたか)を追加。`RaftNode::new_with_learners(node_id,
+  applier, peers, learners, self_is_learner)`を新設(既存の`new`は
+  `learners=[]`・`self_is_learner=false`で委譲、完全後方互換)。
+  `replication_targets()`(voter+learner両方、複製送信対象)を追加。
+  **発見・修正した実バグ**: `append_entries`(Leaderからの受信処理)が
+  無条件に`s.role = RaftRole::Follower`へ遷移させていたため、
+  learnerとして構築したノードもLeaderからの最初のAppendEntries受信を
+  機にFollowerへ格上げされ、`driver.rs`のFollower/Candidate分岐
+  (選挙タイムアウトでCandidate昇格)に巻き込まれてしまう——投票権を
+  持たないはずのlearnerが実際には選挙に参加してしまう、という設計を
+  壊す実バグになるところだった。`self_is_learner`のときはLearnerロール
+  を維持するよう修正。
+- `maybe_commit`(quorum判定)は`self.peers`(voter)のみを見る既存実装を
+  そのまま維持——learnerを`replication_targets()`に含めても複製先が
+  増えるだけでcommitの安全性には影響しない設計にした。
+- `crates/aruaru-dist/src/raft/driver.rs`: `replicate()`が
+  `node.peers()`ではなく`node.replication_targets()`(voter+learner)へ
+  AppendEntriesを送るよう変更。
+- `crates/aruaru-server/src/cluster.rs`: `build_cluster_with_learners`
+  新設(既存`build_cluster`は後方互換の薄いラッパーへ)。
+- `crates/aruaru-server/src/main.rs`: 新CLIフラグ`--raft-role`
+  (`voter`/`learner`)・`--learner-peers`を追加。
+  例: `aruaru-server --raft-id 1 --raft-role voter --learner-peers
+  "2@127.0.0.1:6002"`(Leader側)、`aruaru-server --raft-id 2
+  --raft-role learner --peers "1@127.0.0.1:6001"`(learner側)を
+  **実際に2つの別プロセス**として起動できる。
+- テスト: `raft/node.rs`に
+  `test_learner_role_preserved_across_append_entries_and_applies_
+  committed_entries`(上記バグの回帰テスト)・
+  `test_leader_quorum_excludes_learners_but_still_replicates_to_them`
+  (learnerの複製がquorumに数えられないことの直接検証)を追加。
+
+**(2) ephemeral SQL pod化(プロセスレベルの使い捨て計算単位)**
+
+- `crates/aruaru-server/src/ephemeral_pod.rs`(新規)。親プロセスが
+  対象テナントのテーブルスナップショットをJSON化し、
+  `tokio::process::Command`で**自分自身の実行ファイル**を
+  `--ephemeral-worker`フラグ付きで子プロセスとして起動、標準入力で
+  リクエストを渡し、子プロセスは完全に独立したインメモリ
+  `QueryEngine`(永続ストレージ・Raft・pgwire・GraphQLは一切起動しない)
+  でテーブルを再現しSQLを1回実行、結果を標準出力へJSONで書いて
+  **即座に終了する**。`main.rs`に`--ephemeral-worker`内部フラグを追加し、
+  設定時はこのワーカーモードのみ実行して即returnする。
+  `crates/aruaru-server/src/admin.rs`に`POST /admin/ephemeral-query`
+  (`{tenant_id, tables: [テーブル名], sql}`)を新設、実際に子プロセスを
+  起動して結果を返す。
+- **正直な開示・スコープの限界**(`ephemeral_pod.rs`冒頭docコメントにも
+  記載): (a) cgroup/Job Object等によるCPU/メモリ/帯域の真のリソース
+  制限は実装していない——「独立したOSプロセスとして起動・終了する」
+  というプロセス分離そのものの実証に留まる。(b) 永続ストレージ(fjall)
+  には触れない設計(子プロセスが親と同じデータディレクトリを同時に
+  開くとファイルロック競合のリスクがあるため、意図的にJSON経由の
+  インメモリスナップショットのみを渡す)——書き込みは子プロセスの
+  メモリ上でのみ完結し親の永続状態には反映されない、読み取り専用の
+  テナント別計算オフロードに限定される。(c) 複数物理マシンをまたぐ
+  真のオーケストレーション(Kubernetes pod相当)はこの環境では検証
+  不可能。
+
+### 段階3: 実プロセス間での検証結果(実測、型チェックのみで終わらせない)
+
+**(1) Raft learner — 2プロセスでの実ネットワーク複製検証**:
+`aruaru-server.exe`を実際に2プロセス起動(leader: `--raft-id 1
+--raft-role voter --learner-peers "2@127.0.0.1:6002"` port 6001/6011、
+learner: `--raft-id 2 --raft-role learner --peers "1@127.0.0.1:6001"`
+port 6002/6012)、leaderへ`POST /admin/cluster/propose`で
+`CREATE TABLE items`+`INSERT`を実行後、learner側プロセスへ
+`POST /admin/federation/query`(`local.SELECT * FROM items`、
+learner自身のインメモリQueryEngineへの直接クエリ)で**実際に挿入した
+行(`id=1, name=sword`)が読めることを確認**——TCP経由の実HTTPリクエスト
+によるAppendEntries複製が、別プロセス・別ポートのlearnerへ実際に
+届いていることの直接証拠。
+
+検証の過程で**2件の実バグを発見・修正した**(いずれも「複数プロセスを
+実際に起動して検証する」という今回のアプローチが無ければ発見できな
+かったもの):
+1. `HttpTransport`(`raft/transport.rs`)がAppendEntries/RequestVote送信時
+   に`x-admin-token`ヘッダーを一切付与していなかった——2026-07-30に
+   `/admin/*`全体へ認証を遡及適用した際のHANDOFFが「これらを実際に
+   呼ぶノード間通信はまだ配線されていないため実害は無い」と正直に
+   記していた通りの、まさにその「実際に呼ばれた初回」で顕在化した。
+   環境変数`ARUARU_DB_ADMIN_TOKEN`を読み取り全リクエストへ付与する
+   よう修正。
+2. **さらに深刻な別バグ**: `HttpTransport`が`{base}/raft/append`
+   (`/admin`プレフィックス無し)へ送信していたが、`main.rs`は
+   `admin::admin_routes(..)`全体を`.nest("/admin", ..)`でマウントして
+   いるため受信側の実パスは`/admin/raft/append`——**送信先パスが
+   そもそも存在しない404**だった(1のトークン修正だけでは解決せず、
+   `--log-level debug`で実際のエラーログ
+   `"append_entries send failed", error: "HTTP status client error
+   (404 Not Found)"`を確認して発見)。両方を修正して初めて複製が
+   成功した。この2つのバグはいずれも`tracing::debug!`にしか記録
+   されないため通常運用(info以上のログレベル)では気づけない、
+   サイレントに複製が止まる実バグだった。
+
+**(2) ephemeral SQL pod — 実際の子プロセス生成・終了の検証**:
+親プロセス(`aruaru-server.exe`、port 6101)へ`CREATE TABLE gear`+
+2行`INSERT`後、`POST /admin/ephemeral-query`
+(`{tenant_id: "tenantA", tables: ["gear"], sql: "SELECT * FROM gear
+WHERE qty = '10'"}`)を実行し、**フィルタ条件に合う1行だけが正しく
+返る**ことを確認。同時に`Get-Process aruaru-server`のプロセス数を
+呼び出し前後で比較し、**子プロセスが実際に起動して応答後に終了して
+いる**(プロセス数が呼び出し前後で変化しない=常駐していない)ことを
+確認した。
+
+**実行した主要コマンド(すべて実行、生ログ・生JSON応答を確認)**:
+`cargo build -p aruaru-server`(3回、各修正後に再ビルド)、
+`cargo test --workspace`(全クレート、リグレッション無し確認)、
+自作PowerShellスクリプト2本(2プロセスRaft learner検証・ephemeral pod
+検証、いずれも一時データディレクトリで実行し検証後にプロセスを終了)。
+
+### 段階4: なお残る制約(正直な開示、誇張しない)
+
+1. **真の分散クラスタ(複数物理マシン)での検証は本環境では不可能**:
+   今回の検証は同一マシン上の複数プロセス・複数ポートに留まる
+   (`127.0.0.1`上の別ポート)。複数物理マシン・実ネットワーク越しの
+   レイテンシ・パーティション耐性は未検証。
+2. **openraft自体への統合は今回も行っていない**: `raft/mod.rs`が
+   計画として記す「本番のリーダー選挙・ハートビート・スナップショット・
+   ネットワークRPCをopenraftへ委譲する」は引き続き未着手——今回は
+   既存の自前実装Raft(`RaftNode`/`RaftDriver`/`HttpTransport`)の枠内で
+   learnerロールを実際に機能させた。
+3. **learnerの動的追加・削除(ConfChange)は無い**: 現状は起動時の
+   CLIフラグで役割・peer構成が固定される(TiKVの`AddLearner`/
+   `PromoteLearner`のような実行時のメンバーシップ変更は未実装)。
+4. **ephemeral SQL podは読み取り専用**: 子プロセスでの書き込みは
+   子プロセスのメモリ上でのみ完結し、親プロセスの永続状態(fjall)には
+   一切反映されない(意図的な制約、上記段階2参照)——真の
+   「テナントごとに独立した書き込み可能なephemeral計算単位」には
+   なっていない。
+5. **リソース制限は無い**: 子プロセスのCPU/メモリ/帯域をOSレベルで
+   制限する仕組み(cgroup、Windows Job Object)は実装していない。
+6. **learner対応のRequestVote拒否は明示していない**: `request_vote`
+   自体はlearnerでも技術的には呼べてしまう(driver.rs側がlearnerを
+   選挙に参加させない設計のため実害は無いが、`RaftNode::request_vote`
+   単体に「learnerは投票応答しない」という明示ガードは追加していない
+   ——次回、防御的に追加する余地がある)。
+
+### 次にすべきこと(次回候補)
+
+(1) `RaftNode::request_vote`にlearner向けの明示ガードを追加する
+(現状は`driver.rs`側の分岐だけに依存)、(2) learnerの動的追加・削除
+(ConfChange相当)、(3) ephemeral SQL podに書き込みの永続反映
+(fjallのファイルロック競合を避けるための設計、例えば書き込み結果を
+親プロセスへ返しRaft経由でコミットする、等)を持たせる、(4) 実際に
+openraftクレートへ統合する場合の移行計画の具体化。
