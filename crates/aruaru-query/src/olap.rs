@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, StringDictionaryBuilder,
+    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, StringDictionaryBuilder,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -42,35 +42,48 @@ use crate::engine::{QueryEngine, QueryResponse, Value};
 /// リティ(重複の多い)列でもメモリ上重複してコピーされていた——DataFusion
 /// 自体はDictionaryArrayをネイティブにサポートするにもかかわらず、
 /// `aruaru-query`側がそれを使っていなかったという実際のギャップ。
-/// Text列は`DataType::Dictionary(Int32, Utf8)`へ変更し、
-/// `StringDictionaryBuilder`で辞書エンコードして構築する。
-fn arrow_type(ty: &ColumnType) -> DataType {
-    match ty {
-        ColumnType::Int | ColumnType::BigInt => DataType::Int64,
-        ColumnType::Float => DataType::Float64,
-        ColumnType::Bool => DataType::Boolean,
-        // Text / Bytes / Timestamp は当面 Dictionary(Int32, Utf8) として
-        // 辞書エンコードする(タイムスタンプ解析は次段階)。
-        _ => DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-    }
-}
+///
+/// 【2026-08-21 実装方法の再調査で修正】DuckDB本家の実装方法(GitHub
+/// `duckdb/duckdb`の圧縮関連PR・公式ブログ`lightweight-compression`)を
+/// 調べ直した結果、DuckDBは**Text列に無条件で辞書エンコードを適用する
+/// のではなく、「analyzeフェーズ」でセグメントごとに複数の圧縮方式
+/// (定数・RLE・辞書・FSST・ビットパッキング等)を試算し、最も小さくなる
+/// ものを選ぶ**という設計だと判明した——当初の実装(常に辞書エンコード)
+/// はこの「最良の方式を選ぶ」という核心を反映しておらず、高カーディナリ
+/// ティ列(ほぼ全行が異なる値を持つ列、例: UUID列)では辞書エンコードは
+/// 逆に不利(辞書自体が行数分近く肥大化し、インデックス配列のオーバー
+/// ヘッドが上乗せされるだけ)になり得る。
+///
+/// 本実装はDuckDBの多数の圧縮アルゴリズムの完全な移植は行わない
+/// (正直な簡略化点、下記)が、**その中核判断だけ**——「セグメント
+/// (本実装ではテーブル全体のバッチ)を見て、辞書化が有利かどうかを
+/// 判定してから決める」——を再現する: ユニーク値の比率
+/// (`unique_count / total_non_null_count`)が閾値
+/// (`DICTIONARY_CARDINALITY_THRESHOLD`)未満のときのみ辞書エンコードし、
+/// そうでなければ従来のプレーンな`StringArray`(Utf8)を使う。
+const DICTIONARY_CARDINALITY_THRESHOLD: f64 = 0.7;
 
-/// 列の文字列値ベクタを Arrow 配列へ変換 (型に応じてパース)
-fn build_array(ty: &ColumnType, cells: Vec<Option<String>>) -> ArrayRef {
+/// 列の文字列値ベクタを Arrow 配列へ変換 (型に応じてパース)。
+/// Text/デフォルト分岐では、実データを見てから辞書エンコードするか
+/// (`DataType::Dictionary(Int32, Utf8)`)、プレーンな`Utf8`のままにするか
+/// を決めるため、`build_array`自身が実際に採用した`DataType`も返す
+/// (呼び出し側`build_table_batch`がこれをそのままスキーマのField型に使う
+/// ——スキーマとデータの型不一致を構造的に起こせないようにするため)。
+fn build_array(ty: &ColumnType, cells: Vec<Option<String>>) -> (DataType, ArrayRef) {
     match ty {
         ColumnType::Int | ColumnType::BigInt => {
             let v: Vec<Option<i64>> = cells
                 .into_iter()
                 .map(|c| c.and_then(|s| s.trim().parse::<i64>().ok()))
                 .collect();
-            Arc::new(Int64Array::from(v)) as ArrayRef
+            (DataType::Int64, Arc::new(Int64Array::from(v)) as ArrayRef)
         }
         ColumnType::Float => {
             let v: Vec<Option<f64>> = cells
                 .into_iter()
                 .map(|c| c.and_then(|s| s.trim().parse::<f64>().ok()))
                 .collect();
-            Arc::new(Float64Array::from(v)) as ArrayRef
+            (DataType::Float64, Arc::new(Float64Array::from(v)) as ArrayRef)
         }
         ColumnType::Bool => {
             let v: Vec<Option<bool>> = cells
@@ -83,23 +96,43 @@ fn build_array(ty: &ColumnType, cells: Vec<Option<String>>) -> ArrayRef {
                     })
                 })
                 .collect();
-            Arc::new(BooleanArray::from(v)) as ArrayRef
+            (DataType::Boolean, Arc::new(BooleanArray::from(v)) as ArrayRef)
         }
-        // DuckDB風の辞書エンコーディング(上記`arrow_type`のdocコメント参照)。
-        // 重複する文字列値は辞書へ1回だけ格納され、各セルは整数インデックス
-        // のみを保持する——低カーディナリティ列(例: `region`/`status`等)ほど
-        // 圧縮効果が大きい。
+        // Text / Bytes / Timestamp は当面ここで扱う(タイムスタンプ解析は次段階)。
         _ => {
-            let mut builder = StringDictionaryBuilder::<Int32Type>::new();
-            for cell in cells {
-                match cell {
-                    Some(s) => {
-                        let _ = builder.append(s.as_str());
+            // DuckDB風の「analyzeフェーズ」簡易版: 辞書化した場合に得か
+            // どうかを、実データのユニーク値比率から判定する。
+            let non_null: Vec<&str> = cells.iter().filter_map(|c| c.as_deref()).collect();
+            let unique_ratio = if non_null.is_empty() {
+                0.0
+            } else {
+                let unique: std::collections::HashSet<&str> = non_null.iter().copied().collect();
+                unique.len() as f64 / non_null.len() as f64
+            };
+
+            if unique_ratio < DICTIONARY_CARDINALITY_THRESHOLD {
+                // 低カーディナリティ: 辞書エンコードが有利(重複する文字列値は
+                // 辞書へ1回だけ格納され、各セルは整数インデックスのみを保持)。
+                let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+                for cell in cells {
+                    match cell {
+                        Some(s) => {
+                            let _ = builder.append(s.as_str());
+                        }
+                        None => builder.append_null(),
                     }
-                    None => builder.append_null(),
                 }
+                let dict_type =
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+                (dict_type, Arc::new(builder.finish()) as ArrayRef)
+            } else {
+                // 高カーディナリティ(例: UUID列): 辞書化すると辞書自体が
+                // 行数近くまで肥大化し、インデックス配列のオーバーヘッドが
+                // 純増するだけで不利——DuckDBのanalyzeフェーズが「圧縮しない
+                // (Constant/FSST等が効かない場合はそのまま保持)」を選ぶのと
+                // 同じ判断を、プレーンなUtf8配列で表現する。
+                (DataType::Utf8, Arc::new(StringArray::from(cells)) as ArrayRef)
             }
-            Arc::new(builder.finish()) as ArrayRef
         }
     }
 }
@@ -118,23 +151,21 @@ fn build_table_batch(
     columns: &[(String, ColumnType)],
     rows: &[Vec<String>],
 ) -> Result<(Arc<Schema>, RecordBatch), String> {
-    let fields: Vec<Field> = columns
-        .iter()
-        .map(|(cname, cty)| Field::new(cname, arrow_type(cty), true))
-        .collect();
+    // build_arrayが実際に採用した型(辞書化するか否かはデータを見てから
+    // 決まる、上記docコメント参照)をそのままField型として使うことで、
+    // スキーマとデータの型不一致を構造的に起こせないようにする。
+    let mut fields: Vec<Field> = Vec::with_capacity(columns.len());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
+    for (ci, (cname, cty)) in columns.iter().enumerate() {
+        let cells: Vec<Option<String>> = rows
+            .iter()
+            .map(|r| r.get(ci).cloned().filter(|s| !s.is_empty()))
+            .collect();
+        let (data_type, array) = build_array(cty, cells);
+        fields.push(Field::new(cname, data_type, true));
+        arrays.push(array);
+    }
     let schema = Arc::new(Schema::new(fields));
-
-    let arrays: Vec<ArrayRef> = columns
-        .iter()
-        .enumerate()
-        .map(|(ci, (_, cty))| {
-            let cells: Vec<Option<String>> = rows
-                .iter()
-                .map(|r| r.get(ci).cloned().filter(|s| !s.is_empty()))
-                .collect();
-            build_array(cty, cells)
-        })
-        .collect();
 
     let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(|e| e.to_string())?;
     Ok((schema, batch))
@@ -760,6 +791,46 @@ mod tests {
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0][1], Value::Text("500".into())); // east: 50件 x 10
             assert_eq!(rows[1][1], Value::Text("500".into())); // west: 50件 x 10
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    /// 【2026-08-21 DuckDB本家の実装方法(analyzeフェーズ)再調査で追加】
+    /// 高カーディナリティ列(ほぼ全行がユニークな値を持つ、UUID列を模した
+    /// もの)は辞書エンコードされず、プレーンな`Utf8`のままであることを
+    /// 検証する——DuckDBが「セグメントを見てから最良の圧縮方式を選ぶ」
+    /// (辞書化が不利なら辞書化しない)のと同じ判断を、簡易版
+    /// (ユニーク比率閾値)で再現できていることの直接証拠。あわせて、
+    /// 辞書化されなくても集計結果自体は正しいことも確認する。
+    #[tokio::test]
+    async fn high_cardinality_text_columns_skip_dictionary_encoding() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE events (id INT, uuid TEXT, amount INT)").unwrap();
+        for i in 0..100 {
+            // 全行が異なる値を持つ列(UUID列を模した高カーディナリティ)。
+            eng.execute(&format!(
+                "INSERT INTO events (id, uuid, amount) VALUES ({i}, 'uuid-{i}', 1)"
+            ))
+            .unwrap();
+        }
+
+        let cache = OlapCache::new();
+        cache.refresh(&eng).unwrap();
+        let tables = cache.tables.read();
+        let entry = tables.get("events").unwrap();
+        let uuid_field = entry.schema.field_with_name("uuid").unwrap();
+        assert_eq!(
+            uuid_field.data_type(),
+            &DataType::Utf8,
+            "high-cardinality column should stay plain Utf8, not be dictionary-encoded: {:?}",
+            uuid_field.data_type()
+        );
+        drop(tables);
+
+        let resp = cache.query(&eng, "SELECT COUNT(*) AS n FROM events").await.unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows[0][0], Value::Text("100".into()));
         } else {
             panic!("expected rows");
         }

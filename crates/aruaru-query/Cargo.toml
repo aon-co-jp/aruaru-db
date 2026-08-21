@@ -15,10 +15,9 @@ anyhow.workspace     = true
 thiserror.workspace  = true
 tracing.workspace    = true
 sqlparser.workspace  = true
-# ScyllaDB shard-per-core方式のtoken-aware routing簡略版に使うハッシュ
-# (aruaru-core::storageのZFS互換チェックサムと同じSHA-256、新規アルゴリズム
-# を増やさない意図)
-sha2.workspace       = true
+# ScyllaDB本家の実装方法(Murmur3、暗号学的ハッシュではない)を2026-08-21に
+# 再調査した結果、sha2依存は不要と判明(shard_forをmurmur3_32自前実装へ
+# 差し替え済み、sharded_store.rs参照)。ここに残していたsha2依存は削除した。
 # DuckDB風zone map(min/max block pruning)の簡易WHERE句抽出に使う
 # (2026-08-21、DuckDB再調査で追加)
 regex.workspace       = true

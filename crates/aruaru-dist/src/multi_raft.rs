@@ -30,6 +30,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::closed_ts::{ClosedTimestampCoordinator, ReadPlan, Timestamp};
 use crate::raft::command::Command;
 use crate::raft::node::{Applier, RaftNode};
 use crate::shard::ClusterTopology;
@@ -39,6 +40,12 @@ pub struct MultiRaftCluster<A: Applier> {
     local_node_id: u64,
     topology: RwLock<ClusterTopology>,
     groups: RwLock<HashMap<u64, Arc<RaftNode<A>>>>,
+    /// 【2026-08-21新設】Range単位のclosed timestamp
+    /// (CockroachDBのleaseholder側closed timestamp、TiKVのresolved-ts相当)。
+    /// `propose_at`/`commit_and_apply_at`が進行中書き込みを登録・解除し、
+    /// `advance_closed_timestamps`が前進させる。詳細は
+    /// [`crate::closed_ts`]のモジュールdoc参照。
+    closed_ts: Arc<ClosedTimestampCoordinator>,
 }
 
 impl<A: Applier> MultiRaftCluster<A> {
@@ -51,7 +58,89 @@ impl<A: Applier> MultiRaftCluster<A> {
         let group = Arc::new(RaftNode::new(local_node_id, initial_applier, vec![]));
         group.become_leader();
         groups.insert(1, group);
-        Self { local_node_id, topology: RwLock::new(topology), groups: RwLock::new(groups) }
+        let closed_ts = Arc::new(ClosedTimestampCoordinator::with_default_lag());
+        closed_ts.register_range(1);
+        Self {
+            local_node_id,
+            topology: RwLock::new(topology),
+            groups: RwLock::new(groups),
+            closed_ts,
+        }
+    }
+
+    /// Range単位のclosed timestampコーディネータ。leaseholder側の前進
+    /// (`advance_closed_timestamps`)と、follower/読み取り専用計算ノードへの
+    /// side transport配布(`ClosedTimestampCoordinator::publish_to`)の
+    /// 両方に使う。
+    pub fn closed_timestamps(&self) -> Arc<ClosedTimestampCoordinator> {
+        self.closed_ts.clone()
+    }
+
+    /// 全Rangeのclosed timestampを`now - target_lag`まで前進させる。
+    /// 戻り値は`(range_id, closed_ts)`のrange_id昇順リスト。
+    pub fn advance_closed_timestamps(&self, now: Timestamp) -> Vec<(u64, Timestamp)> {
+        self.closed_ts.advance_all(now)
+    }
+
+    /// タイムスタンプ付きの提案。担当Rangeのclosed timestampが
+    /// この書き込み時刻を跨がないよう「進行中書き込み」として登録してから
+    /// 提案する(登録解除は`commit_and_apply_at`)。
+    pub fn propose_at(
+        &self,
+        key: &[u8],
+        command: &Command,
+        write_ts: Timestamp,
+    ) -> Result<(u64, u64), String> {
+        let (range_id, index) = self.propose(key, command)?;
+        if let Some(t) = self.closed_ts.tracker(range_id) {
+            t.begin_write(write_ts);
+        }
+        Ok((range_id, index))
+    }
+
+    /// `propose_at`で登録した書き込みを確定させる(commit+apply後に
+    /// 進行中書き込みから外す → 以降closed timestampがこの時刻を
+    /// 越えて前進できるようになる)。
+    pub fn commit_and_apply_at(
+        &self,
+        range_id: u64,
+        index: u64,
+        write_ts: Timestamp,
+    ) -> Option<usize> {
+        let applied = self.commit_and_apply(range_id, index);
+        if let Some(t) = self.closed_ts.tracker(range_id) {
+            t.end_write(write_ts);
+        }
+        applied
+    }
+
+    /// 複数キーを読むクエリについて、follower(または読み取り専用の
+    /// ephemeral計算ノード)がそのまま応答してよいか、leaseholderへ
+    /// ルーティングすべきかを判定する(bounded staleness交渉)。
+    pub fn plan_bounded_staleness_read(
+        &self,
+        keys: &[&[u8]],
+        now: Timestamp,
+        max_staleness_nanos: u64,
+    ) -> ReadPlan {
+        let mut range_ids = Vec::new();
+        {
+            let topology = self.topology.read();
+            for k in keys {
+                match topology.find_range(k) {
+                    Some(r) => {
+                        if !range_ids.contains(&r.range_id) {
+                            range_ids.push(r.range_id);
+                        }
+                    }
+                    None => {
+                        return ReadPlan::RouteToLeaseholder { reason: "no range covers this key" }
+                    }
+                }
+            }
+        }
+        self.closed_ts
+            .negotiate_bounded_staleness(&range_ids, now, max_staleness_nanos)
     }
 
     pub fn range_count(&self) -> usize {
@@ -113,6 +202,8 @@ impl<A: Applier> MultiRaftCluster<A> {
         let new_group = Arc::new(RaftNode::new(self.local_node_id, new_group_applier, vec![]));
         new_group.become_leader();
         self.groups.write().insert(new_id, new_group);
+        // 分割で生まれたRangeも独自のclosed timestampを持つ
+        self.closed_ts.register_range(new_id);
         Some(new_id)
     }
 
@@ -132,6 +223,7 @@ impl<A: Applier> MultiRaftCluster<A> {
         let merged_id = self.topology.write().merge_ranges(range_a, range_b)?;
         let removed_id = if merged_id == range_a { range_b } else { range_a };
         self.groups.write().remove(&removed_id);
+        self.closed_ts.forget_range(removed_id);
         Some(merged_id)
     }
 
@@ -278,6 +370,74 @@ mod tests {
         assert_eq!(ids, vec![1, range2, range3]);
         let values: Vec<u64> = gathered.iter().map(|(_, v)| *v).collect();
         assert_eq!(values, vec![2, 1, 0], "range1=2件, range2=1件, range3=0件のcommit_indexがそれぞれ独立に反映される");
+    }
+
+    /// 【2026-08-21新設・closed timestamp / follower read】
+    /// 進行中の書き込みがあるRangeはclosed timestampがその時刻を跨げず、
+    /// そのRangeを含むクエリはleaseholderへルーティングされる。書き込みが
+    /// 確定すると同じクエリがfollower readとして許可される。
+    #[test]
+    fn in_flight_write_blocks_follower_read_until_it_commits() {
+        const SEC: u64 = 1_000_000_000;
+        let cluster = MultiRaftCluster::single_node(1, "n1", RecordingApplier::default());
+        let range2 = cluster.split(1, b"m".to_vec(), RecordingApplier::default()).unwrap();
+        // 分割で生まれたRangeもclosed timestampの管理対象になっている
+        assert_eq!(cluster.closed_timestamps().range_ids(), vec![1, range2]);
+
+        // range1(キー"a")へ 5秒時点の書き込みを開始(未コミット)
+        let (rid, idx) = cluster
+            .propose_at(b"a", &Command::Exec("INSERT a1".into()), 5 * SEC)
+            .unwrap();
+        assert_eq!(rid, 1);
+        cluster.advance_closed_timestamps(10 * SEC);
+
+        // range2 は書き込みが無いので 7秒まで閉じている -> follower readできる
+        let plan = cluster.plan_bounded_staleness_read(&[b"z"], 10 * SEC, 30 * SEC);
+        assert_eq!(plan.timestamp(), Some(7 * SEC));
+
+        // range1 は 5秒の書き込みが進行中 -> closed は 5秒未満に留まる
+        let plan = cluster.plan_bounded_staleness_read(&[b"a"], 10 * SEC, 30 * SEC);
+        assert_eq!(plan.timestamp(), Some(5 * SEC - 1));
+        // 両Rangeを跨ぐクエリは最小値(=range1側)が採用される
+        let plan = cluster.plan_bounded_staleness_read(&[b"a", b"z"], 10 * SEC, 30 * SEC);
+        assert_eq!(plan.timestamp(), Some(5 * SEC - 1));
+        // 陳腐化上限を厳しくすると leaseholder へフォールバックする
+        assert!(matches!(
+            cluster.plan_bounded_staleness_read(&[b"a"], 10 * SEC, 1 * SEC),
+            ReadPlan::RouteToLeaseholder { .. }
+        ));
+
+        // 書き込みを確定させると range1 も 7秒まで閉じられる
+        cluster.commit_and_apply_at(rid, idx, 5 * SEC);
+        cluster.advance_closed_timestamps(10 * SEC);
+        let plan = cluster.plan_bounded_staleness_read(&[b"a", b"z"], 10 * SEC, 30 * SEC);
+        assert_eq!(
+            plan,
+            ReadPlan::FollowerRead { timestamp: 7 * SEC, staleness_nanos: 3 * SEC }
+        );
+    }
+
+    /// side transport: leaseholder 側クラスタのclosed timestampが、
+    /// 読み取り専用の別コーディネータ(follower / ephemeral計算ノード相当)へ
+    /// 配布され、そちら側だけで follower read の可否を判定できる。
+    #[test]
+    fn closed_timestamps_reach_a_read_only_replica_via_side_transport() {
+        const SEC: u64 = 1_000_000_000;
+        let cluster = MultiRaftCluster::single_node(1, "n1", RecordingApplier::default());
+        cluster.advance_closed_timestamps(10 * SEC);
+
+        let read_only = crate::closed_ts::ClosedTimestampCoordinator::with_default_lag();
+        // 配布前: Rangeを知らないので leaseholder へ回すしかない
+        assert!(matches!(
+            read_only.negotiate_bounded_staleness(&[1], 10 * SEC, 30 * SEC),
+            ReadPlan::RouteToLeaseholder { .. }
+        ));
+        assert_eq!(cluster.closed_timestamps().publish_to(&read_only), 1);
+        // 配布後: 自力で follower read の時刻を決められる
+        assert_eq!(
+            read_only.negotiate_bounded_staleness(&[1], 10 * SEC, 30 * SEC).timestamp(),
+            Some(7 * SEC)
+        );
     }
 
     #[test]
