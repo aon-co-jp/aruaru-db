@@ -340,3 +340,21 @@ path依存を再利用し、独自クレートの書き込みコマンド型(こ
 に相当するジェネリックな書き込みラッパーがあれば、同じ
 「Option型フィールド+quorum失敗パスでのみfire-and-forget呼び出し」
 というパターンをそのまま踏襲できる。
+
+## Closed Timestamp / Follower Read の移植メモ(2026-08-21追記)
+
+`aruaru-dist/src/closed_ts.rs`(新設)は、CockroachDBのclosed timestamp・
+TiKVのsafe-ts・YugabyteDBの`yb_follower_read_staleness_ms`に相当する
+「リーダー以外のレプリカが自力で読み取ってよい時刻の上限」を管理する
+**外部依存ゼロ・Raft実装非依存**のモジュール。時刻は呼び出し側が渡す
+論理ナノ秒(`Timestamp = u64`)で、HLCやクロックスキュー上限は扱わない。
+そのため他プロジェクトへ移植する際は、`RaftNode`相当の実装を持ち込む
+必要はなく、`ClosedTimestampCoordinator`単体を持っていけば
+「read_ts <= closed_ts なら読み取り専用ノードで応答してよい」という
+安全性ゲートだけを再利用できる。`MultiRaftCluster`との配線
+(`propose_at`/`commit_and_apply_at`/`plan_bounded_staleness_read`)は
+本リポジトリ固有の薄い接続層であり、移植時は書き込み開始・完了の
+2点にフックを入れる形へ読み替えること。
+
+`aruaru-migrate`側については今回新たな発見はない(移行アダプタの
+インタフェースは変更していない)。

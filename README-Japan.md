@@ -217,6 +217,40 @@ REST `/admin/cluster/propose`の迂回を発見・修正。GraphQL側の
 
 ---
 
+## 🕒 Closed Timestamp / Follower Read (2026-08-21 追加)
+
+「CockroachDB の Raft 強整合」と「Snowflake のストレージ/コンピュート分離」を
+実際に両立させている共通の要素技術として、*読み取りをリーダー
+(leaseholder)以外のレプリカへ逃がす仕組み* が CockroachDB(closed
+timestamp)・TiKV/TiDB(safe-ts による Stale Read)・YugabyteDB
+(`yb_follower_read_staleness_ms` による bounded staleness)のいずれにも
+存在することを調査で確認しました。aruaru-db にはこの概念が**一切
+存在しなかった**(コードを grep して裏取り済み)ため、
+`crates/aruaru-dist/src/closed_ts.rs` として実装しました。
+
+- Range 単位の closed timestamp を `now - target_lag`(既定3秒)まで前進。
+  ただし**進行中の書き込みの最小時刻を跨がない**(跨ぐと保証が破れる)。
+- side transport 相当の配布(`publish_to`)で、読み取り専用ノード側の
+  コーディネータへ closed timestamp を伝搬(冪等)。
+- bounded staleness 交渉: 関与する全 Range の closed timestamp の最小値を
+  読み取り時刻に採用。上限超過・未前進・未知 Range は leaseholder へ
+  フォールバック(`ReadPlan::RouteToLeaseholder`)。
+- `MultiRaftCluster::propose_at` / `commit_and_apply_at` /
+  `plan_bounded_staleness_read` として Multi-Raft へ配線済み。
+
+**正直な現状**: 実装・検証は `cargo test -p aruaru-dist`(50 passed /
+0 failed)・`cargo test --workspace`(全て ok)までで、(1) 管理REST API への
+公開と実プロセスでの E2E 確認、(2) side transport のネットワーク越し配線、
+(3) 判定結果を既存の `AS OF COMMIT` 読み取り経路へ橋渡しすること、の3点は
+**未実施**です。また時刻は呼び出し側が渡す論理ナノ秒で、HLC・クロック
+スキュー上限は扱いません。次回調査・開発の目星(Neon の pageserver/
+safekeeper 分離、SingleStore の rowstore/columnstore 同居、Databend/
+RisingWave のオブジェクトストレージ直結、CockroachDB/TiDB Serverless の
+弾力的コンピュート)は [CLAUDE.md](CLAUDE.md) の HANDOFF 節に整理して
+あります。
+
+---
+
 ## 📄 ライセンス
 
 Apache License 2.0 — 商用利用・改変・再配布すべて自由。  
