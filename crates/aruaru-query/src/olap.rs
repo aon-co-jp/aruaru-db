@@ -316,6 +316,65 @@ impl Default for OlapCache {
     }
 }
 
+impl OlapCache {
+    /// TiFlash Raft learner方式への接近(2026-08-21新設)。日英中の
+    /// Web調査(`docs.pingcap.com/tidbcloud/tiflash-overview`、
+    /// `github.com/pingcap/tiflash`のdesign doc、`tikv.github.io/doc/
+    /// raftstore`)によれば、TiFlashは「Raftのlearnerとして複製ログを
+    /// **非同期に購読**し、変更があった時だけ列ストアへ反映する」
+    /// プッシュ型の構成である。従来の`query()`(`refresh()`をクエリの
+    /// たびに同期的に呼ぶ)は、クエリが来るまでキャッシュが更新されない
+    /// **プル型**であり、非同期購読という核心の向きが逆だった
+    /// (`CLAUDE.md`のHANDOFFに正直に記録済みのギャップ)。
+    ///
+    /// `subscribe`は`engine`に`QueryEngine::set_olap_notifier`で
+    /// `tokio::sync::mpsc`の送信側を登録し、受信側をバックグラウンド
+    /// タスクとして`tokio::spawn`する。以後、`persist_row`等で変更が
+    /// あるたびに(クエリが来るのを待たず)そのテーブルだけを非同期に
+    /// 再構築し、次回のクエリはキャッシュ済みの新しい状態を即座に読む。
+    ///
+    /// **正直な開示・スコープの限界**: (1) これは真のRaft learner
+    /// (別ノードとしてRaft複製ログのコンセンサスへ参加し、ネットワーク
+    /// 越しにログエントリを受信する)ではない——`tokio::mpsc`は同一
+    /// プロセス内のチャネルであり、`aruaru-dist`のRaft複製ログを経由
+    /// していない。単一プロセス前提の近似であることを`olap_notify`の
+    /// docコメントと合わせて明記する。(2) 通知チャネル経由の更新は
+    /// あくまで「先回りしてキャッシュを温める」ための補助経路であり、
+    /// 正しさの最終的な根拠は引き続き`query()`内の`refresh()`
+    /// (クエリ実行時の同期ポーリング、ダーティ集合の再確認)にある
+    /// ——`subscribe`を呼ばなくても`query()`は従来通り正しく動作する。
+    /// (3) 返す`JoinHandle`をdropしてもタスク自体はデタッチされ動作を
+    /// 続ける(通常のtokioの挙動)。呼び出し元が明示的に停止したい場合は
+    /// 返り値の`abort()`を呼ぶこと。
+    pub fn subscribe(self: Arc<Self>, engine: Arc<QueryEngine>) -> tokio::task::JoinHandle<()> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        engine.set_olap_notifier(tx);
+        tokio::spawn(async move {
+            while let Some(table) = rx.recv().await {
+                if let Err(e) = self.refresh_one(&engine, &table) {
+                    tracing::warn!(table = %table, error = %e, "olap async subscriber: eager refresh failed (will retry on next query via sync poll)");
+                }
+            }
+        })
+    }
+
+    /// `refresh()`のうち1テーブルだけを対象にした版(非同期購読タスクが
+    /// 通知を受けた直後、そのテーブルだけを先回りして再構築するために使う)。
+    /// `query()`側の`refresh()`(全テーブル走査)とロジックを共有するため、
+    /// 内部的には同じ`rebuild_full`/`rebuild_incremental`を呼ぶ。
+    fn refresh_one(&self, engine: &QueryEngine, name: &str) -> Result<(), String> {
+        let needs_full_rebuild = engine.is_olap_schema_dirty(name) || !self.contains(name);
+        if needs_full_rebuild {
+            return self.rebuild_full(engine, name);
+        }
+        let delta_pks = engine.take_olap_delta_pks(name);
+        if delta_pks.is_empty() {
+            return Ok(());
+        }
+        self.rebuild_incremental(engine, name, delta_pks)
+    }
+}
+
 /// Arrow DataType → catalog::ColumnType(逆変換、デルタ行の再構築時に
 /// 元の列型へ揃えるために使う。`arrow_type`の対になる関数)。
 fn arrow_type_to_column_type(ty: &DataType) -> ColumnType {
@@ -450,5 +509,52 @@ mod tests {
         } else {
             panic!("expected rows");
         }
+    }
+
+    /// **TiFlash learner風の非同期購読(2026-08-21新設)の核心特性**:
+    /// `OlapCache::subscribe`を呼んだ後、`query()`を一度も呼んでいない
+    /// 段階でも、書き込み(`INSERT`)の直後にバックグラウンドタスクが
+    /// 自律的にキャッシュを温めていることを実証する
+    /// (`cached_table_count()`が、クエリを介さずに増えることが直接の
+    /// 証拠——従来の同期ポーリング経路〈`query()`内の`refresh()`〉
+    /// だけなら、最初の`query()`呼び出しまでキャッシュは空のままのはず)。
+    #[tokio::test]
+    async fn olap_cache_async_subscriber_eagerly_warms_cache_without_a_query() {
+        let eng = Arc::new(QueryEngine::new());
+        let cache = Arc::new(OlapCache::new());
+
+        assert_eq!(cache.cached_table_count(), 0, "no query yet, cache must start empty");
+
+        let handle = cache.clone().subscribe(eng.clone());
+
+        eng.execute("CREATE TABLE events (id INT, kind TEXT)").unwrap();
+        eng.execute("INSERT INTO events (id, kind) VALUES (1, 'click')").unwrap();
+
+        // 非同期購読タスクが通知を処理するのを少し待つ(バックグラウンド
+        // tokioタスクのスケジューリングを待つ、テストとしての現実的な
+        // 妥協——本番運用では待つ必要は無く「先回りできていれば速い、
+        // 間に合わなくても次のquery()が同期ポーリングで必ず正しく補う」
+        // 設計であることをdocコメントに明記済み)。
+        let mut warmed = false;
+        for _ in 0..50 {
+            if cache.contains("events") {
+                warmed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(warmed, "async subscriber must warm the 'events' cache entry without any query() call");
+
+        // 先回りされたキャッシュが実際に正しいデータを持つことも、
+        // 通常のqueryパス経由で確認する(refresh()はデルタが空なら
+        // 行ストアに触れず、既に温められた値をそのまま使うはず)。
+        let resp = cache.query(&eng, "SELECT COUNT(*) AS n FROM events").await.unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows[0][0], Value::Text("1".into()));
+        } else {
+            panic!("expected rows");
+        }
+
+        handle.abort();
     }
 }

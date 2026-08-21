@@ -19,6 +19,7 @@ sqlparser.workspace  = true
 # OLAP 実行エンジン (HTAP の OLAP 側)
 datafusion.workspace = true
 arrow.workspace      = true
+tokio.workspace       = true
 
 [dev-dependencies]
 tokio.workspace = true

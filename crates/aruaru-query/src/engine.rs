@@ -123,6 +123,30 @@ pub struct QueryEngine {
     /// 変わるため、行単位のデルタマージでは対応できず、`OlapCache`側で
     /// 全体再構築(ベースの作り直し)が必要なテーブル名の集合。
     olap_schema_dirty: RwLock<std::collections::HashSet<String>>,
+    /// **TiFlash Raft learner方式への接近(2026-08-21追記)**: 日英中で
+    /// `raftstore-proxy`/TiFlashの設計を再調査した結果
+    /// (`docs.pingcap.com/tidbcloud/tiflash-overview`、
+    /// `github.com/pingcap/tiflash`のdesign doc)、TiFlashは
+    /// 「Raftのlearnerロールとして複製ログを非同期に購読し、変更が
+    /// あった時だけ列ストアへ反映する」という**プッシュ型**の構成で
+    /// あり、`OlapCache::refresh()`が従来行っていた「クエリ実行の
+    /// たびにダーティフラグを同期的に読みにいく」という**プル型
+    /// (ポーリング的)**とは非同期性の向きが逆だった——この一致度の
+    /// ギャップは`CLAUDE.md`のHANDOFFに正直に記録済み。
+    ///
+    /// 真のRaft learner(別ノードとしてRaft複製ログへ参加する)化は
+    /// `aruaru-dist`のopenraft統合完了を要する大規模な再設計のため
+    /// 見送るが、「単一プロセス内で、変更イベントを非同期チャネル
+    /// (`tokio::sync::mpsc`)で購読し、購読側が変更があった時だけ
+    /// 非同期にキャッシュを更新する」という構造は、Raftログへの
+    /// 依存無しに単一プロセス内でも再現できる。これがTiFlashの核心
+    /// (「フルスキャンではなく、変更の通知を受けて追従する」)を保った
+    /// 現実的な近似——`olap_notify`はこの通知チャネルの送信側。
+    /// 未登録時(`None`)は何もしない(既存の同期ポーリング経路
+    /// `OlapCache::refresh`は本フィールドの有無によらず変わらず動作し、
+    /// 後方互換性を保つ——プッシュ通知はあくまで「早く追従できる」
+    /// 追加の経路であり、正しさの根拠は引き続きポーリング側にある)。
+    olap_notify: RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
 }
 
 impl QueryEngine {
@@ -137,6 +161,7 @@ impl QueryEngine {
             dirty: RwLock::new(std::collections::BTreeSet::new()),
             olap_delta_pks: RwLock::new(std::collections::HashMap::new()),
             olap_schema_dirty: RwLock::new(std::collections::HashSet::new()),
+            olap_notify: RwLock::new(None),
         }
     }
 
@@ -152,6 +177,29 @@ impl QueryEngine {
             dirty: RwLock::new(std::collections::BTreeSet::new()),
             olap_delta_pks: RwLock::new(std::collections::HashMap::new()),
             olap_schema_dirty: RwLock::new(std::collections::HashSet::new()),
+            olap_notify: RwLock::new(None),
+        }
+    }
+
+    /// TiFlash learner風の非同期購読チャネルの送信側を登録する
+    /// (`OlapCache::subscribe`から呼ばれる)。登録すると、以後
+    /// `persist_row`/`persist_delete`/`persist_schema`/`persist_drop`の
+    /// たびに変更のあったテーブル名がこのチャネルへ非ブロッキングで
+    /// 送られる(`send`はチャネルバッファへ積むだけの同期操作、await不要
+    /// ——`UnboundedSender`のため`commit_txn`等の同期経路からも安全に
+    /// 呼べる)。受信側が無い(`OlapCache::subscribe`を呼んでいない)場合は
+    /// `None`のままで、既存の同期ポーリング経路のみが使われる。
+    pub fn set_olap_notifier(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        *self.olap_notify.write() = Some(tx);
+    }
+
+    /// 変更のあったテーブル名を購読チャネルへ通知する(登録されていれば)。
+    /// 送信失敗(受信側が既にdropされている等)は無視する——通知はあくまで
+    /// 「早く追従できる」ための補助経路であり、失敗してもクエリ実行時の
+    /// 同期ポーリング(`OlapCache::refresh`)が正しさを保証する。
+    fn notify_olap_change(&self, table: &str) {
+        if let Some(tx) = self.olap_notify.read().as_ref() {
+            let _ = tx.send(table.to_string());
         }
     }
 
@@ -555,6 +603,60 @@ impl QueryEngine {
     /// SQL を実行
     pub fn execute(&self, sql: &str) -> Result<QueryResponse, String> {
         let stmt = parser::parse(sql)?;
+        self.execute_stmt(stmt)
+    }
+
+    /// **軽量マルチテナント分離(2026-08-21新設)**: CockroachDB Serverless
+    /// のマルチテナント方式を日英で再調査した結果
+    /// (`github.com/cockroachdb/cockroach` issue #48119、
+    /// `cockroachlabs.atlassian.net`のCluster virtualizationドキュメント、
+    /// `andrewdeally.medium.com`のTenant Isolation解説)、CockroachDBは
+    /// 「SQLレイヤーが生成するキーの先頭にテナントIDを付与する」
+    /// (`/<tenant-id>/<table-id>/<index-id>/<key>`、単一テナント構成の
+    /// `/<table-id>/<index-id>/<key>`と対比)という、**キー空間の
+    /// プレフィックス分離**でストレージ層のテナント分離を実現している
+    /// ことを確認した——これはコンテナ/プロセスレベルでのSQL pod分離
+    /// (テナントごとのephemeral SQL処理プロセス、Kubernetes pod)とは
+    /// **別の軸**であり、後者(計算資源の分離)は単一プロセスの
+    /// `aruaru-server`では実現不可能だが、前者(データの論理分離)は
+    /// 単一プロセス内でも忠実に再現できると判断し、今回実装した。
+    ///
+    /// 実装方式: SQL文をパースした後、`table`フィールドを持つ文
+    /// (CREATE/INSERT/UPSERT/SELECT/DELETE/UPDATE/DROP TABLE/
+    /// `AS OF COMMIT`)に限り、内部的なテーブル識別子の先頭に
+    /// `"__tenant_{tenant_id}__"`を付与してから既存のハンドラへ渡す。
+    /// これにより、テーブルデータ(`self.tables`)・Prolly Treeの
+    /// スナップショットキー(`table\0pk`、`snapshot_root`/`select_as_of`
+    /// が使う形式)・`OlapCache`の列キャッシュエントリ名など、テーブル名を
+    /// キーとして使う既存の全ての仕組みが、変更無しに自動でテナント単位に
+    /// 分離される(CockroachDBの「SQL層が生成するキーの先頭にテナントIDを
+    /// 付与する」という設計と同じ効果を、テーブル識別子への前置という
+    /// 形で得ている)。呼び出し元がテナントIDを渡さない`execute()`は
+    /// 従来通りプレフィックス無し(デフォルト名前空間)で動作し、
+    /// 完全に後方互換。
+    ///
+    /// **正直な開示・スコープの限界**: (1) CockroachDB Serverlessの核心
+    /// であるテナントごとのephemeral SQL pod(計算資源そのものの分離、
+    /// CPU/メモリ/ネットワーク帯域のcgroup制限)は実装していない
+    /// ——単一プロセス内の論理的なキー空間分離のみ。(2)
+    /// `AruaruFn`(`aruaru_branch`/`aruaru_checkout`/`aruaru_commit`/
+    /// `aruaru_merge`)・`AruaruLog`・`BEGIN`/`COMMIT`/`ROLLBACK`は
+    /// テーブル単位ではなくエンジン全体に及ぶ操作のため、今回は
+    /// テナントスコープの対象外(エンジン全体で共有されるコミット
+    /// グラフ・トランザクション状態のまま)——将来、テナントごとに
+    /// 独立したコミット履歴が必要になった場合は別途大規模な設計変更を要する。
+    /// (3) テナントIDの文字列自体はテーブル名へ埋め込まれるため、
+    /// アンダースコア2連続を含む等の細工されたテナントIDで他テナントの
+    /// 名前空間に衝突させる入力は検証していない(呼び出し元
+    /// (`aruaru-server`の接続認証層)が正当なテナントIDのみを渡す
+    /// ことを前提とする)。
+    pub fn execute_as_tenant(&self, sql: &str, tenant_id: &str) -> Result<QueryResponse, String> {
+        let stmt = parser::parse(sql)?;
+        let stmt = namespace_statement_for_tenant(stmt, tenant_id);
+        self.execute_stmt(stmt)
+    }
+
+    fn execute_stmt(&self, stmt: Statement) -> Result<QueryResponse, String> {
         match stmt {
             Statement::CreateTable { table, columns } => self.create_table(table, columns),
             Statement::Insert {
@@ -677,10 +779,12 @@ impl QueryEngine {
     fn persist_row(&self, table: &str, pk: &[u8], row: &[String]) -> Result<(), String> {
         self.dirty.write().insert((table.to_string(), pk.to_vec()));
         self.olap_delta_pks.write().entry(table.to_string()).or_default().insert(pk.to_vec());
+        self.notify_olap_change(table);
         self.record_or_apply(PersistOp::Row(table.to_string(), pk.to_vec(), row.to_vec()))
     }
     fn persist_delete(&self, table: &str, pk: &[u8]) -> Result<(), String> {
         self.olap_delta_pks.write().entry(table.to_string()).or_default().insert(pk.to_vec());
+        self.notify_olap_change(table);
         self.record_or_apply(PersistOp::Del(table.to_string(), pk.to_vec()))
     }
     fn persist_schema(&self, table: &str, cols: &[(String, ColumnType)]) -> Result<(), String> {
@@ -688,11 +792,13 @@ impl QueryEngine {
         // (以前の値の型/列数がもう合わない可能性がある) —— 全体再構築へ。
         self.olap_delta_pks.write().remove(table);
         self.olap_schema_dirty.write().insert(table.to_string());
+        self.notify_olap_change(table);
         self.record_or_apply(PersistOp::Schema(table.to_string(), cols.to_vec()))
     }
     fn persist_drop(&self, table: &str) -> Result<(), String> {
         self.olap_delta_pks.write().remove(table);
         self.olap_schema_dirty.write().insert(table.to_string());
+        self.notify_olap_change(table);
         self.record_or_apply(PersistOp::Drop(table.to_string()))
     }
 
@@ -1394,6 +1500,46 @@ impl Default for QueryEngine {
     }
 }
 
+/// テナントIDをテーブル識別子の先頭へ前置する(CockroachDB Serverless
+/// のキー空間プレフィックス分離を模した軽量マルチテナント分離、
+/// `QueryEngine::execute_as_tenant`のdocコメント参照)。テーブル
+/// フィールドを持たない文(`AruaruFn`/`AruaruLog`/`Begin`/`TxnCommit`/
+/// `Rollback`)はそのまま素通しする(エンジン全体で共有、テナント
+/// スコープの対象外——同ドキュメントの「正直な開示」参照)。
+fn namespace_statement_for_tenant(stmt: Statement, tenant_id: &str) -> Statement {
+    fn ns(table: String, tenant_id: &str) -> String {
+        format!("__tenant_{tenant_id}__{table}")
+    }
+    match stmt {
+        Statement::CreateTable { table, columns } => Statement::CreateTable { table: ns(table, tenant_id), columns },
+        Statement::Insert { table, columns, values } => {
+            Statement::Insert { table: ns(table, tenant_id), columns, values }
+        }
+        Statement::Upsert { table, columns, values, conflict_column, action } => Statement::Upsert {
+            table: ns(table, tenant_id),
+            columns,
+            values,
+            conflict_column,
+            action,
+        },
+        Statement::Select { table, columns, filter } => {
+            Statement::Select { table: ns(table, tenant_id), columns, filter }
+        }
+        Statement::Delete { table, filter } => Statement::Delete { table: ns(table, tenant_id), filter },
+        Statement::Update { table, set, filter } => Statement::Update { table: ns(table, tenant_id), set, filter },
+        Statement::DropTable { table } => Statement::DropTable { table: ns(table, tenant_id) },
+        Statement::SelectAsOf { table, filter, commit_id } => {
+            Statement::SelectAsOf { table: ns(table, tenant_id), filter, commit_id }
+        }
+        // テーブル単位ではない文はテナント名前空間の対象外、そのまま。
+        other @ (Statement::Begin
+        | Statement::TxnCommit
+        | Statement::Rollback
+        | Statement::AruaruFn { .. }
+        | Statement::AruaruLog { .. }) => other,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
@@ -1412,6 +1558,52 @@ mod tests {
         if let QueryResponse::Rows { columns, rows } = resp {
             assert_eq!(columns, vec!["id", "name"]);
             assert_eq!(rows.len(), 2);
+        } else {
+            panic!("expected rows");
+        }
+    }
+
+    /// **軽量マルチテナント分離(2026-08-21新設)**の核心特性:
+    /// `execute_as_tenant`で同名テーブル`items`をテナントA/Bそれぞれに
+    /// 作成・書き込みしても、互いのデータが一切見えない(CockroachDBの
+    /// キー空間プレフィックス分離と同じ効果)ことを実証する。
+    #[test]
+    fn tenant_namespacing_isolates_same_named_tables_across_tenants() {
+        let eng = QueryEngine::new();
+        eng.execute_as_tenant("CREATE TABLE items (id INT, qty INT)", "tenant_a").unwrap();
+        eng.execute_as_tenant("CREATE TABLE items (id INT, qty INT)", "tenant_b").unwrap();
+        eng.execute_as_tenant("INSERT INTO items (id, qty) VALUES (1, 100)", "tenant_a").unwrap();
+        eng.execute_as_tenant("INSERT INTO items (id, qty) VALUES (1, 999)", "tenant_b").unwrap();
+        eng.execute_as_tenant("INSERT INTO items (id, qty) VALUES (2, 200)", "tenant_a").unwrap();
+
+        let resp_a = eng.execute_as_tenant("SELECT * FROM items", "tenant_a").unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp_a {
+            assert_eq!(rows.len(), 2, "tenant_a must see only its own 2 rows");
+        } else {
+            panic!("expected rows");
+        }
+
+        let resp_b = eng.execute_as_tenant("SELECT * FROM items", "tenant_b").unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp_b {
+            assert_eq!(rows.len(), 1, "tenant_b must see only its own 1 row, not tenant_a's rows");
+            assert_eq!(rows[0][1], Value::Text("999".into()));
+        } else {
+            panic!("expected rows");
+        }
+
+        // デフォルト名前空間(execute、テナント無し)からはどちらのテナント
+        // テーブルも見えない(異なる内部識別子のため)。
+        let resp_default = eng.execute("SELECT * FROM items");
+        assert!(resp_default.is_err(), "unscoped execute() must not see any tenant's 'items' table");
+
+        // 後方互換性の直接証拠: テナントを一切使わない既存の呼び出しパターン
+        // (execute()のみ)は、テナント名前空間を一切知らないテーブル名で
+        // 従来通り動作する。
+        eng.execute("CREATE TABLE untenanted (id INT)").unwrap();
+        eng.execute("INSERT INTO untenanted (id) VALUES (1)").unwrap();
+        let resp = eng.execute("SELECT * FROM untenanted").unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows.len(), 1);
         } else {
             panic!("expected rows");
         }
