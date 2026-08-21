@@ -2360,3 +2360,150 @@ TiFlash方式のRaft learner化(`aruaru-dist`のRaft複製ログを`OlapCache`
 が独立ピアとして購読する設計への刷新)と、CockroachDB Serverless方式の
 マルチテナントSQL pod化は、いずれも単一プロセス前提の現行アーキテク
 チャ全体の再設計を要するため次回以降の課題として持ち越す。
+
+## HANDOFF: 2026-08-21 「見送り」判断を再検証、実装可能な増分を洗い出して実装(TiFlash非同期購読+CockroachDB風テナント分離)
+
+前回HANDOFF(直上)が「単一プロセス前提の現行アーキテクチャ全体の
+再設計を要する」として2点とも見送っていたことに対し、ユーザーから
+「見送りで終わらせず、もう一度世界中の言語でGoogle検索・GitHub調査を
+行い、実際にハイブリッド/トライブリッドデータベースとして開発を
+進めてほしい」との指示を受けた。日・英・中(簡体)を中心にWebSearchで
+再調査した結果、**全面再設計は依然として過大**という前回判断自体は
+妥当だったが、「単一プロセス内で核心的な発想だけを再現する」という
+現実的なスコープでの増分は実装可能と判明し、今回実際に実装した。
+
+### 段階1: 追加調査結果(出典付き)
+
+1. **TiFlash/raftstore-proxy**: TiFlashは列ストア本体と
+   `raftstore-proxy`(TiKVベースのCダイナミックライブラリ、
+   Multi-Raftフレームワークを他エンジンへexportする役割)の2コンポーネント
+   構成で、`raftstore-proxy`がapply結果(region metaを含む)をFFI経由で
+   TiFlashへ渡しRSM(Replicated State Machine)を直接維持させる、という
+   **プッシュ型**の構成であることを確認した
+   ([TiFlash Overview, PingCAP公式](https://docs.pingcap.com/tidbcloud/tiflash-overview/)、
+   [tiflash design doc, GitHub](https://github.com/pingcap/tiflash/blob/master/docs/design/0000-00-00-architecture-of-distributed-storage-and-transaction.md)、
+   [tikv/tikv PR #2726「support raft learner in raftstore」](https://github.com/tikv/tikv/pull/2726))。
+   Rustの`tokio::sync::watch`/`mpsc`は「状態変化を購読する」という
+   同種の非同期プッシュパターンの単一プロセス内実装として使える
+   ([tokio公式ドキュメント](https://docs.rs/tokio/latest/tokio/sync/watch/index.html)、
+   [tokio公式Channelsチュートリアル](https://tokio.rs/tokio/tutorial/channels))。
+2. **CockroachDB Serverlessのマルチテナント**: SQL層(計算)とKV層
+   (ストレージ+Raft)を分離し、SQL層はテナントごとにephemeralな
+   "SQL Pod"としてKubernetes pod単位でCPU/メモリ/ネットワーク帯域を
+   cgroupで制限、一方**ストレージ層のテナント分離は「SQL層が生成する
+   キーの先頭にテナントIDを付与する」というキー空間プレフィックス**
+   (`/<tenant-id>/<table-id>/<index-id>/<key>`、単一テナント構成の
+   `/<table-id>/<index-id>/<key>`と対比)で実現していることを確認した
+   ([cockroachdb/cockroach issue #48119](https://github.com/cockroachdb/cockroach/issues/48119)、
+   [Cluster virtualization and Multi-tenant CockroachDB, Cockroach Labs Confluence](https://cockroachlabs.atlassian.net/wiki/spaces/CRDB/pages/2431942778/Multi-tenant+CockroachDB)、
+   [Tenant Isolation with CockroachDB, Medium](https://andrewdeally.medium.com/tenant-isolation-with-cockroachdb-85303250ed72))。
+   これは「計算資源の分離」(コンテナ/プロセスレベル)と「データの論理
+   分離」(キー空間プレフィックス)という**2つの独立した軸**であることが
+   前回調査より明確になった——前者は単一プロセスの`aruaru-server`では
+   原理的に不可能だが、後者は単一プロセス内でも忠実に再現できる。
+
+### 段階2: 実装した内容
+
+1. **TiFlash風の非同期購読(`crates/aruaru-query/src/olap.rs`
+   `OlapCache::subscribe`、`crates/aruaru-query/src/engine.rs`
+   `QueryEngine::set_olap_notifier`/`notify_olap_change`)**:
+   `QueryEngine`に`olap_notify: RwLock<Option<mpsc::UnboundedSender
+   <String>>>`を新設。`persist_row`/`persist_delete`/`persist_schema`/
+   `persist_drop`の全てで、書き込みのたびに変更テーブル名を
+   このチャネルへ非ブロッキング送信するようにした。
+   `OlapCache::subscribe(self: Arc<Self>, engine: Arc<QueryEngine>)`が
+   受信側を`tokio::spawn`し、通知を受けるたびに(クエリが来るのを
+   待たず)そのテーブルだけを先回りして`rebuild_full`/
+   `rebuild_incremental`する。これにより「クエリ実行時に同期的に
+   ダーティフラグを読みにいく」だったポーリング的な向きが、
+   「書き込みイベントを非同期に購読し、変更があった時だけ反映する」
+   というTiFlashに近い向きへ変わった。
+   `aruaru-query/Cargo.toml`に`tokio`を通常依存として追加(従来は
+   `[dev-dependencies]`のみだった)。
+   **正直な開示**: 真のRaft learner(別ノードとしてRaftコンセンサスへ
+   参加しネットワーク越しにログを受信する)ではなく、同一プロセス内の
+   `tokio::mpsc`チャネルによる購読——`aruaru-dist`のRaft複製ログは
+   経由していない。また、通知はあくまで「先回りしてキャッシュを
+   温める」補助経路であり、`subscribe`を呼ばなくても`query()`内の
+   `refresh()`(同期ポーリング)が正しさを保証する設計は変更していない
+   (通知の取りこぼし・タイミング競合があっても、次回クエリ時に必ず
+   正しい状態へ収束する)。
+2. **CockroachDB風の軽量マルチテナント分離(`engine.rs`
+   `QueryEngine::execute_as_tenant`/`namespace_statement_for_tenant`)**:
+   SQL文をパースした後、`table`フィールドを持つ文(CREATE/INSERT/
+   UPSERT/SELECT/DELETE/UPDATE/DROP TABLE/`AS OF COMMIT`)の内部
+   テーブル識別子の先頭に`"__tenant_{tenant_id}__"`を前置してから
+   既存のハンドラへ渡す。テーブル名をキーとして使う既存の全ての仕組み
+   (`self.tables`・Prolly Treeのスナップショットキー`table\0pk`・
+   `OlapCache`の列キャッシュエントリ名)が、変更無しに自動でテナント
+   単位に分離される——CockroachDBの「SQL層が生成するキーの先頭に
+   テナントIDを付与する」という設計と同じ効果を、テーブル識別子への
+   前置という形で得ている。既存の`execute()`(テナント無し)は
+   完全に無変更・後方互換。
+   **正直な開示**: (1) 計算資源そのものの分離(ephemeral SQL pod、
+   cgroup制限)は実装していない——単一プロセス内の論理的なキー空間
+   分離のみ。(2) `AruaruFn`(branch/checkout/commit/merge)・
+   `AruaruLog`・トランザクション制御文はテーブル単位ではなくエンジン
+   全体に及ぶ操作のため今回はテナントスコープの対象外(将来、
+   テナントごとに独立したコミット履歴が必要になった場合は別途
+   大規模な設計変更を要する)。(3) 呼び出し元(`aruaru-server`の
+   接続認証層)が正当なテナントIDのみを渡すことを前提とする——
+   `aruaru-server`/`aruaru-wire`側からの実際の呼び出し配線
+   (接続ごとのテナントID解決、認証との統合)は今回未実施。
+
+### 段階3: 検証結果(実測)
+
+- `cargo test -p aruaru-query`: **46 passed / 0 failed**(前回44件+
+  今回新規2件: `tenant_namespacing_isolates_same_named_tables_across_
+  tenants`〈同名テーブル`items`をテナントA/Bで作成・書き込みし、
+  互いのデータが一切見えないこと、デフォルト名前空間〈`execute()`〉
+  からはどちらのテナントテーブルも見えないこと、テナント無し呼び出し
+  パターン自体が従来通り動作することを直接検証〉、
+  `olap_cache_async_subscriber_eagerly_warms_cache_without_a_query`
+  〈`subscribe`後、一度も`query()`を呼ばずにINSERTした直後、
+  バックグラウンドタスクが自律的に`cached_table_count`を増やすことを
+  ポーリングで実証、その後`query()`経由で値の正しさも確認〉)。
+  型チェックのみでの完了報告ではなく、実際に`cargo test`を実行し
+  green出力を確認した。
+- `cargo build --release --workspace`: **成功**(exit code 0、
+  `aruaru-server`の未使用関数`propose_commit`に関する既存の警告1件のみ、
+  エラー無し。ビルド完走を実際に確認した上でcommitしている)。
+
+### 段階4: なお見送った部分とその技術的理由(正直な開示)
+
+1. **真のRaft learner化**: `aruaru-dist`のRaft複製ログ
+   (`aruaru-dist/src/raft/`)を`OlapCache`が別ピアとして購読する
+   設計は、Raftのメンバーシップ変更(ConfChange、learner追加)・
+   ネットワーク越しのログ配信(現状`aruaru-dist`はopenraft統合が
+   単一プロセス内実装に留まる)の両方が前提として必要で、今回の
+   スコープ(単一プロセス内の非同期化)を超える。TiKV本家の
+   `raftstore`が`AddLearner`/`PromoteLearner`ConfChangeコマンドを
+   持つ設計([tikv/tikv PR #2726](https://github.com/tikv/tikv/pull/2726))
+   に相当する仕組みがaruaru-db側にまだ無いことが根本的な制約。
+2. **ephemeral SQL pod化(計算資源そのものの分離)**: `aruaru-server`
+   は単一プロセス・単一tokioランタイムで動作する設計であり、
+   テナントごとに独立したOSプロセス/コンテナを起動しCPU/メモリ/
+   帯域をcgroupで制限する、というCockroachDB Serverlessの本質的な
+   仕組みは、プロセスモデル自体の変更(マルチプロセス化、
+   オーケストレーション層の追加)を要するため見送った。今回実装した
+   キー空間プレフィックス分離は「データの論理分離」のみを提供し、
+   「計算資源の公平性・過負荷テナントからの保護」は提供しない
+   (1テナントの重いクエリが他テナントの応答性能に影響し得る、
+   という制約が残る)。
+3. **テナントスコープのコミット履歴・ブランチング**: 今回の分離は
+   テーブルデータのみが対象で、`aruaru_commit`/`AS OF COMMIT`/
+   Neon型ブランチングは引き続きエンジン全体で単一のコミットグラフを
+   共有する。テナントごとに独立したGit-on-SQL履歴が必要になった
+   場合は、`VersionController`自体のマルチテナント化という、
+   今回より大きい別の設計変更を要する。
+
+### 次にすべきこと
+
+(1) `aruaru-server`/`aruaru-wire`から`execute_as_tenant`を実際に
+呼び出す配線(接続ごとのテナントID解決、認証との統合)、
+(2) 「分身の術」(既存の`aruaru-llm`の`src/tenants.rs`パターン、
+`CLAUDE.md`の「分身の術」構成の対象拡大節参照)との統合検討——
+動的テナント登録APIと今回のキー空間プレフィックス分離を組み合わせる
+余地がある、(3) 真のRaft learner化・ephemeral SQL pod化は、
+`aruaru-dist`のopenraft統合完了後、あるいはマルチプロセス化を
+本格検討するタイミングで再評価する。
