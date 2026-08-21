@@ -15,6 +15,10 @@ anyhow.workspace     = true
 thiserror.workspace  = true
 tracing.workspace    = true
 sqlparser.workspace  = true
+# ScyllaDB shard-per-core方式のtoken-aware routing簡略版に使うハッシュ
+# (aruaru-core::storageのZFS互換チェックサムと同じSHA-256、新規アルゴリズム
+# を増やさない意図)
+sha2.workspace       = true
 
 # OLAP 実行エンジン (HTAP の OLAP 側)
 datafusion.workspace = true
