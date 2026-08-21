@@ -7,6 +7,7 @@ pub mod multi_raft;
 pub mod raft;
 pub mod shard;
 pub mod snapshot_pairing;
+pub mod wal_service;
 #[cfg(feature = "open_raid_z")]
 pub mod raid_z_backend;
 
@@ -37,6 +38,10 @@ pub use multi_raft::MultiRaftCluster;
 pub use closed_ts::{
     ClosedTimestampCoordinator, ClosedTimestampTracker, ReadPlan, Timestamp,
     DEFAULT_MAX_STALENESS_NANOS, DEFAULT_TARGET_LAG_NANOS,
+};
+pub use wal_service::{
+    DisaggregatedStorage, Lsn, PageDelta, Pageserver, Safekeeper, Term, WalRecord, WalService,
+    WalServiceError, DEFAULT_MAX_REPLICATION_LAG,
 };
 pub use snapshot_pairing::{wire_to_node, InMemorySnapshotBackend, SnapshotBackend, SnapshotPairingRegistry};
 pub use dual_database::{DualDatabaseError, DualDatabaseMirror, MirroredMutation, SCHEMA_SQL as DUAL_DATABASE_SCHEMA_SQL};

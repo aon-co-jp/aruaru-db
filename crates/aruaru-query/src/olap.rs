@@ -250,7 +250,31 @@ pub async fn run_olap(engine: &QueryEngine, sql: &str) -> Result<QueryResponse, 
 /// フィルタ処理が発生する点は今後の高頻度書き込み向け最適化の余地。
 pub struct OlapCache {
     tables: parking_lot::RwLock<std::collections::HashMap<String, TableCache>>,
+    /// 1セグメント(= DuckDBのRow Group / Databendのblock相当)の行数。
+    /// 【2026-08-22 HTAP横断再調査で追加】従来は「テーブル全体で
+    /// ゾーンマップ1つ」という最も粗い粒度しか持たず、コード内にも
+    /// 正直な簡略化点として明記されていた。SingleStoreの
+    /// Universal Storage(columnstoreをsegment単位で持ち、segmentごとの
+    /// メタデータでスキップする)、Databendのsnapshot→segment→blockの
+    /// 階層(blockごとにmin/max index・sparse index・bloom filterを持つ)、
+    /// DuckDBのRow Groupのいずれも**セグメント単位の統計で部分スキップ**
+    /// をしており、粒度そのものが要素技術だと分かったため導入した。
+    segment_rows: usize,
 }
+
+/// セグメント(Row Group / block)単位の統計。
+/// `offset`行目から`len`行が1セグメント。
+#[derive(Debug, Clone)]
+struct SegmentStats {
+    offset: usize,
+    len: usize,
+    zone_maps: std::collections::HashMap<String, (f64, f64)>,
+}
+
+/// 既定のセグメント行数。DuckDBのRow Group(既定122,880行)ほど大きくは
+/// せず、テスト可能かつ枝刈りが効く実用値として1024行を採る
+/// (この値自体は本家の値の移植ではない——独自の既定値であることを明記)。
+pub const DEFAULT_SEGMENT_ROWS: usize = 1024;
 
 struct TableCache {
     schema: Arc<Schema>,
@@ -268,6 +292,8 @@ struct TableCache {
     /// ブロック単位分割(Row Groupのような複数統計区間への細分化)は
     /// 実装していない(正直な簡略化点、下記`OlapCache::query`のdocも参照)。
     zone_maps: std::collections::HashMap<String, (f64, f64)>,
+    /// セグメント単位のゾーンマップ(2026-08-22追加)。
+    segments: Vec<SegmentStats>,
 }
 
 /// バッチの数値列(Int64/Float64)ごとにmin/maxを計算する
@@ -299,6 +325,26 @@ fn compute_zone_maps(batch: &RecordBatch) -> std::collections::HashMap<String, (
         }
     }
     maps
+}
+
+/// バッチを`segment_rows`行ごとに区切り、各セグメントのゾーンマップを
+/// 計算する(DuckDBのRow Group / Databendのblock単位統計に相当)。
+/// `RecordBatch::slice`はArrowのゼロコピー・スライスであり、データの
+/// 複製は発生しない。
+fn compute_segment_stats(batch: &RecordBatch, segment_rows: usize) -> Vec<SegmentStats> {
+    let total = batch.num_rows();
+    if total == 0 || segment_rows == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while offset < total {
+        let len = segment_rows.min(total - offset);
+        let slice = batch.slice(offset, len);
+        out.push(SegmentStats { offset, len, zone_maps: compute_zone_maps(&slice) });
+        offset += len;
+    }
+    out
 }
 
 /// `SELECT ... FROM <table> WHERE <col> <op> <number>`という最も単純な
@@ -347,7 +393,44 @@ fn zone_map_disproves(min: f64, max: f64, op: &str, num: f64) -> bool {
 
 impl OlapCache {
     pub fn new() -> Self {
-        Self { tables: parking_lot::RwLock::new(std::collections::HashMap::new()) }
+        Self::with_segment_rows(DEFAULT_SEGMENT_ROWS)
+    }
+
+    /// セグメント(Row Group)行数を指定して作る。
+    pub fn with_segment_rows(segment_rows: usize) -> Self {
+        Self {
+            tables: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            segment_rows: segment_rows.max(1),
+        }
+    }
+
+    /// テーブルのセグメント数(観測用・テスト用)。
+    pub fn segment_count(&self, table: &str) -> usize {
+        self.tables.read().get(table).map(|t| t.segments.len()).unwrap_or(0)
+    }
+
+    /// SQLに対するセグメント枝刈りの結果を`(テーブル名, 残ったセグメント数,
+    /// 全セグメント数)`として返す(観測用・テスト用。`None`は
+    /// 単純述語として解釈できず枝刈り対象外だった場合)。
+    pub fn plan_segment_pruning(&self, sql: &str) -> Option<(String, usize, usize)> {
+        let (table, col, op, num) = extract_simple_range_predicate(sql)?;
+        let tables = self.tables.read();
+        let entry = tables.get(&table)?;
+        let total = entry.segments.len();
+        let kept = entry
+            .segments
+            .iter()
+            .filter(|seg| match seg.zone_maps.get(&col) {
+                Some(&(min, max)) => !zone_map_disproves(min, max, &op, num),
+                None => true,
+            })
+            .count();
+        Some((table, kept, total))
+    }
+
+    /// セグメント`idx`の列`column`のゾーンマップ(観測用・テスト用)。
+    pub fn segment_zone_map(&self, table: &str, idx: usize, column: &str) -> Option<(f64, f64)> {
+        self.tables.read().get(table)?.segments.get(idx)?.zone_maps.get(column).copied()
     }
 
     /// 現在キャッシュされているテーブル数(テスト・観測用)。
@@ -375,7 +458,8 @@ impl OlapCache {
         }
         let (schema, batch) = build_table_batch(&columns, &rows)?;
         let zone_maps = compute_zone_maps(&batch);
-        self.tables.write().insert(name.to_string(), TableCache { schema, base_pks: pks, base_batch: batch, zone_maps });
+        let segments = compute_segment_stats(&batch, self.segment_rows);
+        self.tables.write().insert(name.to_string(), TableCache { schema, base_pks: pks, base_batch: batch, zone_maps, segments });
         Ok(())
     }
 
@@ -430,7 +514,8 @@ impl OlapCache {
 
         let schema = entry.schema.clone();
         let zone_maps = compute_zone_maps(&merged);
-        cache.insert(name.to_string(), TableCache { schema, base_pks: new_pks, base_batch: merged, zone_maps });
+        let segments = compute_segment_stats(&merged, self.segment_rows);
+        cache.insert(name.to_string(), TableCache { schema, base_pks: new_pks, base_batch: merged, zone_maps, segments });
         Ok(())
     }
 
@@ -464,20 +549,30 @@ impl OlapCache {
     /// 証明できる場合、**DataFusionへ一切クエリを投げずに空の結果を
     /// 即座に返す**——DuckDBがブロックのmin/max統計だけでRow Group全体の
     /// スキャンをスキップするのと同じ発想。今回の実装は「テーブル全体で
-    /// 1つのゾーンマップ」という粗い粒度のため、スキップできるのは
-    /// 「テーブル全体が対象外と証明できる場合」のみ(DuckDBのような
-    /// ブロック単位の部分スキップは行わない、正直な簡略化点)。
+    /// 1つのゾーンマップ」という粗い粒度だったため、スキップできるのは
+    /// 「テーブル全体が対象外と証明できる場合」のみだった。
+    ///
+    /// 【2026-08-22 HTAP横断再調査で改善・セグメント単位の部分スキップ】
+    /// SingleStore Universal Storage / Databend(snapshot→segment→block)/
+    /// DuckDB(Row Group)のいずれも**セグメント単位のmin/max統計で
+    /// 部分スキップ**をしていることを確認したため、テーブルを
+    /// `segment_rows`行ごとのセグメントに区切って各セグメントの
+    /// ゾーンマップを持つようにし、証明できたセグメントのみを
+    /// DataFusionへ渡さない形に変更した(`plan_segment_pruning`で
+    /// 枝刈り結果を観測できる)。ブルームフィルタ・sparse indexまでは
+    /// 実装していない(正直な簡略化点)。
     /// マッチしない/証明できない場合は常に安全側(=通常通り
     /// `execute_and_format`でDataFusionへ渡す)に倒れるため、この枝刈りが
     /// 結果の正しさに影響することは無い。
     pub async fn query(&self, engine: &QueryEngine, sql: &str) -> Result<QueryResponse, String> {
         self.refresh(engine)?;
 
-        if let Some((table, col, op, num)) = extract_simple_range_predicate(sql) {
+        let predicate = extract_simple_range_predicate(sql);
+        if let Some((table, col, op, num)) = predicate.as_ref() {
             let tables = self.tables.read();
-            if let Some(entry) = tables.get(&table) {
-                if let Some(&(min, max)) = entry.zone_maps.get(&col) {
-                    if zone_map_disproves(min, max, &op, num) {
+            if let Some(entry) = tables.get(table) {
+                if let Some(&(min, max)) = entry.zone_maps.get(col) {
+                    if zone_map_disproves(min, max, op, *num) {
                         let columns: Vec<String> =
                             entry.schema.fields().iter().map(|f| f.name().clone()).collect();
                         return Ok(QueryResponse::Rows { columns, rows: Vec::new() });
@@ -488,7 +583,35 @@ impl OlapCache {
 
         let ctx = session_context();
         for (name, entry) in self.tables.read().iter() {
-            let table = MemTable::try_new(entry.schema.clone(), vec![vec![entry.base_batch.clone()]]).map_err(|e| e.to_string())?;
+            // 【2026-08-22追加】セグメント単位の枝刈り。述語の対象テーブル
+            // については、ゾーンマップが「このセグメントには該当行が
+            // 絶対に無い」と証明できるセグメントをDataFusionへ渡さない。
+            // 生き残ったセグメントは`RecordBatch::slice`(ゼロコピー)を
+            // それぞれ1パーティションとして登録する——DataFusionは
+            // パーティション並列で走るため、枝刈りと並列化が同時に効く。
+            // 証明できない場合・述語が単純形でない場合は全セグメントを
+            // 渡す(安全側)。
+            let partitions: Vec<Vec<RecordBatch>> = match (&predicate, entry.segments.is_empty()) {
+                (Some((ptable, pcol, pop, pnum)), false) if ptable == name => {
+                    let kept: Vec<Vec<RecordBatch>> = entry
+                        .segments
+                        .iter()
+                        .filter(|seg| match seg.zone_maps.get(pcol) {
+                            Some(&(min, max)) => !zone_map_disproves(min, max, pop, *pnum),
+                            None => true,
+                        })
+                        .map(|seg| vec![entry.base_batch.slice(seg.offset, seg.len)])
+                        .collect();
+                    if kept.is_empty() {
+                        // 全セグメントが枝刈りされた = 該当行なし
+                        vec![vec![RecordBatch::new_empty(entry.schema.clone())]]
+                    } else {
+                        kept
+                    }
+                }
+                _ => vec![vec![entry.base_batch.clone()]],
+            };
+            let table = MemTable::try_new(entry.schema.clone(), partitions).map_err(|e| e.to_string())?;
             ctx.register_table(name.as_str(), Arc::new(table)).map_err(|e| e.to_string())?;
         }
         execute_and_format(&ctx, sql).await
@@ -574,6 +697,57 @@ fn arrow_type_to_column_type(ty: &DataType) -> ColumnType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 【2026-08-22 HTAP横断再調査】セグメント(Row Group / block)単位の
+    /// ゾーンマップが作られ、述語に該当しないセグメントだけが枝刈りされ、
+    /// **かつ結果は枝刈り無しと完全に一致する**ことを実証する。
+    #[tokio::test]
+    async fn segment_level_zone_maps_prune_only_provably_empty_segments() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE m (id INT, v INT)").unwrap();
+        for i in 1..=6 {
+            eng.execute(&format!("INSERT INTO m (id, v) VALUES ({i}, {})", i * 10)).unwrap();
+        }
+        // 2行=1セグメント -> 3セグメント (v: 10-20 / 30-40 / 50-60)
+        let cache = OlapCache::with_segment_rows(2);
+        let all = cache.query(&eng, "SELECT COUNT(*) AS n FROM m").await.unwrap();
+        if let QueryResponse::Rows { rows, .. } = all {
+            assert_eq!(rows[0][0], Value::Text("6".into()));
+        } else {
+            panic!("expected rows");
+        }
+        assert_eq!(cache.segment_count("m"), 3);
+        assert_eq!(cache.segment_zone_map("m", 0, "v"), Some((10.0, 20.0)));
+        assert_eq!(cache.segment_zone_map("m", 2, "v"), Some((50.0, 60.0)));
+
+        // v > 45 は最後のセグメントだけが残る
+        let sql = "SELECT id FROM m WHERE v > 45";
+        assert_eq!(cache.plan_segment_pruning(sql), Some(("m".to_string(), 1, 3)));
+        let resp = cache.query(&eng, sql).await.unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert_eq!(rows.len(), 2, "5 and 6 must survive pruning");
+        } else {
+            panic!("expected rows");
+        }
+
+        // 全セグメントが対象外なら空(テーブル全体のゾーンマップで即断)
+        assert_eq!(
+            cache.plan_segment_pruning("SELECT id FROM m WHERE v > 1000"),
+            Some(("m".to_string(), 0, 3))
+        );
+        let resp = cache.query(&eng, "SELECT id FROM m WHERE v > 1000").await.unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp {
+            assert!(rows.is_empty());
+        } else {
+            panic!("expected rows");
+        }
+
+        // 全セグメントが該当する述語は1つも枝刈りしない(偽陽性を出さない)
+        assert_eq!(
+            cache.plan_segment_pruning("SELECT id FROM m WHERE v > 0"),
+            Some(("m".to_string(), 3, 3))
+        );
+    }
 
     #[tokio::test]
     async fn test_olap_group_by_sum() {
