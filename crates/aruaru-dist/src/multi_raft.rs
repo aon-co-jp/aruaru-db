@@ -115,6 +115,56 @@ impl<A: Applier> MultiRaftCluster<A> {
         self.groups.write().insert(new_id, new_group);
         Some(new_id)
     }
+
+    /// 【2026-08-21新設・Vitess Reshard(併合方向)への追従】隣接する2つのRangeを
+    /// 1つへ統合する(`ClusterTopology::merge_ranges`のdoc参照)。トポロジ上の
+    /// 統合に加え、消えた側のRaftグループを`groups`から取り除く——統合後は
+    /// 残った側(`merged_id`)の単一グループがキー空間全体の合意を担う。
+    ///
+    /// **正直な開示**: `split`と対称に、統合後のグループは「生き残った側の
+    /// 既存ログをそのまま引き継ぐ」だけであり、消えた側のグループが保持して
+    /// いたコミット済みログ・状態機械の内容を統合先へマージする処理は行わない
+    /// (`split`が新グループを空ログから始める簡略化としているのと同じ水準の
+    /// 簡略化——実運用では統合前に一方の状態を他方へ複製してから切り替える
+    /// 必要があるが、本実装はトポロジ構造の統合〈キー空間ルーティングが
+    /// 1本化されること〉のみを扱う)。
+    pub fn merge(&self, range_a: u64, range_b: u64) -> Option<u64> {
+        let merged_id = self.topology.write().merge_ranges(range_a, range_b)?;
+        let removed_id = if merged_id == range_a { range_b } else { range_a };
+        self.groups.write().remove(&removed_id);
+        Some(merged_id)
+    }
+
+    /// 【2026-08-21新設・VitessのVTGate scatter-gatherへの追従】
+    /// キーを指定せず、**全Range(全Raftグループ)へ同じ読み取りクロージャを
+    /// 適用し、range_id順に結果を集約する**——Vitessが「シャーディングキーの
+    /// 分からないクエリを全シャードへ展開(scatter)し、返ってきた結果を
+    /// マージ(gather)する」のと同じ形の操作。CockroachDB方式のMulti-Raft
+    /// (キーが分かっている場合の`propose`によるポイントルーティング)とは
+    /// 相補的な、クロスシャード読み取りの土台。
+    ///
+    /// `f`は各Rangeの`RaftNode`への参照を受け取り、その場でスナップショット
+    /// 的に読み取れる値(例: `commit_index()`・状態機械への問い合わせ結果)を
+    /// 返す。書き込みではなく読み取り専用の集約を意図しており、`propose`の
+    /// ような合意を伴う操作はこの関数の対象外(呼び出し側が個別の`propose`を
+    /// 使うこと)。
+    pub fn scatter_gather<T, F>(&self, mut f: F) -> Vec<(u64, T)>
+    where
+        F: FnMut(&RaftNode<A>) -> T,
+    {
+        let topology = self.topology.read();
+        let groups = self.groups.read();
+        let mut range_ids: Vec<u64> = topology.ranges.iter().map(|r| r.range_id).collect();
+        range_ids.sort_unstable();
+
+        let mut out = Vec::with_capacity(range_ids.len());
+        for range_id in range_ids {
+            if let Some(group) = groups.get(&range_id) {
+                out.push((range_id, f(group.as_ref())));
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +230,54 @@ mod tests {
             Some(3),
             "range 1のcommit_indexはrange 2への書き込みの影響を受けてはならない(Multi-Raftの独立性)"
         );
+    }
+
+    /// 【Vitess Reshard(併合方向)検証】Range分割後、片方へ書き込んだ状態で
+    /// 統合すると、統合先(生き残ったrange_id)が両方のキーをルーティングでき、
+    /// 統合前に消えた側だったグループへは(ログはマージされないという既知の
+    /// 簡略化の範囲で)もう提案できない。
+    #[test]
+    fn merge_reunifies_ranges_and_removes_the_absorbed_raft_group() {
+        let cluster = MultiRaftCluster::single_node(1, "n1", RecordingApplier::default());
+        let new_range_id = cluster.split(1, b"m".to_vec(), RecordingApplier::default()).unwrap();
+        assert_eq!(cluster.range_count(), 2);
+
+        let merged_id = cluster.merge(1, new_range_id).unwrap();
+        assert_eq!(cluster.range_count(), 1);
+        assert_eq!(merged_id, 1);
+
+        // 統合後、キー空間全体が単一Rangeへ解決される(Vitessの
+        // Reshard完了後は1つのシャードが全域を担当するのと同じ形)
+        assert_eq!(cluster.commit_index_for_key(b"a"), Some(0));
+        assert_eq!(cluster.commit_index_for_key(b"z"), Some(0));
+        let (range_id, _) = cluster.propose(b"z", &Command::Exec("INSERT z1".into())).unwrap();
+        assert_eq!(range_id, merged_id);
+    }
+
+    /// VTGate scatter-gather: 3つのRangeそれぞれへ独立にコミットした後、
+    /// `scatter_gather`が全Rangeのcommit_indexをrange_id順に集約できることを
+    /// 実証する(Vitessが複数シャードへクエリを展開し、range順にマージした
+    /// 結果を返すのと同じ形)。
+    #[test]
+    fn scatter_gather_collects_a_reading_from_every_range_like_vitess_vtgate() {
+        let cluster = MultiRaftCluster::single_node(1, "n1", RecordingApplier::default());
+        let range2 = cluster.split(1, b"m".to_vec(), RecordingApplier::default()).unwrap();
+        let range3 = cluster.split(range2, b"t".to_vec(), RecordingApplier::default()).unwrap();
+
+        // range1(キー"a")に2件、range2(キー"n")に1件、range3(キー"z")は無変更
+        for i in 1..=2u32 {
+            let (rid, idx) = cluster.propose(b"a", &Command::Exec(format!("INSERT a{i}"))).unwrap();
+            cluster.commit_and_apply(rid, idx);
+        }
+        let (rid, idx) = cluster.propose(b"n", &Command::Exec("INSERT n1".into())).unwrap();
+        cluster.commit_and_apply(rid, idx);
+
+        let gathered = cluster.scatter_gather(|node| node.commit_index());
+        // range_id昇順で全Rangeぶん集約されていること
+        let ids: Vec<u64> = gathered.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![1, range2, range3]);
+        let values: Vec<u64> = gathered.iter().map(|(_, v)| *v).collect();
+        assert_eq!(values, vec![2, 1, 0], "range1=2件, range2=1件, range3=0件のcommit_indexがそれぞれ独立に反映される");
     }
 
     #[test]
