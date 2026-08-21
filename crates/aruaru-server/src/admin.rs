@@ -304,6 +304,8 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         .at("/cluster/node", post(cluster_node))
         .at("/cluster/rebalance", post(cluster_rebalance))
         .at("/cluster/propose", post(cluster_propose))
+        // 【2026-08-21新設】ephemeral SQL pod (計算資源の使い捨てプロセス分離)
+        .at("/ephemeral-query", post(ephemeral_query))
         .at("/registry", get(registry_list))
         .at("/registry/summary", get(registry_summary))
         .at("/registry/crawl", post(registry_crawl))
@@ -894,6 +896,48 @@ async fn cluster_propose(state: Data<&Arc<AdminState>>, Json(req): Json<SqlReque
             "message": format!("提案を log index {idx} に追加しました(replicator未取り付けのためRaftNode直接経路、disaster-backup配線対象外)。")
         })),
         Err(e) => Json(json!({ "success": false, "message": e })),
+    }
+}
+
+/// 【2026-08-21新設・ephemeral SQL pod化】指定テナントのテーブルを
+/// 独立した子プロセス(`--ephemeral-worker`)へスナップショットとして渡し、
+/// その子プロセス内だけで SQL を1回実行させる。子プロセスは応答後に必ず
+/// 終了する(`crate::ephemeral_pod::run_ephemeral_query`のdoc参照)。
+/// 書き込みは子プロセスのインメモリ上でのみ完結し、親プロセスの永続状態
+/// (fjall)には反映されない(意図的な制約、ephemeral_pod.rsのdoc参照)。
+#[derive(Debug, Deserialize)]
+struct EphemeralQueryRequest {
+    tenant_id: String,
+    /// 子プロセスへ渡すテーブル名一覧(親プロセスの現在の状態から
+    /// スナップショットして渡す)。
+    tables: Vec<String>,
+    sql: String,
+}
+
+#[handler]
+async fn ephemeral_query(
+    state: Data<&Arc<AdminState>>,
+    Json(req): Json<EphemeralQueryRequest>,
+) -> Json<Value> {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return Json(json!({ "success": false, "message": format!("current_exe() failed: {e}") })),
+    };
+    let tables = crate::ephemeral_pod::snapshot_for_tenant(&state.engine, &req.tables);
+    let ephemeral_req = crate::ephemeral_pod::EphemeralRequest {
+        tenant_id: req.tenant_id.clone(),
+        tables,
+        sql: req.sql,
+    };
+    match crate::ephemeral_pod::run_ephemeral_query(&exe, &ephemeral_req).await {
+        Ok(resp) => Json(json!({
+            "success": resp.ok,
+            "tenant_id": req.tenant_id,
+            "result": resp.result,
+            "error": resp.error,
+            "mode": "ephemeral_process",
+        })),
+        Err(e) => Json(json!({ "success": false, "message": format!("ephemeral worker process failed: {e}") })),
     }
 }
 

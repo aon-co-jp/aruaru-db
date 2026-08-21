@@ -42,8 +42,22 @@ pub struct RaftNode<A: Applier> {
     state: RwLock<RaftState>,
     log: RwLock<ReplicatedLog>,
     applier: A,
+    /// 投票権を持つ peer (quorum 計算・選挙投票要求の対象)
     peers: Vec<u64>,
-    /// Leader 用: peer → 複製済み最大インデックス
+    /// 【2026-08-21新設・真のRaft learner化 第一歩】投票権を持たない
+    /// peer。Leader はここへも AppendEntries を送りログを複製するが、
+    /// `maybe_commit` の過半数計算には含めない (TiKV の `AddLearner`
+    /// ConfChangeと同じ意味論 — `raftstore-proxy`設計、
+    /// tikv/tikv PR #2726参照)。
+    learners: Vec<u64>,
+    /// このノード自身が learner ロールとして構築されたかどうか。
+    /// true の場合、`append_entries` で Leader からログを受信しても
+    /// (通常の Follower なら) Follower へ遷移するところを Learner の
+    /// ままに保つ — これにより別プロセスとして起動した learner ノードが
+    /// 選挙タイマー (driver.rs の Follower/Candidate 分岐) に一切参加せず
+    /// 投票もしない、という learner 本来の受動的な性質を維持する。
+    self_is_learner: bool,
+    /// Leader 用: peer → 複製済み最大インデックス (voter/learner 両方を含む)
     match_index: RwLock<HashMap<u64, u64>>,
     /// commit+適用が完了したログインデックス → 適用結果。
     /// 【課金アイテムの権利消失防止】書き込みクライアントが
@@ -59,11 +73,32 @@ pub struct RaftNode<A: Applier> {
 
 impl<A: Applier> RaftNode<A> {
     pub fn new(node_id: u64, applier: A, peers: Vec<u64>) -> Self {
+        Self::new_with_learners(node_id, applier, peers, Vec::new(), false)
+    }
+
+    /// 【2026-08-21新設】投票権を持つ peer (`peers`) と、投票権を持たない
+    /// learner peer (`learners`) を分けて構築する。`self_is_learner` に
+    /// true を渡すと、このノード自身が Leader からの AppendEntries を
+    /// 受けても Learner ロールを維持する (別プロセスの learner ノードを
+    /// 起動する側で使う)。
+    pub fn new_with_learners(
+        node_id: u64,
+        applier: A,
+        peers: Vec<u64>,
+        learners: Vec<u64>,
+        self_is_learner: bool,
+    ) -> Self {
+        let mut state = RaftState::new(node_id);
+        if self_is_learner {
+            state.role = RaftRole::Learner;
+        }
         Self {
-            state: RwLock::new(RaftState::new(node_id)),
+            state: RwLock::new(state),
             log: RwLock::new(ReplicatedLog::new()),
             applier,
             peers,
+            learners,
+            self_is_learner,
             match_index: RwLock::new(HashMap::new()),
             pending_results: RwLock::new(HashMap::new()),
             on_commit: RwLock::new(None),
@@ -97,6 +132,23 @@ impl<A: Applier> RaftNode<A> {
     }
     pub fn peers(&self) -> &[u64] {
         &self.peers
+    }
+    /// 投票権を持たない learner peer 一覧 (Leader が AppendEntries を
+    /// 送る対象ではあるが、quorum 計算には含めない)
+    pub fn learners(&self) -> &[u64] {
+        &self.learners
+    }
+    /// このノード自身が learner として構築されたか
+    pub fn is_self_learner(&self) -> bool {
+        self.self_is_learner
+    }
+    /// Leader が AppendEntries を送るべき全 peer (voter + learner)。
+    /// 複製対象は voter/learner を区別しないが、commit の可否
+    /// (`maybe_commit`) は voter (`peers`) の match_index のみで判定する。
+    pub fn replication_targets(&self) -> Vec<u64> {
+        let mut v = self.peers.clone();
+        v.extend_from_slice(&self.learners);
+        v
     }
 
     /// peer へ送る AppendEntries の中身を組み立てる
@@ -258,7 +310,19 @@ impl<A: Applier> RaftNode<A> {
         if leader_term > s.current_term {
             s.current_term = leader_term;
         }
-        s.role = RaftRole::Follower;
+        // 【2026-08-21】このノード自身が learner として構築されている場合は
+        // Leader からの正当な AppendEntries を受けても Learner ロールを
+        // 維持する (通常の Follower はここで Follower 化される)。これが
+        // 無いと、別プロセスの learner ノードが最初の AppendEntries 受信を
+        // 機に Follower へ格上げされてしまい、driver.rs の
+        // Follower/Candidate 分岐(選挙タイムアウトで Candidate 昇格)に
+        // 巻き込まれ、投票権を持たないはずの learner が選挙へ参加してしまう
+        // (learner本来の受動的性質が壊れる実バグになるところだった)。
+        s.role = if self.self_is_learner {
+            RaftRole::Learner
+        } else {
+            RaftRole::Follower
+        };
         drop(s);
 
         let mut log = self.log.write();
@@ -449,6 +513,65 @@ mod tests {
         // 適用対象が無い呼び出しでは再度呼ばれない
         assert_eq!(n.apply_committed(), 0);
         assert_eq!(*seen.lock(), vec![2]);
+    }
+
+    /// 【2026-08-21新設】learner ロールで構築したノードは、Leader からの
+    /// AppendEntries を受け取っても Follower へ格上げされずに Learner の
+    /// ままであり、コミット済みエントリはちゃんと適用されることを検証する。
+    #[test]
+    fn test_learner_role_preserved_across_append_entries_and_applies_committed_entries() {
+        let learner = RaftNode::new_with_learners(
+            2,
+            RecordingApplier { applied: Mutex::new(vec![]) },
+            vec![],
+            vec![],
+            true, // self_is_learner
+        );
+        assert_eq!(learner.role(), RaftRole::Learner);
+
+        let entries = vec![
+            LogEntry { term: 1, index: 1, payload: Command::Exec("a".into()).encode() },
+            LogEntry { term: 1, index: 2, payload: Command::Exec("b".into()).encode() },
+        ];
+        let r = learner.append_entries(1, 0, 0, entries, 2);
+        assert!(r.success);
+        // 通常の Follower ならここで role が Follower になるが、learner は
+        // Learner のまま — これが今回のバグ修正の核心
+        assert_eq!(learner.role(), RaftRole::Learner);
+        assert_eq!(learner.apply_committed(), 2);
+    }
+
+    /// Leader 側の quorum 計算は voter (`peers`) のみで行われ、learner の
+    /// match_index は commit 可否に影響しないことを検証する。
+    #[test]
+    fn test_leader_quorum_excludes_learners_but_still_replicates_to_them() {
+        // voter は node3 のみ (peers=[3])、learner は node4
+        let leader = RaftNode::new_with_learners(
+            1,
+            RecordingApplier { applied: Mutex::new(vec![]) },
+            vec![3],
+            vec![4],
+            false,
+        );
+        leader.become_leader();
+        let idx = leader.propose(&Command::Exec("INSERT 1".into())).unwrap();
+        assert_eq!(idx, 1);
+
+        // replication_targets には voter・learner 両方が含まれる
+        let mut targets = leader.replication_targets();
+        targets.sort();
+        assert_eq!(targets, vec![3, 4]);
+
+        // learner (node4) だけが複製済みでも、voter(node3)の過半数に
+        // 達していないため commit されない (learner は quorum に数えない)
+        leader.update_match(4, 1);
+        leader.maybe_commit();
+        assert_eq!(leader.commit_index(), 0);
+
+        // voter (node3) が複製完了して初めて commit される
+        leader.update_match(3, 1);
+        leader.maybe_commit();
+        assert_eq!(leader.commit_index(), 1);
     }
 
     #[test]

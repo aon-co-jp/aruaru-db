@@ -53,17 +53,52 @@ pub fn build_cluster(
     peers: &[(u64, String)],
     engine: Arc<QueryEngine>,
 ) -> anyhow::Result<(Arc<ClusterNode>, Arc<ClusterDriver>)> {
-    let peer_ids: Vec<u64> = peers.iter().map(|(id, _)| *id).collect();
-    let applier = EngineApplier::new(engine);
-    let node = Arc::new(RaftNode::new(node_id, applier, peer_ids));
+    build_cluster_with_learners(node_id, peers, &[], false, engine)
+}
 
-    // 単一ノードは即 Leader 化 (選挙不要)
-    if peers.is_empty() {
+/// 【2026-08-21新設・真のRaft learner化 第一歩】voter peer に加え、
+/// learner peer (投票権を持たない非同期複製先)・自ノード自身が learner
+/// として起動されるかどうかを指定できるクラスタ構築。
+/// `aruaru-server --raft-role learner --peers <leaderのアドレス>`
+/// のように、**同一マシン上の別プロセス・別ポート**として learner
+/// ノードを実際に起動できるようにする(単一プロセス内購読からの前進)。
+///
+/// - `self_is_learner=false` (voter/leader 側): `learner_peers` は
+///   Leader が AppendEntries を送るが quorum には数えない learner の
+///   一覧 (peer_map には voter・learner 両方のアドレスを含める必要がある)。
+/// - `self_is_learner=true` (learner 側プロセス): このノード自身は
+///   投票せず、選挙にも参加しない。`peers` に Leader の (node_id, url)
+///   を渡すことで、HttpTransport 経由で自分が受信した AppendEntries に
+///   対する追加送信は行わないが(Learner は driver.rs 側で送信自体を
+///   スキップする)、`node_id`解決のため peer_map は共有しておく。
+pub fn build_cluster_with_learners(
+    node_id: u64,
+    peers: &[(u64, String)],
+    learner_peers: &[(u64, String)],
+    self_is_learner: bool,
+    engine: Arc<QueryEngine>,
+) -> anyhow::Result<(Arc<ClusterNode>, Arc<ClusterDriver>)> {
+    let peer_ids: Vec<u64> = peers.iter().map(|(id, _)| *id).collect();
+    let learner_ids: Vec<u64> = learner_peers.iter().map(|(id, _)| *id).collect();
+    let applier = EngineApplier::new(engine);
+    let node = Arc::new(RaftNode::new_with_learners(
+        node_id,
+        applier,
+        peer_ids,
+        learner_ids,
+        self_is_learner,
+    ));
+
+    // 単一ノード (voter peer も learner peer も空) かつ自身が learner
+    // でなければ即 Leader 化 (選挙不要)。learner 単独起動では Leader化しない
+    // (learner は本質的に受動的なレプリカであり、自ら書き込みを提案しない)。
+    if peers.is_empty() && learner_peers.is_empty() && !self_is_learner {
         node.become_leader();
         tracing::info!(node_id, "single-node cluster: promoted to leader");
     }
 
-    let peer_map: HashMap<u64, String> = peers.iter().cloned().collect();
+    let mut peer_map: HashMap<u64, String> = peers.iter().cloned().collect();
+    peer_map.extend(learner_peers.iter().cloned());
     let transport = Arc::new(HttpTransport::new(peer_map)?);
     let driver = RaftDriver::new(node.clone(), transport);
     Ok((node, driver))

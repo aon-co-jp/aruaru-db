@@ -98,7 +98,12 @@ impl<A: Applier + 'static, T: Transport + 'static> RaftDriver<A, T> {
     async fn replicate(&self) {
         let term = self.node.term();
         let leader_id = self.node.node_id();
-        for &peer in self.node.peers() {
+        // 【2026-08-21】voter/learner 両方へ複製する (真のRaft learner化)。
+        // quorum 判定(`maybe_commit`)は引き続き voter (`node.peers()`) の
+        // match_index のみで行われるため、learner をここに含めても
+        // commit の安全性には影響しない — learner はあくまで非同期の
+        // 複製先が増えるだけ。
+        for peer in self.node.replication_targets() {
             let (prev_log_index, prev_log_term, entries, leader_commit) =
                 self.node.build_append_for(peer);
             let req = AppendEntriesReq {

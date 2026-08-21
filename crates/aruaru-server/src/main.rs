@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 mod admin;
 mod cluster;
+mod ephemeral_pod;
 mod self_update;
 
 /// aruaru-DB server
@@ -36,9 +37,42 @@ struct Cli {
     #[arg(long, default_value = "1")]
     raft_id: u64,
 
-    /// Raft ピアアドレス (カンマ区切り)
+    /// Raft ピアアドレス (カンマ区切り、投票権を持つ voter peer)
     #[arg(long)]
     peers: Option<String>,
+
+    /// 【2026-08-21新設】このノード自身の Raft ロール。"voter"(既定、
+    /// leader/follower として振る舞う)または "learner"(投票権を持たず
+    /// Leader からの複製をひたすら受け取るだけの非同期レプリカ)。
+    /// 同一マシン上で `--raft-role voter --port 5433` と
+    /// `--raft-role learner --port 5434` のように**別プロセス**として
+    /// 起動し、`--peers`(learner側は接続先leaderのURL)/
+    /// `--learner-peers`(leader側が複製先として認識するlearnerのURL)を
+    /// 指定することで、実際にTCP越しにログが複製される真のマルチ
+    /// プロセスRaftを構成できる。
+    #[arg(long, default_value = "voter")]
+    raft_role: String,
+
+    /// 【2026-08-21新設】leader/voter側から見た learner peer アドレス
+    /// (カンマ区切り、`--peers` と同じ "id@host:port" 形式)。
+    /// Leader はここへ AppendEntries を複製するが、quorum(過半数コミット
+    /// の判定)には数えない。
+    #[arg(long)]
+    learner_peers: Option<String>,
+
+    /// 【2026-08-21新設・ephemeral SQL pod化 第一歩】このプロセスを
+    /// 「使い捨て計算ワーカー」として起動する内部フラグ。標準入力から
+    /// JSON({tenant_id, tables: [(name,cols,rows)], sql})を1件読み取り、
+    /// 完全に独立したインメモリQueryEngineでテーブルを再構築してSQLを
+    /// 1回だけ実行し、結果をJSONで標準出力へ書いて即座に終了する
+    /// (永続ストレージ・pgwire・GraphQL・Raftは一切起動しない)。
+    /// `ephemeral_pod::run_ephemeral_query` が
+    /// `tokio::process::Command`でこのフラグ付きの自分自身を子プロセスと
+    /// して起動し、処理完了後にそのプロセスは終了する
+    /// (CockroachDB Serverless の ephemeral SQL pod の発想を、単一マシン
+    /// 上のプロセスレベル分離で模した最小実装)。
+    #[arg(long, default_value_t = false)]
+    ephemeral_worker: bool,
 
     /// ログレベル (trace/debug/info/warn/error)
     #[arg(long, default_value = "info")]
@@ -64,6 +98,13 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // 【ephemeral SQL pod化】自分自身が使い捨てワーカーとして起動された
+    // 場合は、通常のサーバ起動フロー(永続ストレージ・pgwire・GraphQL・
+    // Raft)を一切経由せず、標準入力から1件だけリクエストを処理して即終了する。
+    if cli.ephemeral_worker {
+        return ephemeral_pod::run_worker_once();
+    }
 
     // ── ロギング初期化 ─────────────────────────────────
     tracing_subscriber::fmt()
@@ -174,14 +215,39 @@ async fn main() -> anyhow::Result<()> {
         .as_deref()
         .map(cluster::parse_peers)
         .unwrap_or_default();
+    let learner_peers = cli
+        .learner_peers
+        .as_deref()
+        .map(cluster::parse_peers)
+        .unwrap_or_default();
+    let self_is_learner = match cli.raft_role.as_str() {
+        "learner" => true,
+        "voter" => false,
+        other => {
+            tracing::warn!(raft_role = other, "unknown --raft-role value; defaulting to voter");
+            false
+        }
+    };
     let admin_state = admin::AdminState::new(engine.clone(), registry.clone());
     // 【課金アイテムの権利消失防止】書き込みをRaft経由で複製するレプリケータ。
     // クラスタ構築に成功した場合のみ設定される (推奨構成: 自ノード+peers 2台=計3ノード)。
     let mut replicator: Option<std::sync::Arc<dyn aruaru_dist::ReplicatedWriter>> = None;
-    match cluster::build_cluster(cli.raft_id, &peers, engine.clone()) {
+    match cluster::build_cluster_with_learners(
+        cli.raft_id,
+        &peers,
+        &learner_peers,
+        self_is_learner,
+        engine.clone(),
+    ) {
         Ok((node, driver)) => {
             admin_state.attach_cluster(node.clone());
-            if peers.is_empty() {
+            if self_is_learner {
+                tracing::info!(
+                    node_id = cli.raft_id,
+                    "Raft: learner mode (別プロセスの非同期レプリカ、投票権なし)。\
+                     Leader 側は --learner-peers にこのノードのアドレスを含める必要がある"
+                );
+            } else if peers.is_empty() && learner_peers.is_empty() {
                 tracing::info!(
                     node_id = cli.raft_id,
                     "Raft: single-node mode (leader). 本番運用では --peers で他2ノードを指定し、\
@@ -191,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!(
                     node_id = cli.raft_id,
                     cluster_size = peers.len() + 1,
+                    learners = learner_peers.len(),
                     "Raft: multi-node cluster; consensus driver started (過半数コミットで書き込み確定)"
                 );
             }
