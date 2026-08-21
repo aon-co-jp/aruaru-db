@@ -19,6 +19,9 @@ sqlparser.workspace  = true
 # (aruaru-core::storageのZFS互換チェックサムと同じSHA-256、新規アルゴリズム
 # を増やさない意図)
 sha2.workspace       = true
+# DuckDB風zone map(min/max block pruning)の簡易WHERE句抽出に使う
+# (2026-08-21、DuckDB再調査で追加)
+regex.workspace       = true
 
 # OLAP 実行エンジン (HTAP の OLAP 側)
 datafusion.workspace = true
