@@ -253,6 +253,61 @@ RisingWave のオブジェクトストレージ直結、CockroachDB/TiDB Serverl
 
 ---
 
+## 🧱 ストレージ/コンピュート分離の要素技術 (2026-08-22 追加)
+
+「Snowflake と CockroachDB の両方の特性を持つハイブリッド DB」の要素技術を
+日本語・英語・中国語・韓国語で横断調査し、一次資料で裏取りしたうえで
+優先度の高い3件を実装しました(前回追加の closed timestamp / follower read
+とは別軸の追加です)。
+
+1. **WAL サービス (safekeeper) と Pageserver の分離 — Neon 方式**
+   (`crates/aruaru-dist/src/wal_service.rs`)
+   `neondatabase/neon` の `docs/walservice.md`・`docs/safekeeper-protocol.md`・
+   `docs/pageserver-storage.md` で確認した設計を実装:
+   - WAL は複数 safekeeper へ送り、**過半数が flush した時点で durable**。
+     `commitLSN` は全 safekeeper の `flushLSN` を並べた **quorum 番目**。
+   - proposer は起動ごとに **term** が増え、古い proposer を fence する
+     (= 単一 primary 強制 / split-brain 防止)。
+   - Pageserver は safekeeper 群から WAL を取り込み、
+     **`get_page_at_lsn` で任意 LSN のページを image layer + delta layer から
+     再構成**。未着 LSN の要求は拒否し、`max_replication_lag` で
+     バックプレッシャをかける。image layer 生成 (compaction) より前の
+     LSN は再構成不能であることを `BelowGcCutoff` として明示。
+
+2. **セグメント (Row Group / block) 単位のゾーンマップ枝刈り**
+   (`crates/aruaru-query/src/olap.rs`)
+   SingleStore の Universal Storage (segment 単位の columnstore)、
+   Databend の block 単位 min/max、DuckDB の Row Group がいずれも
+   **セグメント単位統計での部分スキップ**を行っている共通点を確認し、
+   従来「テーブル全体で min/max 1組」だった粒度を細分化しました。
+   該当行が絶対に無いと証明できたセグメントは DataFusion へ渡さず、
+   生き残ったセグメントは `RecordBatch::slice` (ゼロコピー) として
+   1パーティションずつ登録します (枝刈りと並列実行が同時に効く)。
+   枝刈り結果は `OlapCache::plan_segment_pruning` で観測できます。
+
+3. **オブジェクトストレージ直結のテーブルフォーマット — Databend 方式**
+   (`crates/aruaru-backup/src/table_format.rs`)
+   中国語一次資料 (「Databend 存储架构总览」「Databend 索引结构说明」) で
+   確認した snapshot → segment → block の3層メタデータを実装:
+   - `_ss/<32桁16進>_v1.json` (snapshot) / `_sg/<32桁16進>_v1.json`
+     (segment、**最大1000 block**) というパス構成。
+   - block ごとの min/max (`ColumnStats`) と bloom filter による枝刈り。
+     segment 側の集約統計で**丸ごと読み飛ばせる場合は block を一切見ない**。
+   - `prev_snapshot_id` の連鎖による時間旅行。
+   - **MetaSrv 相当の Snapshot Key の楽観的 CAS が成功して初めてコミット
+     成立**(古い親の上への書き込みは `CommitConflict`)。
+
+**正直な現状**: 検証は `cargo test --workspace` / `cargo build --workspace`
+までです。(1) `wal_service` は同一プロセス内のオブジェクト分離であり
+ネットワーク越しのストリーミング複製・管理 REST API 公開・既存 SQL 経路
+(`AS OF COMMIT`) への接続は**未実施**、(2) `table_format` の `ObjectStore`
+実装はメモリ上のみで既存の `s3.rs` へ**未接続**、Parquet 実体の書き出しも
+行いません、(3) RisingWave の Hummock (epoch/barrier ベースのチェック
+ポイント) と SingleStore の hash index / 行レベルロックは**未実装**です。
+次回への引き継ぎは [CLAUDE.md](CLAUDE.md) の HANDOFF 節に記載しています。
+
+---
+
 ## 📄 ライセンス
 
 Apache License 2.0 — 商用利用・改変・再配布すべて自由。  

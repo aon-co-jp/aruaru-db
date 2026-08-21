@@ -20,6 +20,15 @@ use s3::S3Client;
 pub mod sftp;
 use sftp::SftpClient;
 
+/// オブジェクトストレージ直結のテーブルフォーマット
+/// (Databend 方式の snapshot → segment → block メタデータ階層、
+/// 2026-08-22 追加。詳細は [`table_format`] のモジュールドキュメント)。
+pub mod table_format;
+pub use table_format::{
+    BlockMeta, BloomFilter, ColumnStats, InMemoryObjectStore, MetaService, ObjectStore, ObjectTable,
+    RangeOp, SegmentMeta, TableFormatError, TableSnapshot, MAX_BLOCKS_PER_SEGMENT,
+};
+
 // ── バックアップ設定 ──────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

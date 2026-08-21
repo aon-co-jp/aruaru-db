@@ -358,3 +358,31 @@ TiKVのsafe-ts・YugabyteDBの`yb_follower_read_staleness_ms`に相当する
 
 `aruaru-migrate`側については今回新たな発見はない(移行アダプタの
 インタフェースは変更していない)。
+
+## WAL サービス/Pageserver・セグメント統計・オブジェクトテーブルの移植メモ(2026-08-22追記)
+
+- **`aruaru-dist/src/wal_service.rs`(Neon 方式、新設)**: `Safekeeper`
+  (term fencing + `flush_lsn`)・`WalService`(quorum 番目の `flushLSN` を
+  `commitLSN` とする)・`Pageserver`(`get_page_at_lsn` によるページ再構成、
+  image/delta layer、バックプレッシャ)・それらを束ねる
+  `DisaggregatedStorage`から成る。**外部依存は `parking_lot` と
+  `thiserror` のみで、既存の Raft 実装・ストレージ層に一切依存しない**
+  ため、他プロジェクトへはファイル1つを持っていくだけで移植できる。
+  逆に言えば本リポジトリの SQL 実行経路とも未接続なので、移植先で
+  「書き込み時に `write()` を呼び、読み取り時に `get_page_at_lsn` を
+  経由させる」配線は移植先側で書く必要がある。
+- **`aruaru-query/src/olap.rs`(セグメント単位ゾーンマップ、改修)**:
+  `OlapCache`に`segment_rows`(既定1024)を追加し、`SegmentStats`
+  (offset/len/min-max)で部分スキップする形へ変更。Arrow の
+  `RecordBatch::slice`と DataFusion の`MemTable`(パーティション配列)に
+  依存するため、移植先が Arrow/DataFusion を使っていない場合は
+  「セグメント境界と min/max を持ち、証明できたセグメントをスキャン
+  対象から外す」という考え方だけを移すこと。
+- **`aruaru-backup/src/table_format.rs`(Databend 方式、新設)**:
+  `ObjectStore`トレイト(`put`/`get`/`list`の3メソッドのみ)を差し替え
+  可能な形にしてあるため、移植先の任意のオブジェクトストレージ
+  クライアントを実装して差し込める(同梱はメモリ実装のみ)。
+  依存は`serde`/`serde_json`/`sha2`/`hex`/`chrono`/`thiserror`。
+  コミットの原子性は`MetaService`の CAS 1点に集約してあるので、
+  移植先が etcd/FoundationDB 等の CAS を持つ場合は`MetaService`だけを
+  差し替えれば分散環境でもそのまま成立する設計。

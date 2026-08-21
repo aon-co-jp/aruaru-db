@@ -3526,3 +3526,229 @@ crate。
    (b) side transportをネットワーク越し(`raft/transport.rs`)へ配線、
    (c) `ReadPlan::FollowerRead`の時刻を既存の`AS OF COMMIT`読み取り経路へ
    実際に橋渡しする(現状はゲート判定までで読み取り本体と未接続)。
+
+## HANDOFF: 2026-08-22 Neon の pageserver/safekeeper 分離を一次資料で調査、
+WAL サービス層(safekeeper quorum + pageserver)を新規実装
+
+**経緯**: 前回エントリ(2026-08-21(続き6))で「次回の調査目星」として
+残した1件目、**Neon の pageserver / safekeeper 分離**を日本語・英語
+両方で検索し、一次資料(`neondatabase/neon`リポジトリ内の設計ドキュメント)
+で裏取りしてから実装した。
+
+### 調査で確認したこと(一次資料)
+
+- [`docs/walservice.md`](https://github.com/neondatabase/neon/blob/main/docs/walservice.md):
+  compute が生成した WAL は複数の **safekeeper** へストリームされ、
+  「**過半数の safekeeper がローカルディスクへ書き終えた時点で durable**」
+  と見なされる。safekeeper 群は Paxos ベースの合意で WAL を多重化し、
+  **単一 primary の強制**(2つの compute が同時に書くことの防止)も担う。
+  pageserver は primary からではなく **safekeeper 群から** streaming
+  replication で WAL を引く。safekeeper は「一時的な耐障害ストレージ」で
+  あり、最終的な永続化先は S3。
+- [`docs/safekeeper-protocol.md`](https://github.com/neondatabase/neon/blob/main/docs/safekeeper-protocol.md):
+  proposer は `(term, UUID)` の NodeID を持ち、**term は proposer 起動
+  ごとに増加**して split-brain を防ぐ。safekeeper は自分が受理済みの
+  NodeID 以上の提案のみ受理する。`commitLSN` は「全 safekeeper の
+  `flushLSN` を並べた配列の `flushLsn[n - quorum]` 要素」=
+  **quorum 番目に大きい flushLSN**。
+- [`docs/pageserver-storage.md`](https://github.com/neondatabase/neon/blob/main/docs/pageserver-storage.md)
+  ・ブログ["Deep dive into Neon storage engine"](https://neon.com/blog/get-page-at-lsn):
+  pageserver は WAL を継続的に取り込み、ページ単位に切り分けて
+  **要求 LSN のページを image layer + delta layer から再構成**する
+  (`get_page_at_lsn`)。対応する WAL が届くまでページ要求に応答しない
+  ことで一貫性を保証し、`max_replication_*_lag` でバックプレッシャをかける。
+
+### 発見したギャップ(コードで裏取り済み)
+
+`grep -rniE "safekeeper|pageserver|wal_service|commit_lsn|lsn" crates`
+を実行した結果、`crates/`内で LSN に言及していたのは
+`aruaru-core/src/version/mod.rs`の`create_branch_from`の**コメント**
+(Neon 方式ブランチングの説明)だけであり、**WAL を独立した quorum で
+耐久化する層、および「LSN 指定でページを再構成する層」は一切存在
+しなかった**。既存の`aruaru-dist::raft`は「合意 + 状態機械への適用」を
+同一ノード内で一体に行う構成で、Neon の中核設計である
+「WAL の耐久化(safekeeper)とページ再構成(pageserver)の分離」は無かった。
+
+### 実装した内容
+
+- **`crates/aruaru-dist/src/wal_service.rs`(新規、約620行)**
+  - `Safekeeper`: `accepted_term`による fencing、`flush_lsn`、
+    WAL の`accept`(LSN 単調増加を強制)・`stream(after, up_to)`・
+    pageserver 取り込み済み分の解放`truncate_up_to`。
+  - `WalService`: n 台の safekeeper を束ねる。`quorum() = n/2+1`。
+    `start_proposer()`が既存最大 term + 1 を全 safekeeper へ通知して
+    **古い proposer を fence**(単一 primary 強制)。`append(term, records)`
+    は quorum の ack を要求し、`recompute_commit_lsn()`で
+    **全 flush_lsn を降順に並べた quorum 番目**を commitLSN として採用
+    (Neon の`flushLsn[n - quorum]`と同じ計算)。commitLSN は単調増加のみ。
+    `stream_committed(after)`で pageserver へ配る。
+  - `Pageserver`: `ingest(&WalService)`で commitLSN までを取り込み
+    `last_record_lsn`を進める。`get_page_at_lsn(key, lsn)`が
+    image layer + delta layer からページを再構成し、
+    未着 LSN は`WalNotArrived`で拒否(Neon の「WAL が届くまで応答しない」)。
+    `create_image_layer(key, lsn)`が materialize + 以前の delta 破棄
+    (compaction)、それ未満の読み取りは`BelowGcCutoff`として**再構成
+    できないことを明示**。`check_replication_lag`がバックプレッシャ。
+  - `DisaggregatedStorage`: 上2つを束ね、`write(records)`(lag 検査 →
+    quorum 耐久化 → pageserver 取り込み)と`read_latest(key)`を提供。
+  - `PageDelta::{Replace, Append}` / `WalRecord` / `WalServiceError`。
+- `crates/aruaru-dist/src/lib.rs`: 上記型を`pub mod` + 再エクスポート。
+
+### 正直な簡略化点(誇張しない)
+
+1. **同一プロセス内のオブジェクト分離**であり、ネットワーク越しの
+   streaming replication は未実装。
+2. Paxos の完全実装ではない。**term による fencing と quorum flushLSN
+   による commitLSN 決定**という核だけを実装(投票フェーズでの WAL
+   突き合わせ・term_history の復旧は未実装)。
+3. ストレージは**メモリ上**(`BTreeMap`)。Neon の layer file / S3
+   アップロードに相当する永続化は未実装(`aruaru-backup`との接続は次回)。
+4. `PageDelta`は`Replace`/`Append`の2種のみで、PostgreSQL WAL の
+   `redo`再生ではない。
+5. 既存の SQL 実行経路・`AS OF COMMIT`読み取り・管理REST API には
+   **未接続**。本モジュール単体で完結する層として追加している
+   (前回の closed timestamp と同じ状況——両者を実経路へ橋渡しする
+   作業がまとめて残っている)。
+
+### 検証結果(実測)
+
+- `cargo test -p aruaru-dist` → **61 passed / 0 failed / 1 ignored**
+  (前回50件 + 新規11件: commitLSN の quorum 番目採用・非後退、
+  新 proposer による旧 proposer の fence、quorum 未達、LSN 非単調の拒否、
+  過去 LSN でのページ再構成、未着 LSN の拒否、image layer 生成と
+  GC cutoff、バックプレッシャ、取り込み後の WAL 解放、未知ページ)。
+- 実装中に`image_layer_materializes_and_drops_older_deltas`が
+  `PageNotFound`で**実際に失敗**した(image layer より前の LSN を
+  読もうとしたケース)。誤って image の内容を返すのは不正確なため、
+  `BelowGcCutoff`エラーを新設して「再構成できない」ことを明示する形に
+  修正した——テストを緩めずに設計を直した。
+- `cargo build --workspace` / `cargo test --workspace` の結果は下記
+  「ワークスペース全体の検証」に記載。
+
+### 次回の調査・開発の目星(更新版)
+
+前回リストのうち 1.(Neon)は今回着手済み。残りは以下。
+
+1. **今回実装分と前回実装分の「実経路への橋渡し」**(`aruaru-dist`、
+   `aruaru-server`、`aruaru-query`): (a) closed timestamp / WAL サービス
+   を管理REST API(`/admin/closed-timestamp/*`、`/admin/wal-service/*`)へ
+   公開し実プロセス HTTP で E2E 確認、(b) `ReadPlan::FollowerRead`の時刻と
+   `Pageserver::get_page_at_lsn`を既存の`AS OF COMMIT`読み取り経路へ接続、
+   (c) side transport / WAL ストリームをネットワーク越し
+   (`raft/transport.rs`)へ配線。**この橋渡しが2セッション分たまっている
+   ため、次回はここを優先するのが妥当**。
+2. **SingleStore(旧MemSQL)の rowstore/columnstore 単一テーブル同居**
+   (`aruaru-query::olap`)。
+3. **Databend / RisingWave のオブジェクトストレージ直結**
+   (`aruaru-backup`、`aruaru-core`)。今回の`Pageserver`をメモリから
+   S3(`aruaru-backup/src/s3.rs`)上の layer file へ載せる話と直結する。
+4. **CockroachDB Serverless / TiDB Serverless の弾力的コンピュート**
+   (`aruaru-server::ephemeral_pod`)。今回の pageserver 分離と
+   前回の closed timestamp を組み合わせ、読み取り専用 pod を実配線する。
+
+## HANDOFF: 2026-08-22(続き) 方針拡大 — ハイブリッド/HTAP系DBの要素技術を
+多言語(日英中韓)で横断調査し、優先度の高い3件を実装
+
+**経緯**: ユーザーより「前回HANDOFFの目星に限定せず、一から世界中の言語で
+Google/GitHub検索を行い、Snowflake×CockroachDB型ハイブリッドDBに関連する
+重要な技術要素を広く洗い出し、優先度の高いものから複数件を実装に反映する
+こと」という拡大指示を受けた。前回済みの follower reads / closed timestamp
+系(`closed_ts.rs`)は重複調査しない前提。
+
+### 今回の調査対象と、一次資料で確認した要素技術
+
+| # | 技術要素 | 出典(調査言語) | aruaru-db の状況 |
+|---|---|---|---|
+| 1 | Neon: safekeeper(WAL の Paxos quorum)と pageserver(ページ再構成)の分離、`commitLSN = flushLsn[n-quorum]`、term による単一primary強制、`get_page_at_lsn` | `neondatabase/neon`の`docs/walservice.md`・`docs/safekeeper-protocol.md`・`docs/pageserver-storage.md`(英/日) | **無かった → 実装した**(`aruaru-dist/src/wal_service.rs`) |
+| 2 | SingleStore Universal Storage: columnstore を segment 単位で持ち、hash index・subsegment access・行レベルロックで OLTP も columnstore で処理 | `docs.singlestore.com`の"Universal Storage"・"Choosing a Table Storage Type"(英) | 部分的。**segment 単位統計が無かった → 実装した**(`aruaru-query/src/olap.rs`)。hash index・行レベルロックは未実装 |
+| 3 | Databend: snapshot(`_ss/*.json`)→ segment(`_sg/*.json`、最大1000 block)→ block(parquet)の3層メタデータ、min/max・sparse index・bloom filter、**MetaSrv の Snapshot Key 書き込み成功=コミット成功**という ACID の根拠 | 「Databend 存储架构总览」「Databend 索引结构说明」(中国語一次資料、`cnblogs.com/databend`・`zhuanlan.zhihu.com`) | **無かった → 実装した**(`aruaru-backup/src/table_format.rs`) |
+| 4 | RisingWave: Hummock(共有 LSM state store)。shared buffer + オブジェクトストレージ、**Barrier に紐づく epoch を MVCC バージョンとして使う**チェックポイント方式 | `docs.risingwave.com/store/overview`、`risingwave.com/blog/hummock-a-storage-engine-designed-for-stream-processing`(英) | 未実装。ストリーミング(materialized view の増分維持)という別軸の前提が必要なため今回は見送り——**「該当なし」ではなく「未着手」**として記録 |
+| 5 | Snowflake Hybrid Tables(GA): 行ストアを一次ストアとし行ロックで高並行 OLTP、列側は分析用。HTAP を「unified storage / decoupled storage」に分類する整理 | `docs.snowflake.com/en/user-guide/tables-hybrid`(英)、HTAP survey `arxiv.org/pdf/2404.15670`(韓国語検索経由で発見) | 分類上 aruaru-db は **decoupled storage 型**(行ストア + `OlapCache` 列レプリカ)。単一テーブル内での行/列併存(SingleStore の #2 の完全形)は未実装 |
+
+### 実装した内容(3件)
+
+1. **`crates/aruaru-dist/src/wal_service.rs`(新規)** — Neon 方式。
+   詳細は直前の HANDOFF エントリを参照。
+2. **`crates/aruaru-query/src/olap.rs`(改修)** — セグメント単位ゾーンマップ。
+   従来はコード内にも「テーブル全体で1ブロック分の min/max しか持たない
+   (DuckDB のようなブロック単位の部分スキップは行わない)」と正直な
+   簡略化点として明記されていた箇所。SingleStore(segment)・Databend
+   (block)・DuckDB(Row Group)がいずれも**セグメント単位統計で部分
+   スキップ**している共通点を確認したため:
+   - `SegmentStats { offset, len, zone_maps }`を導入し、ベース列バッチを
+     `segment_rows`行(既定1024、`OlapCache::with_segment_rows`で変更可)
+     ごとに区切って各セグメントの min/max を保持。
+   - `query()`は、単純範囲述語に対して**該当行が絶対に無いと証明できた
+     セグメントを DataFusion へ渡さない**。生き残ったセグメントは
+     `RecordBatch::slice`(ゼロコピー)として1パーティションずつ登録する
+     ため、枝刈りと DataFusion のパーティション並列が同時に効く。
+   - 枝刈り結果は`plan_segment_pruning(sql) -> (table, 残数, 全数)`で観測可能。
+     偽陽性(該当行があるのに読み飛ばす)は構造上起こさない設計を維持。
+3. **`crates/aruaru-backup/src/table_format.rs`(新規)** — Databend 方式の
+   オブジェクトストレージ直結テーブルフォーマット。
+   - `ObjectStore`トレイト + `InMemoryObjectStore`。パス構成は Databend に
+     倣い`<root>/<db_id>/<table_id>/_ss/<32桁16進>_v1.json`(snapshot)・
+     `.../_sg/<32桁16進>_v1.json`(segment)。
+   - `BlockMeta`(min/max の`ColumnStats` + 等値述語用`BloomFilter`)、
+     `SegmentMeta`(block 集約統計、**1000 block 超過は
+     `SegmentTooLarge`で拒否**)、`TableSnapshot`(`prev_snapshot_id`の
+     連鎖で時間旅行)。
+   - `MetaService`(MetaSrv 相当)の**楽観的 CAS が成功して初めてコミット
+     成立**——古い親スナップショットの上へ書こうとすると
+     `CommitConflict`。書かれたオブジェクトは孤児として残る(Databend も
+     vacuum 対象として扱う)ことをコメントに明記。
+   - `prune_range`は**segment 統計で丸ごと読み飛ばせる場合 segment 内の
+     block を一切見ない**(Databend が segment 側にも min/max を持つ理由)。
+     戻り値で読み飛ばした segment 数・block 数を報告。`prune_equality`は
+     bloom filter による等値枝刈り(索引が無い block は安全側で残す)。
+
+### 正直な簡略化点(誇張しない)
+
+- `wal_service.rs`: 同一プロセス内、Paxos 完全実装ではない(term fencing +
+  quorum flushLSN のみ)、ストレージはメモリ、`redo`再生ではない、
+  既存 SQL 経路・管理 REST API へ未接続。
+- `olap.rs`: bloom filter・sparse index は未実装(min/max のみ)。
+  述語は`extract_simple_range_predicate`が拾える単純形のみ。
+- `table_format.rs`: **同梱の`ObjectStore`実装はメモリのみで、既存の
+  `s3.rs`(`S3Client`)へは未接続**。block 実体(Parquet)の書き出しも
+  行わない(メタデータ階層と枝刈り・コミットの正しさが担当範囲)。
+  sparse index 未実装。CAS リトライループは呼び出し側責務。
+- RisingWave Hummock(epoch/barrier ベースのチェックポイント)と
+  SingleStore の hash index / 行レベルロック / subsegment access は
+  **今回未実装**。「対応済み」とは書かない。
+
+### 検証結果(実測、2026-08-22)
+
+- `cargo build --workspace` → **成功**(警告は既存の`build_cluster`/
+  `propose_commit` dead_code 2件のみ、今回の変更とは無関係)。
+- `cargo test --workspace` → **全テストバイナリで`test result: ok`、
+  失敗0件**。内訳: aruaru-backup 33 passed(うち`table_format`新規10件)、
+  aruaru-core 14、aruaru-dist 61 passed/1 ignored(うち`wal_service`
+  新規11件)、aruaru-graphql 6、aruaru-migrate 9、aruaru-query 59
+  (うちセグメント枝刈り新規1件)、aruaru-registry 5、aruaru-server
+  3 passed/1 ignored、aruaru-wire 10、統合テスト2件は従来通り ignored
+  (実バイナリ起動が必要なもの)。
+- 実装中に`image_layer_materializes_and_drops_older_deltas`が実際に
+  失敗し、`BelowGcCutoff`エラーを新設して設計を直した(テストを緩めて
+  通したのではない)。
+- **未実施**: 実プロセス HTTP を立てた E2E 検証(管理REST API への公開が
+  まだ無いため)。「コンパイル+単体テストまで」であることを明記する。
+
+### 次回への引き継ぎ(2026-08-22時点、優先順)
+
+1. **橋渡しが3セッション分たまっている**: `closed_ts`(08-21)・
+   `wal_service`(08-22)・`table_format`(08-22)はいずれも
+   **既存のSQL実行経路・管理REST APIへ未接続**。次回はここを優先する:
+   (a) `/admin/wal-service/*`・`/admin/closed-timestamp/*`・
+   `/admin/object-table/*`を`aruaru-server`へ公開し、実プロセスHTTPで
+   E2E確認、(b) `Pageserver::get_page_at_lsn`と`ReadPlan::FollowerRead`を
+   既存の`AS OF COMMIT`読み取り経路へ接続、(c) `table_format`の
+   `ObjectStore`実装を既存の`s3.rs`(`S3Client`、非同期)へ接続。
+2. **RisingWave の Hummock**(未着手): Barrier に紐づく epoch を MVCC
+   バージョンとして使うチェックポイント方式。aruaru-db に
+   materialized view の増分維持が無いため前提整備が必要。
+3. **SingleStore の残り要素**: columnstore 上の hash index・
+   行レベルロック・subsegment access(単一テーブル内での行/列併存の完全形)。
+4. **`olap.rs`のセグメント統計の拡張**: bloom filter・sparse index
+   (今回は min/max のみ)。`table_format.rs`側には bloom filter が
+   あるので、実装を寄せられる可能性がある。
