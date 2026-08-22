@@ -3527,6 +3527,99 @@ crate。
    (c) `ReadPlan::FollowerRead`の時刻を既存の`AS OF COMMIT`読み取り経路へ
    実際に橋渡しする(現状はゲート判定までで読み取り本体と未接続)。
 
+## HANDOFF: 2026-08-22(続き2) CPU SIMD(AVX-512/AVX2/FMA3/PCLMULQDQ)適用可否を
+実コードで調査 — RAID-Z2連携経路は`open-raid-z`側のSIMD化を自動継承、
+このリポジトリ本体はコード変更**不要**と判断(理由を明記)
+
+**経緯**: ユーザー指示「AVX-512があればRAID6パリティ・NVMe RAID6の
+ランダムアクセス・AI処理が高速化できるはず。5リポジトリで実装せよ」への
+対応の一環。**この開発機のCPUはAMD Ryzen 9 3950X(Zen 2)でAVX-512は
+非搭載**であり、実測できるのはAVX2/FMA3/SHA-NIまでである点を先に明記する。
+
+### 調査結果(推測せず`grep`と実クレートソースで確認)
+
+1. **このリポジトリ全体にSIMDコードは存在しなかった**
+   (`avx|simd|is_x86_feature|target_feature`でヒット0件)。
+2. **しかし主要なCPU律速処理は、既にSIMD対応済みのライブラリへ委譲済み
+   だった**——「SIMDコードが無い=最適化されていない」ではない点が
+   今回の最大の発見:
+   - **チェックサム(SHA-256、`aruaru-core/src/storage/mod.rs`)**:
+     依存する`sha2` 0.10.9のソース
+     (`src/sha256/x86.rs:100`)に
+     `cpufeatures::new!(shani_cpuid, "sha", "sse2", "ssse3", "sse4.1");`
+     があることを実際に確認した——**SHA-NI(SHA拡張命令)を実行時検出して
+     使う**設計であり、Zen 2はSHA-NI搭載のため**この開発機では既に
+     ハードウェア高速化が効いている**。手書きSIMDを追加する余地は無い
+     (追加すれば劣化する)。
+   - **OLAP列処理(`aruaru-query/src/olap.rs`)**: Apache Arrow +
+     DataFusion。`compute::min`/`max`(ゾーンマップ)・
+     `filter_record_batch`(インクリメンタルマージ)はいずれもArrowの
+     ベクトル化カーネルであり、Arrow側でSIMD化されている。
+     自前のバイトループを書き足す箇所は無い。
+   - **ハッシュルーティング(`aruaru-query/src/sharded_store.rs`)**:
+     2026-08-21に自前`murmur3_32`へ移行済み(非暗号学的・軽量)。
+     SIMD化の余地はあるが、キー1本ごとの数十バイト処理であり
+     ベクトル幅を活かせない(バッチ化されていない)ため効果が見込めない。
+3. **PCLMULQDQの適用先は無かった**: PCLMULQDQが効くのはCRC32や
+   GF(2^128)(GHASH)のような単一の広い多項式演算だが、このリポジトリの
+   チェックサムはSHA-256(上記の通りSHA-NIで既に高速)であり、CRC系の
+   ホットパスは存在しない。**適用先が無い箇所へ命令を持ち込むことは
+   しなかった**(`open-raid-z`側の同日HANDOFFに、バイト単位GF(2^8)演算に
+   PCLMULQDQが使えない技術的理由〈隣接バイトへの積のビット混入〉も
+   記録してある)。
+
+### 実際に効いた変更(このリポジトリのコードは1行も変えていない)
+
+`aruaru-dist`の`raid_z_backend`(`open_raid_z` feature、Raftコミット×
+RAID-Z2スナップショット連携)は`open_raid_z_core`をpath依存している。
+同日、`open-raid-z`側で**RAID6(RAID-Z2/Z3)のP/Q/Rパリティ計算を
+CPU SIMD化**したため(`zfs_accel_hlsl/src/simd.rs`新設、実行時検出で
+AVX-512F+BW → AVX2 → SSE2/SSSE3 → スカラー)、**この連携経路は再ビルド
+するだけで自動的にその恩恵を受ける**。
+- `open-raid-z`側の実測(Ryzen 9 3950X、検出経路`avx2`):
+  P/Q生成 **8.94〜14.89倍**、P/Q/R生成 **9.21〜13.95倍**、
+  任意係数GF(2^8)乗算 **30.96倍**(いずれもGF乗算テーブル引き実装比)。
+  詳細・ベンチマークの前提条件は`open-raid-z/CLAUDE.md`の同日エントリ参照。
+- **NVMe 4枚以上のRAID6構成でランダムアクセスが速くなる、という主張は
+  していない**——上記はパリティ計算そのものの所要時間であり、
+  実NVMe SSDを4枚以上使った実機IOPS測定はこの開発機に該当構成が無いため
+  **未実施**。ただしRAID6のランダム書き込みはRead-Modify-Writeで
+  パリティ再計算が都度発生し、ディスク本数が増えるほど倍率が上がる
+  (8.9倍→14.9倍)ことは実測済みであり、CPU側パリティ計算がボトルネックに
+  なる場面ほど効くという方向性自体は妥当。
+
+### TEST(実測)
+
+- `cargo test -p aruaru-dist --features open_raid_z --release` →
+  **62 passed / 0 failed / 1 ignored**。SIMD化された
+  `open_raid_z_core`とリンクした状態で、実RAID-Z2プールへの
+  実`create_snapshot`を伴う`real_raft_commit_triggers_real_raid_z_
+  snapshot`を含め全green——**パリティ計算のアルゴリズムを
+  ホーナー法+SIMDへ差し替えても、このリポジトリ側の連携動作に
+  回帰が無いことを実測で確認した**。
+- このリポジトリのコード変更が無いため、他クレートのテストは前回
+  エントリの状態から変化しない。
+
+### 正直な開示・未実施
+
+- **AVX-512経路は`open-raid-z`側でコンパイル確認のみ**(この開発機が
+  非搭載のため実行・ベンチマーク未実施)。AVX-512搭載機へ載せ替えれば
+  コードの書き足し無しに`simd_level()`が`Avx512`を返して有効になる設計。
+- 実NVMe 4枚以上でのRAID6ランダム書き込みIOPS測定は未実施。
+- このリポジトリ本体へのSIMDコード追加は**意図的に見送った**——上記の
+  通り主要ホットパスが既にSIMD対応ライブラリ(sha2 + SHA-NI、
+  Arrow/DataFusion)へ委譲済みであり、手書きSIMDを重ねても改善しない
+  (むしろ保守負債になる)という判断。「コストが高いから見送った」のでは
+  なく「適用先が無いことをコードで確認した」ことを明記する。
+- 次にすべきこと: (1) AVX-512搭載機を入手した際に、`open-raid-z`の
+  `simd_parity_benchmark`を実行した上で、このリポジトリの
+  `raid_z_backend`経由のスナップショット所要時間も併せて測る。
+  (2) 将来`aruaru-query::olap`に自前のバッチ処理(bloom filter一括判定・
+  sparse index等、前回エントリの次回候補)を書く場合は、その時点で
+  初めてSIMDの適用余地が生まれるため再評価する。(3) CPU機能検出は
+  将来、共有クレート`open-cpu`(`aon-co-jp/open-cpu`、別セッションで
+  作成中)へ集約する方針が決まっている(2026-08-22ユーザー指示)。
+
 ## HANDOFF: 2026-08-22 Neon の pageserver/safekeeper 分離を一次資料で調査、
 WAL サービス層(safekeeper quorum + pageserver)を新規実装
 
