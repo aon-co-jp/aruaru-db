@@ -171,6 +171,112 @@ impl S3Client {
     }
 }
 
+/// Run an async future to completion from **synchronous** code, whether or
+/// not the calling thread already happens to be inside a tokio runtime.
+///
+/// Background (2026-08-24, task 3): [`crate::table_format::ObjectStore`]
+/// is a plain synchronous trait (`put`/`get`/`list`, no `async`/`Result`)
+/// -- deliberately so, since its only implementation until now
+/// (`InMemoryObjectStore`) is pure in-memory `BTreeMap` access with no I/O
+/// to await. `S3Client`'s own methods (`put_object`/`get_object`/
+/// `list_objects`) are `async fn`, so bridging the two can't just call
+/// `Handle::current().block_on(..)` -- that panics with "Cannot start a
+/// runtime from within a runtime" whenever the caller (e.g. an
+/// `aruaru-server` admin HTTP handler) is itself running on a tokio
+/// worker thread, which is exactly the intended caller here. Spawning a
+/// dedicated OS thread with its own single-threaded runtime sidesteps
+/// that: `std::thread::scope` lets the spawned closure borrow `self`
+/// (needed since `S3Client`'s methods take `&self`) without requiring
+/// `'static`, and the calling thread blocks on `.join()` until the S3
+/// round-trip completes -- so `ObjectStore::put`/`get`/`list` stay
+/// genuinely synchronous from the caller's point of view, at the cost of
+/// one extra thread + runtime per call (acceptable here: `ObjectTable`
+/// commits are not a hot per-row path, they happen once per
+/// snapshot/segment commit).
+fn run_blocking<F: std::future::Future + Send>(fut: F) -> F::Output
+where
+    F::Output: Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build tokio runtime for the S3 ObjectStore bridge")
+                    .block_on(fut)
+            })
+            .join()
+            .expect("S3 ObjectStore bridge thread panicked")
+    })
+}
+
+/// Strip this client's own bucket-level `prefix` (see [`S3Client::full_key`])
+/// back off of a raw S3 key, so [`ObjectStore::list`] returns keys in the
+/// same "path" namespace that [`ObjectStore::put`]/`get` accept --
+/// matching [`crate::table_format::InMemoryObjectStore`]'s contract, where
+/// `list()` returns exactly the strings `put()` was called with.
+fn strip_client_prefix(client_prefix: &str, key: &str) -> Option<String> {
+    if client_prefix.is_empty() {
+        return Some(key.to_string());
+    }
+    let want = format!("{}/", client_prefix.trim_end_matches('/'));
+    key.strip_prefix(want.as_str()).map(|s| s.to_string())
+}
+
+/// [`crate::table_format::ObjectStore`] backed by a real S3-compatible
+/// bucket (task 3, 2026-08-24) -- closes the gap `table_format.rs`'s
+/// module doc flagged: "the bundled implementation is in-memory only; a
+/// connection to the existing `s3.rs` (async I/O) is not implemented".
+/// `ObjectTable`/`MetaService` can now be constructed with
+/// `Arc::new(S3Client::new(..)?)` in place of `InMemoryObjectStore` to
+/// actually persist Databend-style snapshot/segment metadata to S3.
+///
+/// The trait has no way to report errors (`put` returns `()`, `get`
+/// returns `Option<Vec<u8>>`, `list` returns `Vec<String>`), so failures
+/// are logged via `tracing` rather than propagated -- `get`/`list`
+/// failures degrade to "not found"/"empty" (the same shape a caller would
+/// see for an object that's genuinely absent), and `put` failures are
+/// silently dropped from the caller's perspective beyond the log line.
+/// This is a real limitation: a network blip during a snapshot commit
+/// would look identical to "committed successfully" from
+/// `MetaService`'s point of view unless the log is checked. Widening
+/// `ObjectStore` itself to return `Result` would be the correct fix but
+/// touches every existing caller/impl (`InMemoryObjectStore`, all of
+/// `table_format.rs`'s tests) -- left as a follow-up rather than done
+/// speculatively here.
+impl crate::table_format::ObjectStore for S3Client {
+    fn put(&self, path: &str, bytes: Vec<u8>) {
+        if let Err(e) = run_blocking(self.put_object(path, bytes)) {
+            tracing::error!(path, error = %e, "S3 ObjectStore::put failed");
+        }
+    }
+
+    fn get(&self, path: &str) -> Option<Vec<u8>> {
+        match run_blocking(self.get_object(path)) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::debug!(path, error = %e, "S3 ObjectStore::get: treating as not-found");
+                None
+            }
+        }
+    }
+
+    fn list(&self, prefix: &str) -> Vec<String> {
+        match run_blocking(self.list_objects()) {
+            Ok(keys) => keys
+                .into_iter()
+                .filter_map(|k| strip_client_prefix(&self.prefix, &k))
+                .filter(|k| k.starts_with(prefix))
+                .collect(),
+            Err(e) => {
+                tracing::error!(prefix, error = %e, "S3 ObjectStore::list failed");
+                Vec::new()
+            }
+        }
+    }
+}
+
 /// Extract every `<Key>...</Key>` element's text content from a
 /// `ListObjectsV2` XML response body. Deliberately minimal (no real XML
 /// parser, no namespace handling) -- see `list_objects`'s doc comment for
@@ -249,6 +355,57 @@ mod tests {
                    </ListBucketResult>";
         let keys = extract_xml_keys(xml);
         assert_eq!(keys, vec!["aruaru-db/backup-1/MANIFEST.json", "aruaru-db/backup-2/MANIFEST.json"]);
+    }
+
+    #[test]
+    fn strip_client_prefix_removes_exactly_the_bucket_level_prefix() {
+        assert_eq!(
+            strip_client_prefix("aruaru-db", "aruaru-db/tbl/_ss/x_v1.json"),
+            Some("tbl/_ss/x_v1.json".to_string())
+        );
+        // A key that doesn't actually carry the expected prefix should not
+        // be silently truncated into something misleading.
+        assert_eq!(strip_client_prefix("aruaru-db", "other-app/x"), None);
+    }
+
+    #[test]
+    fn strip_client_prefix_is_passthrough_when_there_is_no_prefix() {
+        assert_eq!(strip_client_prefix("", "tbl/_ss/x_v1.json"), Some("tbl/_ss/x_v1.json".to_string()));
+    }
+
+    /// [`run_blocking`]'s entire reason to exist is to be callable from
+    /// code that is *already* running on a tokio worker thread (e.g. an
+    /// `aruaru-server` async admin handler) without hitting "Cannot start
+    /// a runtime from within a runtime". `#[tokio::test]` puts this test
+    /// itself on a tokio runtime, so this directly exercises that
+    /// scenario rather than just the easy case of calling it from
+    /// synchronous, runtime-free code.
+    #[tokio::test]
+    async fn run_blocking_works_even_when_called_from_inside_an_existing_tokio_runtime() {
+        let result = run_blocking(async {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            42
+        });
+        assert_eq!(result, 42);
+    }
+
+    /// **Honest limitation (2026-08-24, task 3)**: like `put_object`/
+    /// `get_object`/`list_objects` themselves (see this module's doc
+    /// comment), the `ObjectStore for S3Client` impl's actual HTTP
+    /// round-trips are not covered by an automated test here -- this
+    /// sandbox has no live S3-compatible server to test against. What
+    /// *is* verified above: the prefix-stripping logic `list()` depends
+    /// on to satisfy `ObjectStore`'s contract, and that the sync/async
+    /// bridge (`run_blocking`) does not deadlock when called from a
+    /// thread that is itself already driving a tokio runtime (the exact
+    /// situation an `aruaru-server` admin handler is in). A real
+    /// `put`/`get`/`list` round-trip against MinIO/AWS S3 remains
+    /// unverified in this environment, same as the pre-existing
+    /// `put_object`/`get_object`/`list_objects` tests above.
+    #[test]
+    fn object_store_impl_exists_and_type_checks_against_the_trait() {
+        fn assert_impl<T: crate::table_format::ObjectStore>() {}
+        assert_impl::<S3Client>();
     }
 
     #[test]

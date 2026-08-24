@@ -185,6 +185,29 @@ impl VersionController {
             .cloned()
     }
 
+    /// **タイムスタンプ → コミットの解決**(2026-08-24新設)。
+    ///
+    /// `aruaru-dist::closed_ts::ReadPlan::FollowerRead{timestamp, ..}`が
+    /// 判定する「この時刻なら安全に読める」という論理ナノ秒タイムスタンプを、
+    /// 実際に読み出すべき`AS OF COMMIT`の`commit_id`へ変換するための橋渡し。
+    /// 現在のブランチの履歴を HEAD から祖先方向へたどり、
+    /// `commit.timestamp <= timestamp_nanos`を満たす**最初の**(=最も新しい)
+    /// コミットを返す(CockroachDBの「closed timestamp以下の読み取りは
+    /// その時点で確定していた最新コミットを見る」という意味論と同じ)。
+    /// 該当するコミットが無い(要求時刻が最古のコミットより前)場合は`None`。
+    pub fn find_commit_at_or_before(&self, timestamp_nanos: i64) -> Option<Commit> {
+        let mut current = self.head();
+        while let Some(commit) = current {
+            if commit.timestamp <= timestamp_nanos {
+                return Some(commit);
+            }
+            current = commit.parent.as_ref().and_then(|pid| {
+                self.commits.read().get(pid).cloned()
+            });
+        }
+        None
+    }
+
     /// コミットログ (HEAD から祖先方向)
     pub fn log(&self, limit: usize) -> Vec<Commit> {
         let mut result = Vec::new();

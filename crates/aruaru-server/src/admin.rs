@@ -10,6 +10,7 @@
 //!   リモートプッシュダウン → 受理してジョブIDを返し、正直に「未実装」を message に記す
 //!   (aruaru-backup / aruaru-migrate / 分散実行が完成したら差し替え)
 
+use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Instant;
@@ -382,6 +383,13 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         .at("/closed-timestamp/range", post(closed_ts_register))
         .at("/closed-timestamp/advance", post(closed_ts_advance))
         .at("/closed-timestamp/plan", post(closed_ts_plan))
+        // 【2026-08-24新設・タスク2】side transportのネットワーク越し配線
+        // (`aruaru_dist::raft::transport::HttpSideTransport`)。受信側
+        // (このエンドポイント)は他ノードから届いた closed timestamp
+        // 更新を取り込む。送信側は`/closed-timestamp/publish`でこの
+        // エンドポイントへ実際にHTTP POSTする。
+        .at("/closed-timestamp/receive", post(closed_ts_receive))
+        .at("/closed-timestamp/publish", post(closed_ts_publish))
         .at("/wal-service", get(wal_service_status))
         .at("/wal-service/append", post(wal_service_append))
         .at("/wal-service/page", post(wal_service_page))
@@ -1333,6 +1341,18 @@ struct ClosedTsPlanRequest {
     /// bounded では許容する最大の遅れ、exact では読み取り時刻の遡り量。
     #[serde(default)]
     staleness_nanos: Option<u64>,
+    /// 【2026-08-24追記】指定すると、判定(gate)だけで終わらず
+    /// `ReadPlan::FollowerRead`が許可された場合に実際に
+    /// `QueryEngine::select_follower_read`でテーブルを読み出す
+    /// (`AS OF COMMIT`と同じProlly Tree経由の読み取り経路)。
+    /// `RouteToLeaseholder`と判定された場合は読み取りを行わず理由のみ返す。
+    #[serde(default)]
+    table: Option<String>,
+    /// `WHERE col = value`のPK一致フィルタ(省略時はフルテーブルスキャン)。
+    #[serde(default)]
+    filter_col: Option<String>,
+    #[serde(default)]
+    filter_val: Option<String>,
 }
 
 fn now_nanos() -> u64 {
@@ -1403,6 +1423,31 @@ fn closed_ts_plan(state: Data<&Arc<AdminState>>, Json(req): Json<ClosedTsPlanReq
         aruaru_dist::ReadPlan::FollowerRead { .. } => ("follower_read", None),
         aruaru_dist::ReadPlan::RouteToLeaseholder { reason } => ("route_to_leaseholder", Some(*reason)),
     };
+
+    // 【2026-08-24追記】gate判定(上記)だけで終わらせず、`table`が指定され
+    // かつ`FollowerRead`が許可された場合は実際にデータを読み出す
+    // (`QueryEngine::select_follower_read`、`AS OF COMMIT`と同じProlly Tree
+    // 経由の読み取り経路への接続——タスク要件「FollowerReadのtimestampを
+    // 使って実際に該当する過去コミットの読み取りを行える経路」)。
+    let data = match (&plan, &req.table) {
+        (aruaru_dist::ReadPlan::FollowerRead { timestamp, .. }, Some(table)) => {
+            let filter = match (&req.filter_col, &req.filter_val) {
+                (Some(col), Some(val)) => Some((col.clone(), val.clone())),
+                _ => None,
+            };
+            // ReadPlan::Timestamp は論理ナノ秒 u64、Commit.timestamp は
+            // Unix ナノ秒 i64 — このコーディネータではテスト/管理APIから
+            // 単調増加する値が渡される前提(closed_ts.rs冒頭のスコープ注記1
+            // 参照)であり、実運用では両者とも実時刻ベースの値になるため
+            // 素直に i64 へキャストしてよい。
+            match state.engine.select_follower_read(table.clone(), filter, *timestamp as i64) {
+                Ok(resp) => Some(json!({ "ok": true, "result": resp })),
+                Err(e) => Some(json!({ "ok": false, "error": e })),
+            }
+        }
+        _ => None,
+    };
+
     Json(json!({
         "success": true,
         "mode": mode,
@@ -1412,7 +1457,84 @@ fn closed_ts_plan(state: Data<&Arc<AdminState>>, Json(req): Json<ClosedTsPlanReq
         "is_follower_read": plan.is_follower_read(),
         "read_timestamp": plan.timestamp(),
         "reason": reason,
+        "data": data,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ClosedTsReceiveRequest {
+    updates: Vec<ClosedTsUpdate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClosedTsUpdate {
+    range_id: u64,
+    closed_timestamp: aruaru_dist::Timestamp,
+}
+
+/// `POST /admin/closed-timestamp/receive` — side transport の受信側
+/// (2026-08-24新設・タスク2)。他ノード(leaseholder)から
+/// `HttpSideTransport::publish_to`経由で届いた closed timestamp 更新を
+/// このノードの`ClosedTimestampCoordinator`へ取り込む(follower側)。
+#[handler]
+fn closed_ts_receive(state: Data<&Arc<AdminState>>, Json(req): Json<ClosedTsReceiveRequest>) -> Json<Value> {
+    let updates: Vec<(u64, aruaru_dist::Timestamp)> =
+        req.updates.iter().map(|u| (u.range_id, u.closed_timestamp)).collect();
+    let advanced = state.closed_ts.apply_closed_timestamp_updates(&updates);
+    Json(json!({
+        "success": true,
+        "received": updates.len(),
+        "advanced": advanced,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ClosedTsPublishRequest {
+    /// 送信先ノードの識別子(ログ・エラーメッセージ用、ルーティングには
+    /// `peer_url`を使う——`HttpTransport`と同じ`node_id -> base_url`の
+    /// 発想だが、このエンドポイントは単発publish用のため直接URLを受け取る)。
+    peer_id: u64,
+    /// 送信先ノードの `/admin` を含まないベースURL (例: `http://127.0.0.1:6002`)。
+    peer_url: String,
+    /// 省略時は現在保持している全Range。
+    #[serde(default)]
+    range_ids: Option<Vec<u64>>,
+}
+
+/// `POST /admin/closed-timestamp/publish` — side transport の送信側
+/// (2026-08-24新設・タスク2)。このノード(leaseholder想定)が保持する
+/// closed timestampを、実際に`HttpSideTransport`(`raft/transport.rs`、
+/// `HttpTransport`のAppendEntries送信と同じHTTP+`x-admin-token`パターン)
+/// 経由で指定したfollowerノードへネットワーク越しに配布する。
+#[handler]
+async fn closed_ts_publish(
+    state: Data<&Arc<AdminState>>,
+    Json(req): Json<ClosedTsPublishRequest>,
+) -> Json<Value> {
+    let mut snapshot = state.closed_ts.snapshot_closed_timestamps();
+    if let Some(ids) = &req.range_ids {
+        let allow: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        snapshot.retain(|(id, _)| allow.contains(id));
+    }
+    let mut peers = HashMap::new();
+    peers.insert(req.peer_id, req.peer_url.clone());
+    let transport = match aruaru_dist::raft::transport::HttpSideTransport::new(peers) {
+        Ok(t) => t,
+        Err(e) => return Json(json!({ "success": false, "error": format!("failed to build transport: {e}") })),
+    };
+    match transport.publish_to(req.peer_id, snapshot.clone()).await {
+        Ok(advanced) => Json(json!({
+            "success": true,
+            "peer_id": req.peer_id,
+            "sent": snapshot.len(),
+            "advanced_on_peer": advanced,
+        })),
+        Err(e) => Json(json!({
+            "success": false,
+            "peer_id": req.peer_id,
+            "error": format!("failed to publish closed timestamps to peer {}: {e}", req.peer_id),
+        })),
+    }
 }
 
 #[derive(Debug, Deserialize)]

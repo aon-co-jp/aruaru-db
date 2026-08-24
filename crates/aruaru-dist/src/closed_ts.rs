@@ -37,11 +37,19 @@
 //!    「その時刻で読んでよいか」の判定 (安全性ゲート) までを担い、
 //!    実際に過去バージョンを読み出す処理は既存の Git-on-SQL /
 //!    `AS OF COMMIT` 経路の責務として分離している。
-//! 3. side transport は**同一プロセス内のオブジェクト間通知**
-//!    (`publish_to`) として実装する。ネットワーク越しの定期配送
-//!    (CockroachDB の `closedts/sidetransport`) は、`aruaru-dist` の
-//!    Raft トランスポートが真のネットワーク実装へ移行する時点で
-//!    あわせて配線する。
+//! 3. side transport は当初**同一プロセス内のオブジェクト間通知**
+//!    (`publish_to`) としてのみ実装していたが、**2026-08-24、
+//!    `aruaru-dist::raft::transport::HttpSideTransport`でネットワーク
+//!    越しの配布を追加した**(`HttpTransport`のAppendEntries/RequestVote
+//!    送信と同じHTTP + `x-admin-token`パターン)。送信側は
+//!    `snapshot_closed_timestamps`でスナップショットを取り出し
+//!    `HttpSideTransport::publish_to`で他ノードの
+//!    `POST /admin/closed-timestamp/receive`へ実際にPOSTする、受信側は
+//!    `apply_closed_timestamp_updates`で取り込む。CockroachDBの
+//!    `closedts/sidetransport`のような**定期的な自動配送**(バックグラウンド
+//!    ループでの周期送信)は今回は実装しておらず、呼び出し側が
+//!    `POST /admin/closed-timestamp/publish`を能動的に呼ぶ必要がある
+//!    (正直な簡略化点、次回候補)。
 //! 4. Range を跨ぐ読み取りの交渉は「関与する全 Range の closed timestamp
 //!    の最小値」を取る単純方式。CockroachDB の bounded staleness が行う
 //!    「ロックを避ける時刻交渉」までは行わない。
@@ -231,15 +239,38 @@ impl ClosedTimestampCoordinator {
     /// side transport: 自分 (leaseholder 側) の closed timestamp を
     /// follower 側のコーディネータへ配布する。follower 側に未知の Range は
     /// その場で登録する。戻り値は実際に前進した Range 数。
+    ///
+    /// **同一プロセス内**の2つのコーディネータ間でのみ使える(`follower`が
+    /// `&ClosedTimestampCoordinator`という直接参照を要求するため)。
+    /// ネットワーク越しの別プロセスへ配布する場合は`snapshot_closed_
+    /// timestamps`(送信側)+`apply_closed_timestamp_updates`(受信側)を
+    /// HTTP等のトランスポート越しに組み合わせて使う
+    /// (`aruaru-dist::raft::transport::HttpSideTransport`参照、2026-08-24新設)。
     pub fn publish_to(&self, follower: &ClosedTimestampCoordinator) -> usize {
-        let updates: Vec<(u64, Timestamp)> = {
-            let trackers = self.trackers.read();
-            trackers.iter().map(|(id, t)| (*id, t.closed_timestamp())).collect()
-        };
+        follower.apply_closed_timestamp_updates(&self.snapshot_closed_timestamps())
+    }
+
+    /// side transport の送信側: 現在保持している全 Range の closed
+    /// timestamp をスナップショットとして取り出す(`range_id`昇順)。
+    /// ネットワーク越しの送信(HTTP JSONボディ等)にそのままシリアライズ
+    /// できる形。
+    pub fn snapshot_closed_timestamps(&self) -> Vec<(u64, Timestamp)> {
+        let trackers = self.trackers.read();
+        let mut v: Vec<(u64, Timestamp)> =
+            trackers.iter().map(|(id, t)| (*id, t.closed_timestamp())).collect();
+        v.sort_unstable_by_key(|(id, _)| *id);
+        v
+    }
+
+    /// side transport の受信側: 他ノード(leaseholder)から届いた
+    /// `(range_id, closed_timestamp)`群を取り込む。未知の Range はその場で
+    /// 登録する。戻り値は実際に前進した Range 数(`receive_update`が
+    /// 後退・重複通知を無視する冪等性をそのまま引き継ぐ)。
+    pub fn apply_closed_timestamp_updates(&self, updates: &[(u64, Timestamp)]) -> usize {
         let mut advanced = 0;
         for (range_id, ts) in updates {
-            let tracker = follower.register_range(range_id);
-            if tracker.receive_update(ts) {
+            let tracker = self.register_range(*range_id);
+            if tracker.receive_update(*ts) {
                 advanced += 1;
             }
         }
@@ -421,6 +452,33 @@ mod tests {
             c.negotiate_bounded_staleness(&[5], 10 * SEC, 30 * SEC),
             ReadPlan::RouteToLeaseholder { reason: "closed timestamp not yet advanced" }
         );
+    }
+
+    /// `snapshot_closed_timestamps`/`apply_closed_timestamp_updates`の
+    /// 往復(2026-08-24新設・タスク2の下地)。実際のネットワーク送信は
+    /// `HttpSideTransport`(`raft::transport`)が担うが、その送受信ロジックが
+    /// 依拠する「取り出し→適用」の往復そのものは`aruaru-dist`のこのモジュール
+    /// 単体でも検証できる(送受信データの型を`(u64, Timestamp)`のタプル列に
+    /// 統一したことで、`publish_to`(同一プロセス内)と`HttpSideTransport`
+    /// (ネットワーク越し)の両方が同じ往復を再利用できることの裏付け)。
+    #[test]
+    fn snapshot_and_apply_round_trip_matches_in_process_publish_to() {
+        let leader = ClosedTimestampCoordinator::new(3 * SEC);
+        leader.register_range(10);
+        leader.register_range(20);
+        leader.advance_all(30 * SEC);
+
+        let snapshot = leader.snapshot_closed_timestamps();
+        assert_eq!(snapshot, vec![(10, 27 * SEC), (20, 27 * SEC)]);
+
+        let follower = ClosedTimestampCoordinator::new(3 * SEC);
+        let advanced = follower.apply_closed_timestamp_updates(&snapshot);
+        assert_eq!(advanced, 2);
+        assert_eq!(follower.tracker(10).unwrap().closed_timestamp(), 27 * SEC);
+        assert_eq!(follower.tracker(20).unwrap().closed_timestamp(), 27 * SEC);
+
+        // 再適用は冪等 (何も前進しない)。
+        assert_eq!(follower.apply_closed_timestamp_updates(&snapshot), 0);
     }
 
     #[test]
