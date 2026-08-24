@@ -1273,6 +1273,38 @@ impl QueryEngine {
         })
     }
 
+    /// **Follower Read の実データ読み取り経路への接続**(2026-08-24新設)。
+    ///
+    /// `aruaru-dist::closed_ts::ReadPlan::FollowerRead{timestamp, ..}`は、
+    /// これまで「この論理ナノ秒タイムスタンプなら安全に読んでよいか」の
+    /// 安全性ゲート判定までしか実装されておらず(`closed_ts.rs`冒頭の
+    /// スコープ注記2参照)、実際に過去バージョンを読み出す処理には
+    /// 未接続だった。本メソッドがその橋渡し: `timestamp_nanos`(呼び出し側は
+    /// `ReadPlan::FollowerRead::timestamp`をそのまま渡す)を
+    /// `VersionController::find_commit_at_or_before`で「その時刻以前に
+    /// 確定していた最新コミット」へ解決し、既存の`select_as_of`
+    /// (`AS OF COMMIT`と全く同じ読み取りロジック、Prolly Tree経由)へ委譲する。
+    /// `aruaru-query`は`aruaru-dist`に依存しない設計を保つため、
+    /// `ReadPlan`型そのものではなく解決済みの生タイムスタンプ(i64、
+    /// Unixナノ秒)を受け取る——`ReadPlan`から実際に呼び出すのは
+    /// `aruaru-dist`/`aruaru-query`の両方に依存できる`aruaru-server`側の責務。
+    pub fn select_follower_read(
+        &self,
+        table: String,
+        filter: Option<(String, String)>,
+        timestamp_nanos: i64,
+    ) -> Result<QueryResponse, String> {
+        let commit = self
+            .version
+            .find_commit_at_or_before(timestamp_nanos)
+            .ok_or_else(|| {
+                format!(
+                    "no commit found at or before timestamp {timestamp_nanos} (follower read timestamp is older than the oldest commit)"
+                )
+            })?;
+        self.select_as_of(table, filter, commit.id.as_str().to_string())
+    }
+
     // ── Git-on-SQL ───────────────────────────────────────────
 
     fn aruaru_fn(&self, name: &str, arg: Option<String>) -> Result<QueryResponse, String> {
@@ -1760,6 +1792,72 @@ mod tests {
         assert!(eng
             .execute("SELECT qty FROM items WHERE id = 'sword' AS OF COMMIT 'deadbeef'")
             .is_err());
+    }
+
+    /// **タスク1(2026-08-24)**: `ReadPlan::FollowerRead`が判定する
+    /// 論理タイムスタンプが、実際にその時点のコミットへ解決され
+    /// `select_as_of`と同じProlly Tree経由の実データ読み取りへ到達する
+    /// ことの一気通貫テスト。`aruaru-dist::closed_ts::ReadPlan`型そのものは
+    /// `aruaru-query`が依存しない設計を保つため、ここでは
+    /// `ReadPlan::FollowerRead::timestamp`に相当する生タイムスタンプを
+    /// 直接渡す(`aruaru-server`側で実際に`ReadPlan`から取り出して渡す
+    /// 配線を担う、`admin.rs::closed_ts_plan`参照)。
+    #[test]
+    fn select_follower_read_resolves_a_timestamp_to_the_commit_that_was_current_at_that_time() {
+        let eng = QueryEngine::new();
+        eng.execute("CREATE TABLE items (id TEXT, qty INT)").unwrap();
+        eng.execute("INSERT INTO items (id, qty) VALUES ('sword', 1)").unwrap();
+        let commit_1_id = match eng.execute("SELECT aruaru_commit('first grant')").unwrap() {
+            QueryResponse::Rows { rows, .. } => match &rows[0][0] {
+                Value::Text(s) => s.clone(),
+                _ => panic!("expected text commit id"),
+            },
+            _ => panic!("expected rows"),
+        };
+        let commit_1_ts = eng.version().get_commit_by_str(&commit_1_id).unwrap().timestamp;
+
+        eng.execute("UPDATE items SET qty = '5' WHERE id = 'sword'").unwrap();
+        let commit_2_id = match eng.execute("SELECT aruaru_commit('quantity bumped')").unwrap() {
+            QueryResponse::Rows { rows, .. } => match &rows[0][0] {
+                Value::Text(s) => s.clone(),
+                _ => panic!("expected text commit id"),
+            },
+            _ => panic!("expected rows"),
+        };
+        let commit_2_ts = eng.version().get_commit_by_str(&commit_2_id).unwrap().timestamp;
+        assert!(commit_2_ts >= commit_1_ts);
+
+        // commit_1 時点のタイムスタンプでの follower read -> qty=1
+        let resp1 = eng
+            .select_follower_read(
+                "items".to_string(),
+                Some(("id".to_string(), "sword".to_string())),
+                commit_1_ts,
+            )
+            .unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp1 {
+            assert_eq!(rows[0][1], Value::Text("1".to_string()));
+        } else {
+            panic!("expected rows");
+        }
+
+        // commit_2 時点のタイムスタンプでの follower read -> qty=5
+        let resp2 = eng
+            .select_follower_read(
+                "items".to_string(),
+                Some(("id".to_string(), "sword".to_string())),
+                commit_2_ts,
+            )
+            .unwrap();
+        if let QueryResponse::Rows { rows, .. } = resp2 {
+            assert_eq!(rows[0][1], Value::Text("5".to_string()));
+        } else {
+            panic!("expected rows");
+        }
+
+        // 最古のコミットより前のタイムスタンプは解決できずエラー
+        // (follower readとして安全に応答できるコミットが存在しない)。
+        assert!(eng.select_follower_read("items".to_string(), None, -1).is_err());
     }
 
     /// **2026-07-27追記**: `WHERE`無し(複数行・フルテーブルスキャン)の

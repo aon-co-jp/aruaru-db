@@ -110,3 +110,80 @@ impl Transport for HttpTransport {
         Ok(resp)
     }
 }
+
+/// **closed timestamp side transport のネットワーク越し実装**
+/// (2026-08-24新設、タスク要件「side transport をネットワーク越し
+/// (raft/transport.rs)へ配線」への対応)。
+///
+/// `closed_ts::ClosedTimestampCoordinator::publish_to`はこれまで
+/// 「同一プロセス内のオブジェクト間通知」(`&ClosedTimestampCoordinator`を
+/// 直接参照する)としてしか実装されておらず、`closed_ts.rs`冒頭の
+/// スコープ注記3が「Raftトランスポートが真のネットワーク実装へ移行する
+/// 時点であわせて配線する」と明記していた通りの箇所。`HttpTransport`
+/// (AppendEntries/RequestVoteの送信側)と全く同じパターン
+/// (`peers: HashMap<node_id, base_url>`、`x-admin-token`ヘッダー付与)で、
+/// 受信側は`aruaru-server`の`POST /admin/closed-timestamp/receive`
+/// (`admin.rs`、本コミットで新設)。
+pub struct HttpSideTransport {
+    client: reqwest::Client,
+    peers: HashMap<u64, String>,
+    admin_token: Option<String>,
+}
+
+impl HttpSideTransport {
+    pub fn new(peers: HashMap<u64, String>) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()?;
+        let admin_token = std::env::var("ARUARU_DB_ADMIN_TOKEN").ok();
+        Ok(Self { client, peers, admin_token })
+    }
+
+    fn base(&self, peer: u64) -> anyhow::Result<&str> {
+        self.peers
+            .get(&peer)
+            .map(|s| s.as_str())
+            .ok_or_else(|| anyhow::anyhow!("unknown peer: {peer}"))
+    }
+
+    /// 自ノードが保持する closed timestamp のスナップショットを、
+    /// 指定した follower peer へネットワーク越しに配布する。
+    /// 戻り値は follower 側で実際に前進した Range 数
+    /// (`receive_update`の冪等性をそのまま引き継ぐ)。
+    pub async fn publish_to(
+        &self,
+        peer: u64,
+        updates: Vec<(u64, super::super::closed_ts::Timestamp)>,
+    ) -> anyhow::Result<usize> {
+        let url = format!("{}/admin/closed-timestamp/receive", self.base(peer)?);
+        let body = SideTransportBody {
+            updates: updates
+                .into_iter()
+                .map(|(range_id, closed_timestamp)| SideTransportUpdate { range_id, closed_timestamp })
+                .collect(),
+        };
+        let mut builder = self.client.post(url).json(&body);
+        if let Some(token) = &self.admin_token {
+            builder = builder.header("x-admin-token", token);
+        }
+        let resp: SideTransportResp =
+            builder.send().await?.error_for_status()?.json().await?;
+        Ok(resp.advanced)
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SideTransportUpdate {
+    range_id: u64,
+    closed_timestamp: super::super::closed_ts::Timestamp,
+}
+
+#[derive(serde::Serialize)]
+struct SideTransportBody {
+    updates: Vec<SideTransportUpdate>,
+}
+
+#[derive(serde::Deserialize)]
+struct SideTransportResp {
+    advanced: usize,
+}
