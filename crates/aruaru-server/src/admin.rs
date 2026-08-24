@@ -73,6 +73,21 @@ pub struct AdminState {
     /// 選択)。値は文字列固定(JSON文字列をそのまま保持、`ShardedRowStore<V>`
     /// の型パラメータを固定した最小構成)。
     sharded_store: aruaru_query::sharded_store::ShardedRowStore<String>,
+    /// 【2026-08-24新設・橋渡し】CockroachDB方式のclosed timestamp
+    /// (`aruaru-dist::closed_ts`)。2026-08-21に実装されたが管理APIへ
+    /// 未接続のままだったものを、`/admin/closed-timestamp/*`として公開する。
+    /// 既存のSQL実行経路(pgwire/GraphQL)の読み取り判定そのものを
+    /// 置き換えるものではなく、**follower readを行ってよいかの判定を
+    /// 外部から実際に問い合わせられるようにする**オプトインの経路。
+    closed_ts: Arc<aruaru_dist::ClosedTimestampCoordinator>,
+    /// 【2026-08-24新設・橋渡し】Neon方式のsafekeeper/pageserver分離
+    /// (`aruaru-dist::wal_service`)。`/admin/wal-service/*`として公開。
+    wal_storage: Arc<aruaru_dist::DisaggregatedStorage>,
+    /// 【2026-08-24新設・橋渡し】Databend方式のオブジェクトストレージ
+    /// 直結テーブルフォーマット(`aruaru-backup::table_format`)。
+    /// `/admin/object-table/*`として公開。ObjectStoreの実体は依然として
+    /// インメモリ(`InMemoryObjectStore`)であり、S3へは未接続。
+    object_table: Arc<aruaru_backup::table_format::ObjectTable>,
 }
 
 impl AdminState {
@@ -93,6 +108,19 @@ impl AdminState {
             // shard_count=0 -> このマシンの論理コア数を自動採用
             // (ScyllaDBの既定「コア数と同数のシャード」を踏襲、`sharded_store.rs`docコメント参照)。
             sharded_store: aruaru_query::sharded_store::ShardedRowStore::new(0),
+            closed_ts: Arc::new(aruaru_dist::ClosedTimestampCoordinator::with_default_lag()),
+            // safekeeper 3台 (quorum=2) の既定構成。
+            wal_storage: Arc::new(aruaru_dist::DisaggregatedStorage::new(
+                3,
+                aruaru_dist::DEFAULT_MAX_REPLICATION_LAG,
+            )),
+            object_table: Arc::new(aruaru_backup::table_format::ObjectTable::new(
+                Arc::new(aruaru_backup::table_format::InMemoryObjectStore::new()),
+                Arc::new(aruaru_backup::table_format::MetaService::new()),
+                "aruaru",
+                1,
+                1,
+            )),
         })
     }
 
@@ -348,6 +376,19 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         .at("/sharded-store", post(sharded_store_put))
         .at("/sharded-store/:key", get(sharded_store_get))
         .at("/sharded-store-stats", get(sharded_store_stats))
+        // 【2026-08-24新設・橋渡し】closed timestamp / WALサービス /
+        // オブジェクトテーブルを実プロセスのHTTPから叩けるようにする。
+        .at("/closed-timestamp", get(closed_ts_status))
+        .at("/closed-timestamp/range", post(closed_ts_register))
+        .at("/closed-timestamp/advance", post(closed_ts_advance))
+        .at("/closed-timestamp/plan", post(closed_ts_plan))
+        .at("/wal-service", get(wal_service_status))
+        .at("/wal-service/append", post(wal_service_append))
+        .at("/wal-service/page", post(wal_service_page))
+        .at("/wal-service/image-layer", post(wal_service_image_layer))
+        .at("/object-table", get(object_table_status))
+        .at("/object-table/commit", post(object_table_commit))
+        .at("/object-table/prune", post(object_table_prune))
         .at("/registry", get(registry_list))
         .at("/registry/summary", get(registry_summary))
         .at("/registry/crawl", post(registry_crawl))
@@ -1253,5 +1294,365 @@ async fn verify_disaster_email_backup(req: &Request, state: Data<&Arc<AdminState
             format!("verification task panicked: {e}"),
             poem::http::StatusCode::INTERNAL_SERVER_ERROR,
         )),
+    }
+}
+
+// ── 【2026-08-24新設】closed timestamp / WALサービス / オブジェクト
+//    テーブルの実経路への橋渡し ──────────────────────────────────
+//
+// 2026-08-21〜08-22に実装された3モジュール(`aruaru-dist::closed_ts`、
+// `aruaru-dist::wal_service`、`aruaru-backup::table_format`)は、
+// いずれも単体テストのみで管理APIへ未接続だった(CLAUDE.mdのHANDOFFで
+// 「橋渡しが3セッション分たまっている」と明記されていた項目)。ここで
+// `/admin/*`へ公開し、実プロセスのHTTP経由で実際に呼べるようにする。
+//
+// 既存のpgwire/GraphQL書き込み経路の判定ロジックそのものを置き換える
+// のではなく、**オプトインの独立経路**として公開する方針
+// (`multi-raft`・`sharded-store`と同じ、既存機能を壊さない方式)。
+
+#[derive(Debug, Deserialize)]
+struct ClosedTsRangeRequest {
+    range_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClosedTsAdvanceRequest {
+    /// 進める基準時刻(ナノ秒)。省略時は現在時刻(UNIX epoch ナノ秒)。
+    #[serde(default)]
+    now_nanos: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClosedTsPlanRequest {
+    range_ids: Vec<u64>,
+    /// `"bounded"`(既定) または `"exact"`。
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    now_nanos: Option<u64>,
+    /// bounded では許容する最大の遅れ、exact では読み取り時刻の遡り量。
+    #[serde(default)]
+    staleness_nanos: Option<u64>,
+}
+
+fn now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// `GET /admin/closed-timestamp` — 登録済みRangeごとの closed timestamp。
+#[handler]
+fn closed_ts_status(state: Data<&Arc<AdminState>>) -> Json<Value> {
+    let coord = &state.closed_ts;
+    let ranges: Vec<Value> = coord
+        .range_ids()
+        .into_iter()
+        .filter_map(|id| {
+            coord.tracker(id).map(|t| {
+                json!({
+                    "range_id": id,
+                    "closed_timestamp": t.closed_timestamp(),
+                    "lowest_in_flight": t.lowest_in_flight(),
+                    "target_lag_nanos": t.target_lag_nanos(),
+                })
+            })
+        })
+        .collect();
+    Json(json!({ "success": true, "range_count": ranges.len(), "ranges": ranges }))
+}
+
+/// `POST /admin/closed-timestamp/range` — Rangeを追跡対象として登録する。
+#[handler]
+fn closed_ts_register(state: Data<&Arc<AdminState>>, Json(req): Json<ClosedTsRangeRequest>) -> Json<Value> {
+    let tracker = state.closed_ts.register_range(req.range_id);
+    Json(json!({
+        "success": true,
+        "range_id": req.range_id,
+        "closed_timestamp": tracker.closed_timestamp(),
+    }))
+}
+
+/// `POST /admin/closed-timestamp/advance` — 全Rangeの closed timestamp を
+/// 進める(CockroachDBが定期的に行うのと同じ操作を手動で起こす)。
+#[handler]
+fn closed_ts_advance(state: Data<&Arc<AdminState>>, Json(req): Json<ClosedTsAdvanceRequest>) -> Json<Value> {
+    let now = req.now_nanos.unwrap_or_else(now_nanos);
+    let advanced = state.closed_ts.advance_all(now);
+    let entries: Vec<Value> = advanced
+        .into_iter()
+        .map(|(id, ts)| json!({ "range_id": id, "closed_timestamp": ts }))
+        .collect();
+    Json(json!({ "success": true, "now_nanos": now, "advanced": entries }))
+}
+
+/// `POST /admin/closed-timestamp/plan` — 指定Range群を follower read で
+/// 読めるかを実際に判定する。`AS OF SYSTEM TIME`相当の判断をHTTPから
+/// 確認できるようにしたもの。
+#[handler]
+fn closed_ts_plan(state: Data<&Arc<AdminState>>, Json(req): Json<ClosedTsPlanRequest>) -> Json<Value> {
+    let now = req.now_nanos.unwrap_or_else(now_nanos);
+    let staleness = req.staleness_nanos.unwrap_or(aruaru_dist::DEFAULT_MAX_STALENESS_NANOS);
+    let mode = req.mode.unwrap_or_else(|| "bounded".to_string());
+    let plan = match mode.as_str() {
+        "exact" => state.closed_ts.plan_exact_staleness_read(&req.range_ids, now, staleness),
+        _ => state.closed_ts.negotiate_bounded_staleness(&req.range_ids, now, staleness),
+    };
+    let (kind, reason) = match &plan {
+        aruaru_dist::ReadPlan::FollowerRead { .. } => ("follower_read", None),
+        aruaru_dist::ReadPlan::RouteToLeaseholder { reason } => ("route_to_leaseholder", Some(*reason)),
+    };
+    Json(json!({
+        "success": true,
+        "mode": mode,
+        "now_nanos": now,
+        "staleness_nanos": staleness,
+        "plan": kind,
+        "is_follower_read": plan.is_follower_read(),
+        "read_timestamp": plan.timestamp(),
+        "reason": reason,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct WalAppendRecord {
+    page_key: String,
+    /// `"replace"`(既定)または `"append"`。
+    #[serde(default)]
+    op: Option<String>,
+    /// ページへ書く内容(UTF-8文字列として受け取る)。
+    data: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WalAppendRequest {
+    /// 開始LSN。連続する複数レコードには +1 ずつ割り当てる。
+    start_lsn: aruaru_dist::Lsn,
+    records: Vec<WalAppendRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WalPageRequest {
+    page_key: String,
+    /// 省略時は pageserver の最終適用LSN。
+    #[serde(default)]
+    lsn: Option<aruaru_dist::Lsn>,
+}
+
+/// `GET /admin/wal-service` — safekeeper quorum の状態と pageserver の
+/// 適用状況を返す。
+#[handler]
+fn wal_service_status(state: Data<&Arc<AdminState>>) -> Json<Value> {
+    let s = &state.wal_storage;
+    let safekeepers: Vec<Value> = (0..s.wal.len() as u64)
+        .filter_map(|i| {
+            s.wal.safekeeper(i).map(|sk| {
+                json!({ "id": sk.id(), "accepted_term": sk.accepted_term(), "flush_lsn": sk.flush_lsn() })
+            })
+        })
+        .collect();
+    Json(json!({
+        "success": true,
+        "term": s.term(),
+        "quorum": s.wal.quorum(),
+        "commit_lsn": s.wal.commit_lsn(),
+        "safekeepers": safekeepers,
+        "pageserver": {
+            "last_record_lsn": s.pageserver.last_record_lsn(),
+            "max_replication_lag": s.pageserver.max_replication_lag(),
+            "page_keys": s.pageserver.page_keys(),
+        }
+    }))
+}
+
+/// `POST /admin/wal-service/append` — WALレコードを quorum へ耐久化し、
+/// pageserver へ取り込ませる(Neon の compute → safekeeper → pageserver)。
+#[handler]
+fn wal_service_append(state: Data<&Arc<AdminState>>, Json(req): Json<WalAppendRequest>) -> Json<Value> {
+    let mut records = Vec::with_capacity(req.records.len());
+    for (i, r) in req.records.iter().enumerate() {
+        let lsn = req.start_lsn + i as aruaru_dist::Lsn;
+        let bytes = r.data.clone().into_bytes();
+        records.push(match r.op.as_deref() {
+            Some("append") => aruaru_dist::WalRecord::append(lsn, r.page_key.clone(), bytes),
+            _ => aruaru_dist::WalRecord::replace(lsn, r.page_key.clone(), bytes),
+        });
+    }
+    match state.wal_storage.write(&records) {
+        Ok(commit) => Json(json!({
+            "success": true,
+            "commit_lsn": commit,
+            "applied_lsn": state.wal_storage.pageserver.last_record_lsn(),
+            "record_count": records.len(),
+        })),
+        Err(e) => Json(json!({ "success": false, "message": e.to_string() })),
+    }
+}
+
+/// `POST /admin/wal-service/page` — 指定LSN時点のページを pageserver 上で
+/// 再構成して返す(`get_page_at_lsn`)。`AS OF COMMIT`読み取りの土台。
+#[handler]
+fn wal_service_page(state: Data<&Arc<AdminState>>, Json(req): Json<WalPageRequest>) -> Json<Value> {
+    let ps = &state.wal_storage.pageserver;
+    let lsn = req.lsn.unwrap_or_else(|| ps.last_record_lsn());
+    match ps.get_page_at_lsn(&req.page_key, lsn) {
+        Ok(bytes) => Json(json!({
+            "success": true,
+            "page_key": req.page_key,
+            "lsn": lsn,
+            "len": bytes.len(),
+            "data": String::from_utf8_lossy(&bytes),
+            "image_layer_lsn": ps.image_layer_lsn(&req.page_key),
+        })),
+        Err(e) => Json(json!({ "success": false, "page_key": req.page_key, "lsn": lsn, "message": e.to_string() })),
+    }
+}
+
+/// `POST /admin/wal-service/image-layer` — 指定LSNで image layer を作り、
+/// それより古いdeltaを落とす(pageserver の compaction 相当)。
+#[handler]
+fn wal_service_image_layer(state: Data<&Arc<AdminState>>, Json(req): Json<WalPageRequest>) -> Json<Value> {
+    let ps = &state.wal_storage.pageserver;
+    let lsn = req.lsn.unwrap_or_else(|| ps.last_record_lsn());
+    match ps.create_image_layer(&req.page_key, lsn) {
+        Ok(dropped) => Json(json!({
+            "success": true,
+            "page_key": req.page_key,
+            "gc_cutoff_lsn": lsn,
+            "dropped_deltas": dropped,
+        })),
+        Err(e) => Json(json!({ "success": false, "page_key": req.page_key, "lsn": lsn, "message": e.to_string() })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectBlockStat {
+    column: String,
+    min: f64,
+    max: f64,
+    #[serde(default)]
+    null_count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectBlockRequest {
+    location: String,
+    row_count: u64,
+    size_bytes: u64,
+    #[serde(default)]
+    stats: Vec<ObjectBlockStat>,
+    /// 等値枝刈り用 bloom filter に入れるキー。
+    #[serde(default)]
+    bloom: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectTableCommitRequest {
+    blocks: Vec<ObjectBlockRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObjectTablePruneRequest {
+    #[serde(default)]
+    snapshot_id: Option<String>,
+    column: String,
+    /// 範囲述語: `"eq"` / `"lt"` / `"le"` / `"gt"` / `"ge"`
+    #[serde(default)]
+    op: Option<String>,
+    #[serde(default)]
+    value: Option<f64>,
+    /// 等値述語(bloom filter による枝刈り)。`value`より優先する。
+    #[serde(default)]
+    key: Option<String>,
+}
+
+/// `GET /admin/object-table` — 現在のスナップショットと履歴(時間旅行の
+/// 連鎖)を返す。
+#[handler]
+fn object_table_status(state: Data<&Arc<AdminState>>) -> Json<Value> {
+    let t = &state.object_table;
+    match (t.current_snapshot(), t.snapshot_history()) {
+        (Ok(cur), Ok(history)) => Json(json!({
+            "success": true,
+            "table_key": t.table_key(),
+            "current": cur,
+            "history_len": history.len(),
+            "history": history,
+        })),
+        (Err(e), _) | (_, Err(e)) => Json(json!({ "success": false, "message": e.to_string() })),
+    }
+}
+
+/// `POST /admin/object-table/commit` — blockメタデータ群を1 segmentとして
+/// 書き、MetaSrv の CAS が成功したらコミット成立(Databend方式)。
+#[handler]
+fn object_table_commit(state: Data<&Arc<AdminState>>, Json(req): Json<ObjectTableCommitRequest>) -> Json<Value> {
+    let mut blocks = Vec::with_capacity(req.blocks.len());
+    for b in &req.blocks {
+        let mut meta = aruaru_backup::table_format::BlockMeta::new(b.location.clone(), b.row_count, b.size_bytes);
+        for s in &b.stats {
+            meta = meta.with_stats(&s.column, s.min, s.max, s.null_count);
+        }
+        for (col, keys) in &b.bloom {
+            meta = meta.with_bloom(col, keys.iter().map(|s| s.as_str()));
+        }
+        blocks.push(meta);
+    }
+    let count = blocks.len();
+    match state.object_table.commit_blocks(blocks) {
+        Ok(id) => Json(json!({ "success": true, "snapshot_id": id, "block_count": count })),
+        Err(e) => Json(json!({ "success": false, "message": e.to_string() })),
+    }
+}
+
+/// `POST /admin/object-table/prune` — 3層メタデータでの枝刈りを実行し、
+/// 「読む必要のあるblockだけ」と読み飛ばした数を返す。
+#[handler]
+fn object_table_prune(state: Data<&Arc<AdminState>>, Json(req): Json<ObjectTablePruneRequest>) -> Json<Value> {
+    use aruaru_backup::table_format::RangeOp;
+    let t = &state.object_table;
+    let snapshot_id = match req.snapshot_id.clone() {
+        Some(id) => id,
+        None => match t.current_snapshot() {
+            Ok(Some(s)) => s.snapshot_id,
+            Ok(None) => return Json(json!({ "success": false, "message": "table has no snapshot yet" })),
+            Err(e) => return Json(json!({ "success": false, "message": e.to_string() })),
+        },
+    };
+    if let Some(key) = &req.key {
+        return match t.prune_equality(&snapshot_id, &req.column, key) {
+            Ok(kept) => Json(json!({
+                "success": true, "snapshot_id": snapshot_id, "predicate": "equality",
+                "column": req.column, "key": key,
+                "kept_blocks": kept.len(),
+                "locations": kept.iter().map(|b| b.location.clone()).collect::<Vec<_>>(),
+            })),
+            Err(e) => Json(json!({ "success": false, "message": e.to_string() })),
+        };
+    }
+    let op = match req.op.as_deref() {
+        None => return Json(json!({ "success": false, "message": "op is required for range predicates (use `key` instead for equality)" })),
+        Some("eq") => return Json(json!({ "success": false, "message": "equality predicates must use `key` (bloom filter), not `op: eq`" })),
+        Some("lt") => RangeOp::Lt,
+        Some("le") => RangeOp::Le,
+        Some("gt") => RangeOp::Gt,
+        Some("ge") => RangeOp::Ge,
+        Some(other) => return Json(json!({ "success": false, "message": format!("unknown op: {other}") })),
+    };
+    let value = match req.value {
+        Some(v) => v,
+        None => return Json(json!({ "success": false, "message": "value (or key) is required" })),
+    };
+    match t.prune_range(&snapshot_id, &req.column, op, value) {
+        Ok((kept, skipped_segments, skipped_blocks)) => Json(json!({
+            "success": true, "snapshot_id": snapshot_id, "predicate": "range",
+            "column": req.column, "op": req.op, "value": value,
+            "kept_blocks": kept.len(),
+            "skipped_segments": skipped_segments,
+            "skipped_blocks": skipped_blocks,
+            "locations": kept.iter().map(|b| b.location.clone()).collect::<Vec<_>>(),
+        })),
+        Err(e) => Json(json!({ "success": false, "message": e.to_string() })),
     }
 }

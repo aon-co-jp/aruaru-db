@@ -365,8 +365,26 @@ impl ExtendedQueryHandler for AruaruHandler {
             .into_iter()
             .map(|name| FieldInfo::new(name, None, None, Type::VARCHAR, FieldFormat::Text))
             .collect();
-        // パラメータ型は動的型付けのため引き続き未確定(空)のまま返す。
-        Ok(DescribeStatementResponse::new(vec![], field_infos))
+        // **パラメータ記述(2026-08-24修正)**: 以前はここで常に空の
+        // ベクタを返していた。しかしExtendedプロトコルのクライアント
+        // (`tokio-postgres`等)は、`Describe(Statement)`の応答である
+        // `ParameterDescription`のエントリ数を「このプリペアド文が
+        // 受け取るパラメータの個数」として厳密に扱うため、`$1`/`$2`を
+        // 含むSQLでも「0個」と申告されると`Bind`を送る前に
+        // **クライアント側で** "expected 0 parameters but got 2" と
+        // 拒否されていた(open-english → aruaru-db のDUAL書き込み
+        // 実機検証で実際に発生した)。`substitute_params`は元々
+        // `max_placeholder`で$Nを数えて値を埋め込む実装になっており、
+        // サーバー側の実行経路は最初からパラメータを扱えていた
+        // ——足りなかったのは「いくつ受け取るか」の申告だけだった。
+        //
+        // 型はこのDBが動的型付けであるため引き続き確定させず、
+        // 個数ぶんの`UNKNOWN`(OID 0 = 「サーバーに推論を委ねる」)を
+        // 返す。`format_param_literal`が実際の値のテキスト表現から
+        // 安全なリテラルを組み立てるので、型が未確定でも動作する。
+        let param_count = max_placeholder(&stmt.statement);
+        let param_types = vec![Type::UNKNOWN; param_count];
+        Ok(DescribeStatementResponse::new(param_types, field_infos))
     }
 
     /// `Describe(Portal)`(`Bind`後、実パラメータ値が判明している段階)。
