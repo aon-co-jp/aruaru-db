@@ -3845,3 +3845,134 @@ Google/GitHub検索を行い、Snowflake×CockroachDB型ハイブリッドDBに�
 4. **`olap.rs`のセグメント統計の拡張**: bloom filter・sparse index
    (今回は min/max のみ)。`table_format.rs`側には bloom filter が
    あるので、実装を寄せられる可能性がある。
+
+## HANDOFF: 2026-08-24 前回までの「橋渡しが3セッション分たまっている」を解消
+— FollowerRead→AS OF COMMIT接続・side transportのネットワーク越し配線・
+ObjectStoreの実S3クライアント接続を実装、実プロセスHTTP/複数プロセス間で検証
+
+**経緯**: 直前2回のHANDOFF(2026-08-22・2026-08-22続き)が「次回優先」
+として挙げていた3項目のうち、具体的に指示された3つ((b)FollowerReadの
+実データ接続、(c)side transportのネットワーク越し配線、および
+`table_format`の`ObjectStore`実S3接続)に着手した。(a)の管理REST API
+公開自体は既に別コミット(`6e6286f`)で先行完了していたため、今回は
+「公開されているが中身が繋がっていなかった」箇所を実装で埋める形になった。
+
+### タスク1: `ReadPlan::FollowerRead`を`AS OF COMMIT`読み取り経路へ実接続
+
+- `crates/aruaru-core/src/version/mod.rs`: `VersionController::
+  find_commit_at_or_before(timestamp_nanos: i64) -> Option<Commit>`を
+  新設。現在ブランチのHEADから祖先方向へたどり、`commit.timestamp <=
+  timestamp_nanos`を満たす最初の(=最も新しい)コミットを返す。
+- `crates/aruaru-query/src/engine.rs`: `QueryEngine::select_follower_read
+  (table, filter, timestamp_nanos) -> Result<QueryResponse, String>`を
+  新設。上記でcommitへ解決し、既存の`select_as_of`(Prolly Tree経由の
+  `AS OF COMMIT`本体)へそのまま委譲する。`aruaru-query`が`aruaru-dist`に
+  依存しない既存設計を保つため、`ReadPlan`型そのものではなく解決済みの
+  生タイムスタンプ(i64、Unixナノ秒)を受け取る設計とした——`ReadPlan`
+  から実際に呼び出す橋渡しは両クレートに依存できる`aruaru-server`側の
+  責務とした。
+- `crates/aruaru-server/src/admin.rs`: 既存の`POST /admin/closed-
+  timestamp/plan`に`table`/`filter_col`/`filter_val`という省略可能な
+  フィールドを追加。`ReadPlan::FollowerRead`と判定され`table`が指定
+  された場合のみ、`select_follower_read`で実際にデータを読み出し
+  レスポンスの`data`フィールドへ含める(`RouteToLeaseholder`の場合は
+  読み取りを行わず理由のみ返す、後方互換——`table`未指定なら従来通り
+  ゲート判定のみ)。
+
+### タスク2: side transportをネットワーク越し(`raft/transport.rs`)へ配線
+
+- `crates/aruaru-dist/src/closed_ts.rs`: `ClosedTimestampCoordinator`に
+  `snapshot_closed_timestamps()`(送信側、`(range_id, closed_ts)`の
+  スナップショットを取り出す)と`apply_closed_timestamp_updates(&[..])`
+  (受信側、未知Rangeは登録しつつ取り込む、冪等)を新設。既存の
+  `publish_to`(同一プロセス内)はこの2つの組み合わせとして再実装した。
+- `crates/aruaru-dist/src/raft/transport.rs`: `HttpTransport`
+  (AppendEntries/RequestVoteの送信、`x-admin-token`ヘッダー付与)と
+  同じパターンで`HttpSideTransport`を新設。`publish_to(peer, updates)`
+  が指定peerの`POST /admin/closed-timestamp/receive`へ実際にHTTP POST
+  する。
+- `crates/aruaru-server/src/admin.rs`: 受信側`POST /admin/closed-
+  timestamp/receive`(他ノードからの更新を取り込む)と送信側
+  `POST /admin/closed-timestamp/publish`(`peer_id`+`peer_url`を指定して
+  `HttpSideTransport`経由で実際に配布する)を新設。既存の`/admin/*`
+  共通認証ミドルウェアがそのまま適用される(個別実装不要)。
+- **正直な簡略化点**: CockroachDBの`closedts/sidetransport`のような
+  バックグラウンドでの周期的自動配送は実装していない——呼び出し側が
+  `POST /admin/closed-timestamp/publish`を能動的に呼ぶ必要がある。
+
+### タスク3: `table_format::ObjectStore`を実S3クライアントへ接続
+
+- `crates/aruaru-backup/src/s3.rs`: `impl ObjectStore for S3Client`を
+  新設。`ObjectStore`トレイトは同期(`put`/`get`/`list`、`async`でも
+  `Result`でもない)だが`S3Client`のI/Oは非同期のため、`run_blocking`
+  (`std::thread::scope`で専用OSスレッドを立て、その中で
+  `tokio::runtime::Builder::new_current_thread`の新規ランタイムを
+  `block_on`する)でブリッジした——呼び出し元が既にtokioランタイム上
+  (`aruaru-server`の非同期ハンドラ等)にいても`Cannot start a runtime
+  from within a runtime`を起こさない設計(`#[tokio::test]`内から呼ぶ
+  回帰テストで実証)。`list()`は`S3Client`自身のバケットレベル`prefix`
+  を`strip_client_prefix`で取り除き、`put`/`get`が受け取るのと同じ
+  「パス」名前空間の文字列を返すようにし、`InMemoryObjectStore`との
+  契約(`list()`が`put()`に渡した文字列をそのまま返す)を保った。
+- **正直な限界**: `ObjectStore`トレイト自体はエラーを表現できない
+  (`put`は`()`、`get`は`Option`、`list`は`Vec`を返す設計のまま)ため、
+  失敗は`tracing`へログするに留め、`get`/`list`は「見つからなかった
+  ことにする」形へ縮退する——ネットワーク瞬断とオブジェクト不在の
+  区別がこのAPI形状では呼び出し元から見分けられないという制約が残る
+  (トレイト自体を`Result`化する改修は既存の全呼び出し元・
+  `InMemoryObjectStore`・既存テストに影響するため今回は見送った)。
+  実S3/MinIOサーバーへの実際のPUT/GET往復は、既存の`put_object`/
+  `get_object`/`list_objects`自体のテストと同じ理由(この環境に到達
+  可能なS3互換サーバーが無い)で未検証——`strip_client_prefix`の
+  ロジックとsync/asyncブリッジが多重ランタイムでデッドロックしない
+  ことは単体テストで検証済み。
+
+### 検証結果(実測、型チェック・ビルド成功だけで終わらせない方針の徹底)
+
+- `cargo build --workspace` → 成功(既存の`build_cluster`/
+  `propose_commit`未使用警告2件のみ、無関係)。
+- `cargo test --workspace` → 全19テストバイナリで`test result: ok`、
+  失敗0件(新規追加分: aruaru-backup +4〈`strip_client_prefix`2件・
+  `run_blocking`のランタイムネスト回帰・`ObjectStore`実装の型検証〉、
+  aruaru-dist +1〈`snapshot_closed_timestamps`/`apply_closed_timestamp_
+  updates`往復〉、aruaru-query +1〈`select_follower_read`の
+  タイムスタンプ解決〉)。
+- **実プロセスHTTPでのE2E確認(型チェック・単体テストのみで終わらせない)**:
+  1. **タスク1**: 実`aruaru-server.exe`を1台起動し、`CREATE TABLE
+     items`→`INSERT (qty=1)`→`aruaru_commit`→`UPDATE (qty=5)`→
+     `aruaru_commit`→`POST /admin/closed-timestamp/range`→
+     `POST /admin/closed-timestamp/advance`(closed timestampを両
+     コミットより後まで前進)→`POST /admin/closed-timestamp/plan`
+     (`table=items`,`filter_col=id`,`filter_val=sword`)を実行し、
+     **`"plan":"follower_read"`かつ`"data":{"ok":true,"result":
+     {"Rows":{"columns":["id","qty"],"rows":[[{"Text":"sword"},
+     {"Text":"5"}]]}}}}`という実データが実際に返る**ことを確認した
+     (ゲート判定だけでなく実データ読み取りまで到達する直接証拠)。
+  2. **タスク2**: 実`aruaru-server.exe`を2台(port 7401/7402)起動し、
+     server1で`range_id=1`を登録・前進させた後、server1へ
+     `POST /admin/closed-timestamp/publish`(`peer_id=2,
+     peer_url=http://127.0.0.1:7402`)を実行。**server2の
+     `GET /admin/closed-timestamp`が`range_count:0`→`range_count:1`
+     (`closed_timestamp`がserver1と完全一致)へ実際に変化する**ことを
+     確認した——別プロセス・別ポート間の実HTTP通信によるside
+     transportの直接証拠。再送すると`advanced_on_peer:0`(冪等)、
+     `x-admin-token`無しでの`/admin/closed-timestamp/receive`は
+     `401`(既存認証ミドルウェアが新規エンドポイントにも自動適用
+     されることも確認)。
+  3. タスク3(S3実接続)は、この環境に到達可能なS3互換サーバーが
+     無いため実HTTP往復のE2E確認は未実施(上記「正直な限界」参照)。
+- 検証後、両プロセス・一時データディレクトリはすべて終了・削除済み
+  (リポジトリへの影響なし)。
+
+### 次回への引き継ぎ
+
+1. side transportの定期的自動配送(バックグラウンドループでの
+   周期publish)——現状は手動トリガーのみ。
+2. `table_format::ObjectStore`を実S3/MinIOサーバーで実際に往復検証
+   (この環境にサーバーが無いため次回以降、到達可能な環境で)。
+3. `ObjectStore`トレイト自体の`Result`化(エラーの握りつぶしを解消)は
+   既存呼び出し元全体への影響があるため、必要性が具体化した時点で
+   改めて設計する。
+4. `Pageserver::get_page_at_lsn`(`wal_service.rs`)の実経路への接続は
+   今回スコープ外——`ReadPlan::FollowerRead`とは別の橋渡し先であり、
+   次回以降の課題として残る。
