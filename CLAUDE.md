@@ -3976,3 +3976,39 @@ ObjectStoreの実S3クライアント接続を実装、実プロセスHTTP/複�
 4. `Pageserver::get_page_at_lsn`(`wal_service.rs`)の実経路への接続は
    今回スコープ外——`ReadPlan::FollowerRead`とは別の橋渡し先であり、
    次回以降の課題として残る。
+
+## HANDOFF: 2026-08-25 セキュリティ監査(cargo audit)を実施
+
+open-english側のユーザー指示「関連リポジトリのセキュリティ監査(依存
+関係・入力検証等)」への対応(横断的な優先判断はopen-english/CLAUDE.md
+2026-08-25エントリ参照)。
+
+1. **`h2`(0.4.15、DoS脆弱性RUSTSEC-2026-0258)を0.4.19へ更新**
+   (`aruaru-db`本体・`web`サブクレートとも`cargo update -p h2`で
+   互換範囲内更新、コード変更不要)。
+2. **`quick-xml`のHigh(CVSS 7.5)脆弱性2件を修正**
+   (「Quadratic run time when checking a start tag for duplicate
+   attribute names」「Unbounded namespace-declaration allocation in
+   `NsReader` enables memory-exhaustion denial of service」)。
+   `crates/aruaru-backup`が使う`rusty-s3`(S3互換バックアップ先の
+   署名付きURL生成)の依存で、`rusty-s3`自体を0.7→**0.10**へ
+   アップグレードして解消(`quick-xml`側は`rusty-s3`の内部依存の
+   ため直接触れず)。`cargo build --release`(ワークスペース全体、
+   11分33秒)成功、`cargo test --release -p aruaru-backup`
+   **37 passed / 0 failed**を確認。
+3. **未修正のまま記録する事項(正直な開示)**: `rustls-webpki`
+   (0.101.7、複数の証明書検証系issue)が、`crates/aruaru-registry`の
+   `mongodb 2.8.2`が引き込む古い`rustls 0.21`経由で残っている。
+   `mongodb`は3.8.1(メジャーバージョン)が利用可能だが、**データベース
+   エンジンという性質上、API破壊的変更を伴うメジャーバージョン移行を
+   専用のテスト計画無しに拙速に行うのは避けるべき**と判断し、今回は
+   着手しなかった。`rsa`クレート(Marvin Attack、Medium 5.9)も上流
+   未修正のため対処不能。`idna`(0.2.3)・`rkyv`(0.7.46)も
+   `cargo audit`が検出したが、深刻度・悪用可能性の評価まではこの
+   セッションでは行えていない。
+4. **`cargo audit`最終結果**: 10件→7件(`h2`・`quick-xml`2件を解消)。
+   `web`サブクレートは1件→0件(`h2`のみだったため)。
+- 次にすべきこと: (1) `mongodb`2.x→3.xへの移行を専用セッションで
+  計画・実施(破壊的変更の洗い出し、`aruaru-registry`クレートの
+  回帰テスト整備が前提)、(2) `idna`/`rkyv`の深刻度評価、(3) `rsa`の
+  上流修正状況を定期確認。
