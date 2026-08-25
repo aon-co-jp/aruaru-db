@@ -28,7 +28,7 @@ hex.workspace      = true
 # glue" convention) so we can PUT/DELETE/LIST objects with a plain HTTP
 # client (`reqwest`, already a workspace dependency elsewhere) instead of
 # pulling in the much heavier `aws-sdk-s3`.
-rusty-s3 = "0.7"
+rusty-s3 = "0.10"
 reqwest = { workspace = true }
 # SFTP backup destination. `russh` is a pure-Rust SSH client implementation
 # (no libssh2/OpenSSL C dependency, unlike the `ssh2` crate) which matches
