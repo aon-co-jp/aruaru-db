@@ -1,5 +1,26 @@
 # 設計思想・開発方針・開発環境ルール(全リポジトリ共通ヘッダー、2026-07-15追記)
 
+> **📌 2026-08-26追記: Windows用インストーラー`aruaru-db-installer.exe`を
+> 新設(命名規則統一)**: ユーザー指示「パワーシェルでインストールする
+> 関連リポジトリは全て、リポジトリ名-installer.exeに統一して」への対応
+> (aruaru-llm/open-englishと同じ規則)。`installer/windows/aruaru-db.iss`
+> ——既存`install.ps1`のサービス登録ロジック(`New-Service`)をそのまま
+> 呼ぶGUIラッパー。**正直な開示**: aruaru-dbはWindowsサービスとして
+> 登録される設計のため、サービス登録自体が管理者権限を必須とする——
+> `PrivilegesRequired=admin`とし、Inno Setup標準のUAC昇格プロンプトを
+> 1回表示する形にした(aruaru-llm/open-englishのような`lowest`にはできない、
+> 「管理者権限が一切不要になる」わけではなく「利用者が自分で管理者権限の
+> PowerShellを探して起動する手間を無くす」ことが目的)。`[UninstallRun]`で
+> サービス解除も追加(`Remove-Service`はPowerShell 6+限定でこの環境の
+> Windows PowerShell 5.1には存在しないことを実際に確認したため、
+> `sc.exe delete`を使用)。**実機検証**: `cargo build --release --bin
+> aruaru-server`成功、`ISCC.exe`で実際に`aruaru-db-installer.exe`を生成
+> (警告0件)。実際のサービス登録(管理者権限でのインストール実行)は
+> この開発環境では未検証(既存`install.ps1`のロジック自体は変更して
+> いないため、これまでの動作実績をそのまま引き継ぐ設計)。
+> CI(`.github/workflows/release.yml`)もInno Setupビルドを追加しGitHub
+> Releaseへ添付するよう更新済み(実CI実行の確認は次回タグpush時)。
+
 > **📌 保留タスク(2026-08-06、次回セッションで着手予定)/ Pending task (added 2026-08-06, to be started next session)**:
 > ユーザー指示により、**東芝の疑似量子コンピューター技術(Simulated
 > Bifurcation Machine)**と**DeepSeekの技術**(インターネットニュースだけ
