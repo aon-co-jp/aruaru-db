@@ -72,6 +72,22 @@ jobs:
         with:
           name: aruaru-db-windows-x86_64
           path: aruaru-db-windows-x86_64.zip
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+      - name: Build aruaru-db-installer.exe
+        # <リポジトリ名>-installer.exe命名規則の統一(2026-08-26、
+        # aruaru-llm/open-englishと同じ方針)。PrivilegesRequired=admin
+        # なのはWindowsサービス登録(New-Service)が管理者権限を必須と
+        # するため(installer/windows/aruaru-db.iss冒頭コメント参照)。
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=$version installer\windows\aruaru-db.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aruaru-db-installer
+          path: installer/windows/dist/aruaru-db-installer.exe
 
   release:
     name: GitHub Releaseへ添付
@@ -85,3 +101,4 @@ jobs:
           files: |
             aruaru-db-linux-x86_64/aruaru-db-linux-x86_64.tar.gz
             aruaru-db-windows-x86_64/aruaru-db-windows-x86_64.zip
+            aruaru-db-installer/aruaru-db-installer.exe
