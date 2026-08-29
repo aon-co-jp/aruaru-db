@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 mod admin;
 mod cluster;
+mod config;
 mod ephemeral_pod;
 mod self_update;
 
@@ -21,6 +22,13 @@ mod self_update;
 #[derive(Debug, Parser)]
 #[command(name = "aruaru-server", version, about)]
 struct Cli {
+    /// 宣言的設定ファイル `aruaru.yaml` のパス(任意)。指定すると
+    /// 起動時に読み込み、`watch_config.enabled` ならホットリロード監視も
+    /// 開始する。未指定なら従来どおり CLI フラグのみで動作する。
+    /// 設計: docs/CONTROL_PLANE_REDESIGN.md
+    #[arg(long)]
+    config: Option<String>,
+
     /// データディレクトリ
     #[arg(long, default_value = "./data")]
     data: String,
@@ -229,6 +237,27 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let admin_state = admin::AdminState::new(engine.clone(), registry.clone());
+
+    // ── 宣言的設定 `aruaru.yaml`(任意) ─────────────────────
+    // 設計の正本: docs/CONTROL_PLANE_REDESIGN.md(P1)。`--config` 指定時のみ
+    // 読み込み・初回 reconcile・ホットリロード監視を行う。未指定なら
+    // 従来どおり CLI フラグのみで動作(後方互換)。
+    if let Some(config_path) = cli.config.clone() {
+        match config::AruaruConfig::load(&config_path) {
+            Ok(cfg) => {
+                let report = config::reconcile(&cfg, None, &admin_state);
+                tracing::info!(path = %config_path, ?report, "aruaru.yaml を読み込み、初回 reconcile を適用しました");
+                config::spawn_config_watcher(
+                    std::path::PathBuf::from(&config_path),
+                    cfg,
+                    admin_state.clone(),
+                );
+            }
+            Err(e) => {
+                tracing::error!(error = %e, path = %config_path, "aruaru.yaml の読み込みに失敗。CLI フラグのみで起動を続行します");
+            }
+        }
+    }
     // 【2026-08-21新設・Vitess Reshard/VTGate scatter-gatherの実配線】
     // 既存の単一`ClusterNode`(本番のOLTP書き込み経路、pgwire/GraphQL/REST
     // `/admin/cluster/propose`が実際に使う)とは独立した、

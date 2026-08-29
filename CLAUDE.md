@@ -108,19 +108,29 @@
 >   Tauri アプリが `/admin/federation*` を使用。
 >   これらは既に「REST完全撤廃済み」で、再設計後もそのまま
 >   (`object-table`=B2/B3、`keys`=B2/B3 相当)。
-> - **今すぐ着手できる次の一手 = P1(宣言的設定基盤)**:
->   [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md) §5〜§8。
+> - **P1(宣言的設定基盤)= 完了(2026-08-29 続き6)**:
 >   `crates/aruaru-server/src/config/`(`mod.rs`=`AruaruConfig` serde +
->   `load()` + `${VAR}`展開、`watch.rs`=`notify` + `SIGHUP`〈`cfg(unix)`〉、
->   `reconcile.rs`=動的セクションの差分を `AdminState` の各
->   `Arc<Mutex<..>>` へ適用)を新設し、`--config <path>` フラグを追加。
->   既存の CLI フラグは互換維持(config 未指定なら従来どおり)。
->   新規依存: `notify`(ファイル監視)、YAML パーサ(`serde_yml` か
->   `serde_norway`。`serde_yaml` は非推奨なので使わない)。
+>   `load()` + `${VAR}`展開、`watch.rs`=mtime ポーリング +
+>   `SIGHUP`〈`cfg(unix)`〉のホットリロード、`reconcile.rs`=動的
+>   セクションの差分を `AdminState` の `Arc<Mutex<..>>` へ冪等適用)。
+>   `--config <path>` フラグ追加(未指定なら従来どおり CLI フラグのみ)。
+>   新規依存は `serde_norway` のみ(`notify` は使わず自前 mtime ポーリング
+>   =Cosmo の `watch_config` と同方式)。`aruaru.example.yaml` を同梱。
+>   P1 で実際に反映されるのは `backup.schedule` と `federation.sources`
+>   (7テスト、`cargo test -p aruaru-server` 失敗0)。
+> - **今すぐ着手できる次の一手 = P2(B1 の移送)**:
+>   [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md) §4・§8。
+>   `query.parallel`(4フィールド)/ `follower_read.target_lag_ms` /
+>   `wal` / `sharded_store` を `aruaru.yaml` へ移し、`reconcile.rs` に
+>   接続。対応する `/admin/parallel` 等の REST ルートと GraphQL の
+>   `setParallelConfig` スタブを削除。`admin/src-tauri` の設定タブを
+>   `aruaru.yaml` 編集に転換(REST 直叩きをやめる)。
+>   `AdminState.parallel` は7フィールドの独自 `ParallelConfig` を廃し
+>   4フィールド共有型へ寄せる。
 > - **既に完了済み(「未着手」と誤解しないこと)**: `registry`の
 >   `crawlRegistry`/`testRegistryConnection`はGraphQL側で既に実データ
 >   接続済み(再設計では B2/B3)。
-> - 続き3/4 の詳細は本ファイル内「HANDOFF追記(2026-08-29〜続き5)」を
+> - 続き3〜6 の詳細は本ファイル内「HANDOFF追記(2026-08-29〜続き6)」を
 >   参照。再設計そのものの正本は `docs/CONTROL_PLANE_REDESIGN.md`。
 
 > **📌 2026-08-26追記: Windows用インストーラー`aruaru-db-installer.exe`を
@@ -4596,3 +4606,46 @@ B4 ノード間RPC)・`aruaru.yaml` スキーマ案・ホットリロード機�
 **この回のコード変更**: 無し(設計文書 + CLAUDE.md のみ)。続き5の
 着手途中で作った `aruaru-dist::admin_shared::ParallelConfigState` 等の
 編集は、再設計の方向と合わないため `git checkout` で破棄済み。
+
+## HANDOFF追記(2026-08-29続き6) 再設計 P1: 宣言的設定基盤
+
+**正本**: `docs/CONTROL_PLANE_REDESIGN.md`(続き5 で新設)。P0(設計確定)に
+続き、**P1(宣言的設定基盤)を実装・完了**。
+
+**新設ファイル**:
+- `crates/aruaru-server/src/config/mod.rs` — `AruaruConfig`(serde、全
+  フィールド `#[serde(default)]`、`deny_unknown_fields`)、`load(path)`
+  (`${VAR}` 環境変数展開 → YAML 解析)、`expand_env`。サブ構造は
+  `docs/CONTROL_PLANE_REDESIGN.md` §5 の `aruaru.yaml` スキーマに対応。
+  `query.parallel` は **GraphQL と同じ4フィールド**
+  (enabled/max_workers/chunk_size/strategy)で定義。
+- `crates/aruaru-server/src/config/reconcile.rs` — `reconcile(new,
+  previous, &AdminState) -> ReconcileReport`。動的セクションの差分を
+  `AdminState` の共有ハンドルへ**冪等**適用。P1 の対象は
+  `backup.schedule`(`schedule_handle()`)と `federation.sources`
+  (`federation_handle()`)。静的セクション(server/raft)は差分検知で
+  「要再起動」を warn + `restart_required` へ記録するのみ。
+- `crates/aruaru-server/src/config/watch.rs` — `spawn_config_watcher`。
+  WunderGraph Cosmo の `watch_config` と同じ **mtime ポーリング**
+  (既定 2s)＋ `cfg(unix)` の `SIGHUP` でホットリロード。YAML 解析
+  エラー時は error ログを出して**直前の設定を維持**。
+- `aruaru.example.yaml`(リポジトリ直下)— 注釈付きサンプル。
+
+**変更**:
+- `crates/aruaru-server/src/main.rs` — `mod config;`、`--config <path>`
+  フラグ追加。指定時のみ起動時ロード + 初回 reconcile + 監視タスク起動。
+  未指定なら従来どおり(後方互換)。
+- `crates/aruaru-server/Cargo.toml` — `serde_norway = "0.9"` を追加
+  (`serde_yaml`/`serde_yml` は非推奨のため後継を選択)。`notify` は
+  不採用(自前 mtime ポーリングで依存を増やさない)。
+
+**検証**: `cargo test -p aruaru-server` 失敗0。config 系 新規7テスト
+(env 展開 / 空 YAML=既定 / 部分 YAML / 未知キー拒否 / schedule+federation
+適用の冪等性 / YAML から source 削除 → state からも削除 / 静的差分の
+restart_required)。既存警告のみ(ephemeral_pod の `super::*` 等、無関係)。
+
+**次(P2)**: `query.parallel`(4フィールド)/ `follower_read.target_lag_ms`
+/ `wal` / `sharded_store` を reconcile へ接続。`AdminState.parallel` の
+7フィールド独自型を4フィールド共有型へ置換。`/admin/parallel` 等の
+REST ルートと GraphQL `setParallelConfig` スタブを削除。`admin/src-tauri`
+の設定タブを `aruaru.yaml` 編集へ転換。
