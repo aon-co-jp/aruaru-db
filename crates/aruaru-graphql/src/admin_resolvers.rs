@@ -362,6 +362,86 @@ impl AdminQuery {
         Ok(vec![])
     }
 
+    /// 【2026-08-29 再設計 P3】固定値スタブを廃止し、旧 REST
+    /// `POST /admin/parallel/explain` の実ロジックを移植(読み取りなので
+    /// `AdminQuery` 側)。SQL を分類(OLTP/OLAP)し、`AdminState.parallel`
+    /// (= `aruaru.yaml: query.parallel` の実効値)と推定行数から分散実行
+    /// プランのステップ列を組み立てる。単一ノードのため `node = "node-1"`。
+    /// 集計を含めば ParallelScan→Shuffle→HashAggregate→Gather、単純検索
+    /// なら ParallelScan→Gather。返りは「下から上」に読むプラン(逆順)。
+    async fn explain_distributed(
+        &self,
+        ctx: &Context<'_>,
+        sql: String,
+    ) -> Result<Vec<ExplainStepGql>> {
+        let a = admin(ctx)?;
+        let cfg = a.parallel.as_ref().map(|h| h.lock().clone()).unwrap_or_default();
+        let kind = aruaru_query::classify_query(&sql);
+
+        let table = match aruaru_query::parser::parse(&sql) {
+            Ok(aruaru_query::parser::Statement::Select { table, .. }) => Some(table),
+            _ => None,
+        };
+        let rows = table
+            .as_ref()
+            .and_then(|t| a.engine.table_row_count(t))
+            .unwrap_or(0) as i64;
+
+        let scan_par = if cfg.enabled { (cfg.max_workers.min(8).max(1)) as i32 } else { 1 };
+        let shuffle_partitions =
+            if cfg.enabled { cfg.max_workers.saturating_mul(8).max(1) as i32 } else { 1 };
+        let table_label = table.clone().unwrap_or_else(|| "(table)".into());
+
+        let mut step = 0i32;
+        let mut next = || {
+            step += 1;
+            step
+        };
+
+        let mut plan = vec![ExplainStepGql {
+            step: next(),
+            node: "node-1".into(),
+            range: "(min)-(max)".into(),
+            operation: if cfg.enabled {
+                format!(
+                    "ParallelScan[{table_label}] par={scan_par} (述語プッシュダウン, strategy={})",
+                    cfg.strategy
+                )
+            } else {
+                format!("ParallelScan[{table_label}] par=1 (並列実行無効)")
+            },
+            estimated_rows: rows,
+        }];
+
+        if matches!(kind, aruaru_query::QueryKind::Olap) {
+            plan.push(ExplainStepGql {
+                step: next(),
+                node: "node-1".into(),
+                range: "(min)-(max)".into(),
+                operation: format!("ShuffleExchange par={shuffle_partitions} (ハッシュ再分配)"),
+                estimated_rows: rows,
+            });
+            plan.push(ExplainStepGql {
+                step: next(),
+                node: "node-1".into(),
+                range: "(min)-(max)".into(),
+                operation: format!("HashAggregate par={scan_par} (2段階集計)"),
+                estimated_rows: rows / 10 + 1,
+            });
+        }
+
+        plan.push(ExplainStepGql {
+            step: next(),
+            node: "node-1".into(),
+            range: "(min)-(max)".into(),
+            operation: format!("Gather(Coordinator) par=1 [query_kind={kind:?}]"),
+            estimated_rows: rows / 10 + 1,
+        });
+
+        plan.reverse();
+        Ok(plan)
+    }
+
     // ── フェデレーション ────────────────────────────────────
 
     /// 【2026-08-29改修】固定空配列スタブを廃止し、REST `/admin/
@@ -770,22 +850,9 @@ impl AdminMutation {
     // ── 並列実行 ────────────────────────────────────────────
     // `setParallelConfig` mutation は撤廃(2026-08-29 再設計 P2)。並列
     // 設定は宣言的 `aruaru.yaml: query.parallel` が正本(ホットリロード)。
-    // 実効値は `Query.parallelConfig` で参照する。
-
-    async fn explain_distributed(
-        &self,
-        ctx: &Context<'_>,
-        sql: String,
-    ) -> Result<Vec<ExplainStepGql>> {
-        require_admin_token(ctx)?;
-        Ok(vec![ExplainStepGql {
-            step: 1,
-            node: "node-1".into(),
-            range: "(min)-(max)".into(),
-            operation: sql,
-            estimated_rows: 0,
-        }])
-    }
+    // 実効値は `Query.parallelConfig`、分散プランは `Query.explainDistributed`
+    // で参照する(いずれも読み取りなので Query 側。P3 で AdminMutation から
+    // AdminQuery へ移設)。
 
     // ── フェデレーション ────────────────────────────────────
 
@@ -1440,5 +1507,89 @@ mod cluster_propose_tests {
         assert_eq!(d["parallelConfig"]["maxWorkers"], 24);
         assert_eq!(d["parallelConfig"]["chunkSize"], 2000);
         assert_eq!(d["parallelConfig"]["strategy"], "range");
+    }
+
+    // ── 2026-08-29 再設計 P3: selfIssueKey mutation(認証不要)が旧 REST
+    // POST /v1/keys/self-issue を置き換える ──
+    #[tokio::test]
+    async fn self_issue_key_mutation_works_without_admin_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let ctx = admin_ctx(engine.clone(), None);
+        let keyring = ctx.keyring.clone().unwrap();
+        let schema = build_schema(engine.clone(), ctx);
+
+        assert_eq!(keyring.count(), 0);
+
+        // admin トークンを **付けない** リクエスト(認証不要であることの確認)。
+        let resp = schema
+            .execute(async_graphql::Request::new(
+                "mutation { selfIssueKey { key role expiresInHours } }",
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let d = resp.data.into_json().unwrap();
+        assert_eq!(d["selfIssueKey"]["role"], "viewer");
+        assert_eq!(d["selfIssueKey"]["expiresInHours"], 24);
+        assert!(d["selfIssueKey"]["key"].as_str().unwrap().len() > 8);
+
+        // 同一の KeyGuardian に発行済みとして記録される。
+        assert_eq!(keyring.count(), 1);
+    }
+
+    // ── 2026-08-29 再設計 P3: explainDistributed が固定値スタブではなく
+    // AdminState.parallel の実効値 + SQL 分類から実プランを組む ──
+    #[tokio::test]
+    async fn explain_distributed_reflects_parallel_config_and_query_kind() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let ctx = admin_ctx(engine.clone(), None);
+        let parallel = ctx.parallel.clone().unwrap();
+        let schema = build_schema(engine.clone(), ctx);
+
+        // 並列無効時: ParallelScan の par は 1。
+        let resp = schema
+            .execute(authorized_request(
+                r#"query { explainDistributed(sql: "SELECT * FROM users") { step node operation } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let steps = resp.data.into_json().unwrap()["explainDistributed"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(!steps.is_empty());
+        assert!(steps[0]["operation"].as_str().unwrap().starts_with("Gather"));
+        let scan = steps
+            .iter()
+            .find(|s| s["operation"].as_str().unwrap().contains("ParallelScan"))
+            .expect("plan should contain a ParallelScan step");
+        assert!(scan["operation"].as_str().unwrap().contains("par=1"), "{scan:?}");
+        assert_eq!(scan["node"], "node-1");
+
+        // 並列有効・max_workers=6 → par=6。
+        {
+            let mut c = parallel.lock();
+            c.enabled = true;
+            c.max_workers = 6;
+        }
+        let resp = schema
+            .execute(authorized_request(
+                r#"query { explainDistributed(sql: "SELECT * FROM users") { operation } }"#,
+            ))
+            .await;
+        let steps = resp.data.into_json().unwrap()["explainDistributed"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let scan = steps
+            .iter()
+            .find(|s| s["operation"].as_str().unwrap().contains("ParallelScan"))
+            .unwrap();
+        assert!(scan["operation"].as_str().unwrap().contains("par=6"), "{scan:?}");
     }
 }

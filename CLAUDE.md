@@ -132,23 +132,38 @@
 >   (`restart_required`)。`cargo test -p aruaru-dist -p aruaru-graphql
 >   -p aruaru-server` 失敗0(新規 reconcile 3件 + GraphQL 1件)。
 >   TiDB/TiFlash 等の調査結果を `docs/CONTROL_PLANE_REDESIGN.md` 付録 A へ。
-> - **今すぐ着手できる次の一手 = P2 残り → P3**:
+> - **P2 残り / P3 = 一部消化(2026-08-29 続き8)**:
+>   (a) ✅ `/admin/parallel/explain`・`/admin/parallel/jobs` を撤廃。
+>   GraphQL `explainDistributed` query(旧 REST の実ロジックを移植、
+>   `AdminMutation`→`AdminQuery` へ移設)と `parallelJobs` query に一本化。
+>   Tauri 2 コマンドを GraphQL へ。→ **`/admin/parallel*` は完全撤廃**。
+>   (b) ✅ `/v1/keys/self-issue` REST 撤廃 → GraphQL `selfIssueKey` mutation
+>   (`VcsMutation`、**認証ガード無し**)。`build_schema` が `AdminCtx.keyring`
+>   と同一 `KeyGuardian` を schema data へ注入。
+>   (c) ⏳ `disaster_backup.email`: config スキーマは `EmailBackupTargetConfig`
+>   と同じ7フィールドへ拡張済み(`aruaru.example.yaml` も)。reconcile 本体は
+>   `feature = "disaster_email_backup"` ゲート + `replicator` 注入の要否判断
+>   + feature ゲート付きテストが必要な**別スライス**として保留。
+>   `cargo test -p aruaru-graphql -p aruaru-server` 失敗0(GraphQL 新規3件:
+>   selfIssueKey / explainDistributed 実データ / parallelConfig 実データ)。
+> - **今すぐ着手できる次の一手 = P3 本体**:
 >   [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md) §8。
->   P2 残り: `disaster_backup.email` の reconcile 接続、
->   `/admin/parallel/explain`・`/admin/parallel/jobs` の GraphQL
->   実データ化(`explainDistributed`・`parallelJobs` は現状スタブ、実
->   ロジック移植が必要)→ REST 撤廃、Tauri 設定タブ全体の `aruaru.yaml`
->   編集 UI 化。P3: `ephemeral-query`/`multi-raft`/`sharded-store` put/get/
->   `closed-timestamp`/`wal-service` を GraphQL 化 → REST 撤廃。
->   **P2/P3 とも着手前に grep で Tauri/Android/web の該当 REST 参照を
->   確認**(参照があればそのクライアントも同一コミットで移行)。
+>   `ephemeral-query`/`multi-raft`(split/merge/scatter-query)/
+>   `sharded-store`(put/get/stats)/`closed-timestamp`(status/range/
+>   advance/plan)/`wal-service`(status/append/page/image-layer)を
+>   GraphQL query/mutation 化 → 対応 `/admin/*` ルート削除。
+>   `disaster_backup.email` reconcile(feature ゲート)。Tauri 設定タブの
+>   `aruaru.yaml` 編集 UI 化。**着手前に grep で Tauri/Android/web の
+>   該当 REST 参照を確認**(参照があれば同一コミットでクライアントも移行)。
 > - **既に完了済み(「未着手」と誤解しないこと)**: `registry`の
 >   `crawlRegistry`/`testRegistryConnection`はGraphQL側で既に実データ
 >   接続済み(再設計では B2/B3)。
-> - 続き3〜7 の詳細は本ファイル内「HANDOFF追記(2026-08-29〜続き7)」を
+> - 続き3〜8 の詳細は本ファイル内「HANDOFF追記(2026-08-29〜続き8)」を
 >   参照。再設計そのものの正本は `docs/CONTROL_PLANE_REDESIGN.md`
->   (付録 A に CockroachDB×Snowflake ハイブリッド変種=TiDB/TiFlash 等の
->   調査と将来の取り込み候補)。
+>   (§2 新・設計哲学12か条、§3 REST 完全撤廃の厳命、付録 A に
+>   CockroachDB×Snowflake ハイブリッド変種=TiDB/TiFlash 等の調査、
+>   付録 B に「REST 撤廃を可能にする Cosmo の技術」= Federation /
+>   Connect / Persisted Operations / Schema Registry+CDN)。
 
 > **📌 2026-08-26追記: Windows用インストーラー`aruaru-db-installer.exe`を
 > 新設(命名規則統一)**: ユーザー指示「パワーシェルでインストールする
@@ -4724,3 +4739,53 @@ SI 読み取り検証、DeltaTree 型 delta 層)を整理。P5(コントロー�
 **次**: P2 残り(`disaster_backup.email` reconcile 接続、explain/jobs の
 GraphQL 実データ化 → REST 撤廃、Tauri 設定タブの aruaru.yaml 編集 UI 化)、
 その後 P3。
+
+## HANDOFF追記(2026-08-29続き8) 再設計 P2残り/P3: parallel/explain・jobs と self-issue の REST 撤廃
+
+正本: `docs/CONTROL_PLANE_REDESIGN.md`(§2 新・設計哲学12か条、§3 REST 完全撤廃の
+厳命、付録 A=TiDB/TiFlash 調査、付録 B=REST 撤廃を可能にする Cosmo の技術)。
+
+**(a) `/admin/parallel/explain`・`/admin/parallel/jobs` を完全撤廃**
+- GraphQL `explainDistributed` query: 固定値スタブを廃止し、旧 REST
+  `explain_distributed` の実ロジック(SQL 分類 → `AdminState.parallel` の
+  実効値 + 推定行数から ParallelScan/ShuffleExchange/HashAggregate/Gather の
+  ステップ列を組む)を移植。**読み取りなので `AdminMutation` → `AdminQuery`
+  へ移設**(最初 Mutation に置いてスキーマエラー→テスト7件が poison cascade で
+  失敗 → Query へ移して解決)。
+- `parallelJobs` query は既存のまま(単一ノードは常駐ジョブ管理を持たず `[]`)。
+- `admin.rs`: `.at("/parallel/explain")`・`.at("/parallel/jobs")` ルートと
+  `explain_distributed`/`list_jobs` ハンドラ削除。未使用になった
+  `use aruaru_query::parser::{self, Statement};` も削除。
+- Tauri `admin/src-tauri/src/main.rs`: `explain_distributed`/`list_parallel_jobs`
+  コマンドを GraphQL query 呼び出しへ書き換え。
+- → **`/admin/parallel*` は 1 本も残っていない**。
+
+**(b) `/v1/keys/self-issue` REST 撤廃 → GraphQL `selfIssueKey` mutation**
+- `crates/aruaru-graphql/src/lib.rs`: `VcsMutation` に `self_issue_key`
+  リゾルバ(**認証ガード無し** = SPIFFE 哲学「即発行できること自体が承認」)。
+  `SelfIssuedKeyGql { key, role, expires_in_hours }`。`build_schema` が
+  `AdminCtx.keyring` と同一 `KeyGuardian` を `.data()` で schema へ注入。
+- `crates/aruaru-server/src/main.rs`: `/v1/keys/self-issue` ルート・
+  `self_issue_key` ハンドラ・`keyring_for_self_issue` を削除。
+  未使用の `post`/`Data` インポートも整理。
+- 他クライアント参照は grep 済みで皆無(ドキュメントのみ)。
+
+**(c) `disaster_backup.email` — config スキーマのみ先行、reconcile は保留**
+- `config::DisasterBackupEmail` を `open_raid_z_core::EmailBackupTargetConfig`
+  と同じ7フィールド(smtp_host/port/username/password_env/from/to/
+  allow_plaintext_for_testing)へ拡張。`aruaru.example.yaml` も更新。
+  `#[allow(dead_code)]` を付与(P3 の feature ゲート付き reconcile が消費予定)。
+- reconcile 本体は `feature = "disaster_email_backup"` ゲート +
+  `replicator.set_disaster_email_backup` 注入の要否判断 + feature ゲート付き
+  テストが必要なため**別スライス**として次回。
+
+**検証**: `cargo test -p aruaru-graphql -p aruaru-server` 失敗0
+(GraphQL 新規3: `self_issue_key_mutation_works_without_admin_token` /
+`explain_distributed_reflects_parallel_config_and_query_kind` /
+既存 `parallel_config_query_returns_shared_state_not_a_stub`)。
+`cargo build -p aruaru-server` 既存2警告のみ。
+
+**次(P3 本体)**: `ephemeral-query`/`multi-raft`/`sharded-store`/
+`closed-timestamp`/`wal-service` の GraphQL 化 → `/admin/*` 該当ルート削除。
+`disaster_backup` reconcile(feature ゲート)。着手前に grep で
+Tauri/Android/web の該当 REST 参照確認。

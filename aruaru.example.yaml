@@ -68,10 +68,16 @@ wal:
 sharded_store:
   shards: 0              # 0 = 論理コア数(静的)
 
-# disaster_backup:       # feature = "disaster_email_backup" のときのみ
-#   email:
-#     to: "${DISASTER_BACKUP_TO}"
-#     smtp: "${DISASTER_BACKUP_SMTP}"
+# disaster_backup:       # feature = "disaster_email_backup" ビルドのみ。P3 で reconcile 接続予定
+#   enabled: false
+#   email:                # EmailBackupTargetConfig と同じ7項目
+#     smtp_host: "smtp.example.com"
+#     smtp_port: 587
+#     smtp_username: "backup@example.com"
+#     smtp_password_env: "DISASTER_BACKUP_SMTP_PASSWORD"   # 値ではなく環境変数名
+#     from_address: "backup@example.com"
+#     to_address: "admin@example.com"
+#     allow_plaintext_for_testing: false
 
 # ── コントロールプレーン(RPoem)からの動的 config 取得(P5 で実配線) ──
 control_plane:

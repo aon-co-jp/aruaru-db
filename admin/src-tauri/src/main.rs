@@ -276,17 +276,27 @@ async fn set_parallel_config(_base_url: String, _config: ParallelConfig) -> Resu
         .to_string())
 }
 
-/// 分散実行プラン (どのフラグメントがどのノードで並列に走るか) を取得
+/// 分散実行プラン (どのフラグメントがどのノードで並列に走るか) を取得。
+/// 【2026-08-29 再設計 P3】REST `/admin/parallel/explain` は撤廃、
+/// GraphQL `explainDistributed` query へ。
 #[tauri::command]
 async fn explain_distributed(base_url: String, sql: String) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/parallel/explain", json!({ "sql": sql })).await
+    let q = format!(
+        r#"query {{ explainDistributed(sql: {}) {{ step node range operation estimatedRows }} }}"#,
+        serde_json::to_string(&sql).unwrap_or_else(|_| "\"\"".into())
+    );
+    let r = graphql_query(q, None, format!("{base_url}/graphql")).await?;
+    Ok(r["data"]["explainDistributed"].clone())
 }
 
-/// 実行中の並列ジョブ一覧
+/// 実行中の並列ジョブ一覧。
+/// 【2026-08-29 再設計 P3】REST `/admin/parallel/jobs` は撤廃、
+/// GraphQL `parallelJobs` query へ。
 #[tauri::command]
 async fn list_parallel_jobs(base_url: String) -> Result<Vec<Value>, String> {
-    let v = admin_get(&base_url, "/admin/parallel/jobs").await?;
-    Ok(v["jobs"].as_array().cloned().unwrap_or_default())
+    let q = r#"query { parallelJobs { jobId sql status workers elapsedMs rowsProcessed startedAt } }"#;
+    let r = graphql_query(q.to_string(), None, format!("{base_url}/graphql")).await?;
+    Ok(r["data"]["parallelJobs"].as_array().cloned().unwrap_or_default())
 }
 
 // ── ④ 分散DB統合 (フェデレーション) ─────────────────────────────
