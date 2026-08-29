@@ -282,18 +282,34 @@ cargo run -p aruaru-backup --bin backup-cli -- restore --path ./backups/<manifes
 (`aruaru-wire` または `aruaru-graphql`)だけを依存に加えれば足りる
 (いずれも `aruaru-core`/`aruaru-query` を共通基盤として利用)。
 
+**⚠️ 移植・拡張時の大前提(2026-08-29、ユーザー指示によりCLAUDE.md冒頭に
+固定した最重要事項をここにも明記)**: aruaru-dbは**RPoemとSET(対)で
+使うことで初めて「REST API不要・WunderGraph Cosmo有料版(Enterprise)
+互換」という価値が成立する**設計である。以下のREST→GraphQL段階移行は
+その価値(SCIM/SSO相当・APIキー自動管理・VersionlessAPI互換)を強化
+する目的で行っており、**REST APIの代替をただ闇雲に作る作業ではない**
+——移植先で同種の作業を行う場合も、必ず「これはRPoemとのSET連携の
+価値を強化するものか」を自問してから着手すること。WunderGraph Cosmo
+**本体**(Router等)は実はApache 2.0のOSSであり、有料(Enterprise)
+部分はSSO+SCIM・専有クラウドに限定される点も忘れないこと。
+
 **REST→GraphQL段階移行の状況(2026-08-29時点)**: `/admin/*`のREST
 エンドポイントのうち、`clusterStatus`・`backupSchedule`・
-`federatedSources`(および対応するmutation)はGraphQL側が
-`crates/aruaru-dist/src/admin_shared.rs`の共有型経由でREST側と
-**同一の状態インスタンス**を参照するよう接続済み——移植先で新しい
-REST/GraphQL両対応の管理データを追加する場合は、この
-`Arc<parking_lot::Mutex<..>>`共有パターンを踏襲すること
-(`AdminState::topology_handle()`/`schedule_handle()`/
-`federation_handle()`が実例)。`parallel_config`・`multi-raft`・
-`sharded-store`・`closed-timestamp`・`wal-service`・`object-table`・
-`ephemeral-query`・`registry`(crawl/test-connection)・`keys`は
-GraphQL側が未接続のまま(詳細・理由は`CLAUDE.md`のHANDOFF参照)。
+`federatedSources`(および対応するmutation)・`keyStatus`/`revokeKeys`
+はGraphQL側が`crates/aruaru-dist/src/admin_shared.rs`(topology/
+schedule/federation)・`crates/aruaru-dist/src/keyring.rs`
+(`KeyGuardian`)の共有型経由でREST側と**同一の状態インスタンス**を
+参照するよう接続済み——移植先で新しいREST/GraphQL両対応の管理データを
+追加する場合は、この`Arc<parking_lot::Mutex<..>>`(または
+`Arc<KeyGuardian>`)共有パターンを踏襲すること(`AdminState::
+topology_handle()`/`schedule_handle()`/`federation_handle()`/
+`keyring`フィールドが実例)。`parallel_config`(REST実体とGraphQL
+スキーマの形状が非互換なため意図的に未接続、無理な変換をしないこと)・
+`multi-raft`・`sharded-store`・`closed-timestamp`・`wal-service`・
+`object-table`・`ephemeral-query`はGraphQL側が未接続のまま
+(詳細・理由は`CLAUDE.md`のHANDOFF参照)。**注意**: `registry`の
+crawl/test-connection(`crawlRegistry`/`testRegistryConnection`)は
+既にGraphQL側で実データ接続済み——「未着手」と誤解しないこと。
 
 ## 8. 移植・拡張時の注意
 
