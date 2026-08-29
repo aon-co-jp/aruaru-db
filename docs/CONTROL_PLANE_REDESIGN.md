@@ -280,9 +280,15 @@ config/
 
 ## 8. フェーズ（「一気に」でも作業はこの順で積む）
 
-- **P0（本文書）** 設計思想・4 バケツ仕分け・目標 HTTP 面の確定。 ← 済
+- **P0（本文書）** 設計思想・4 バケツ仕分け・目標 HTTP 面の確定。 ← **済**
 - **P1 宣言的設定基盤** `aruaru-server::config`（load + watch + reconcile）、
-  `aruaru.yaml`、`--config` フラグ。既存 CLI フラグは互換維持。
+  `aruaru.yaml`、`--config` フラグ。既存 CLI フラグは互換維持。 ← **済（2026-08-29 続き6）**
+  - `crates/aruaru-server/src/config/{mod,reconcile,watch}.rs` 新設。
+  - 依存追加は `serde_norway` のみ。ファイル監視は mtime ポーリング
+    ＋ `SIGHUP`（`cfg(unix)`）を自前実装（`notify` 不使用）。
+  - P1 で reconcile 接続済み: `backup.schedule`・`federation.sources`。
+    残り（`query.parallel` 等）は P2。
+  - `aruaru.example.yaml` を同梱。`cargo test -p aruaru-server` 失敗 0。
 - **P2 B1 の移送** parallel / backup.schedule / federation / follower_read.lag /
   wal / sharded_store / disaster_backup を config へ。対応する `/admin` ルートと
   GraphQL `setX` スタブを削除。Tauri の設定タブを `aruaru.yaml` 編集に。

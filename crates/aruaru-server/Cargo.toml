@@ -27,6 +27,11 @@ serde.workspace       = true
 serde_json.workspace  = true
 parking_lot.workspace = true
 chrono.workspace      = true
+# 【2026-08-29 P1】宣言的設定 `aruaru.yaml` のロード + ホットリロード
+# (docs/CONTROL_PLANE_REDESIGN.md)。`serde_yaml` は非推奨のため後継の
+# `serde_norway` を使う。ファイル監視は WunderGraph Cosmo の `watch_config`
+# と同じ mtime ポーリング方式で自前実装(新規依存を増やさない)。
+serde_norway  = "0.9"
 # APIキー自動ライフサイクル管理(2026-08-29新設、src/keyring.rs参照)。
 # RPoemの`KeyGuardian`と同じ最小依存構成(SHA-256ハッシュ化+UUID発行)。
 sha2.workspace        = true

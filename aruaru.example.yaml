@@ -1,0 +1,84 @@
+# aruaru-db 宣言的設定ファイル(例)
+#
+# 使い方:  aruaru-server --config ./aruaru.yaml
+#
+# 設計の正本: docs/CONTROL_PLANE_REDESIGN.md
+#
+# - 「望ましい状態」を書く宣言的ドキュメント。実行時ミューテーション
+#   (setX API)は廃止方針。設定変更は「このファイルを編集 → 保存 →
+#   ホットリロードが反映」。
+# - `${VAR}` は環境変数へ展開。`$$` はリテラルの `$`。
+# - すべてのキーは省略可(未指定は既定値)。未知のキーはエラー。
+#
+# 実装状況(P1): server/raft は静的(変更検知で「要再起動」を警告)。
+# backup.schedule と federation.sources はホットリロードで反映。
+# query.parallel ほかは P2 以降で接続。
+
+version: "1"
+
+# ── 静的(プロセス再起動が必要) ───────────────────────────
+server:
+  data_dir: "./data"
+  pg_port: 5432
+  graphql_port: 4000
+  metrics_addr: "127.0.0.1:9090"
+  log_level: "info"
+  tls:
+    cert: "${ARUARU_TLS_CERT}"
+    key: "${ARUARU_TLS_KEY}"
+
+raft:
+  node_id: 1
+  role: "voter"          # voter | learner
+  peers: []              # ["2@host:5433", ...]
+  learner_peers: []
+
+# ── 動的(ホットリロード対象) ─────────────────────────────
+query:
+  parallel:
+    enabled: false
+    max_workers: 4
+    chunk_size: 10000
+    strategy: "hash"     # hash | range
+
+backup:
+  schedule:
+    enabled: false
+    cron: "0 3 * * *"
+    kind: "full"
+
+federation:
+  sources: []
+    # - name: "warehouse"
+    #   kind: "postgres"
+    #   uri: "postgres://user:pass@db.internal/wh"
+    #   read_only: true
+    #   pushdown: false
+
+follower_read:
+  target_lag_ms: 3000
+
+wal:
+  safekeepers: 3
+  quorum: 2
+
+sharded_store:
+  shards: 0              # 0 = 論理コア数
+
+# disaster_backup:       # feature = "disaster_email_backup" のときのみ
+#   email:
+#     to: "${DISASTER_BACKUP_TO}"
+#     smtp: "${DISASTER_BACKUP_SMTP}"
+
+# ── コントロールプレーン(RPoem)からの動的 config 取得(P5 で実配線) ──
+control_plane:
+  execution_config:
+    poll:
+      url: "http://localhost:3100/aruaru/execution-config"
+      interval_ms: 10000
+  graph_api_token: "${ARUARU_GRAPH_TOKEN}"
+
+watch_config:
+  enabled: true
+  interval_ms: 2000
+  startup_delay_ms: 500
