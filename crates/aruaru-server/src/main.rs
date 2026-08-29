@@ -342,6 +342,9 @@ async fn main() -> anyhow::Result<()> {
         // GraphQLスタブをREST実状態へ接続する対応)。
         let schedule_for_graphql = admin_state.schedule_handle();
         let federation_for_graphql = admin_state.federation_handle();
+        // オブジェクトテーブル(時間旅行=VersionlessAPIの実体)も同一
+        // インスタンスをGraphQL `objectTable`へ共有(2026-08-29(続き3))。
+        let object_table_for_graphql = admin_state.object_table_handle();
 
         // Federation SDL を返すエンドポイント (wgc subgraph publish 用)
         #[handler]
@@ -405,6 +408,7 @@ async fn main() -> anyhow::Result<()> {
                     schedule: Some(schedule_for_graphql.clone()),
                     federation: Some(federation_for_graphql.clone()),
                     keyring: Some(keyring_for_graphql.clone()),
+                    object_table: Some(object_table_for_graphql.clone()),
                 },
             ))
             .at("/graphql/sdl", get(subgraph_sdl))
