@@ -27,13 +27,14 @@ pub struct PeerConfig {
 
 pub use raft::{
     command::{Command, CommandResponse},
-    AppendEntriesReq, AppendEntriesResp, AppendResult, Applier, HttpSideTransport, HttpTransport,
-    LogEntry, RaftDriver, RaftNode, RaftRole, RaftState, RaftWriter, ReplicatedLog,
-    ReplicatedWriter, RequestVoteReq, RequestVoteResp, Transport, VoteResult,
-    DEFAULT_COMMIT_TIMEOUT,
+    AppendEntriesReq, AppendEntriesResp, AppendResult, Applier, BinaryTcpTransport,
+    HttpSideTransport, HttpTransport, LogEntry, RaftDriver, RaftNode, RaftRole, RaftState,
+    RaftWriter, ReplicatedLog, ReplicatedWriter, RequestVoteReq, RequestVoteResp,
+    serve_binary_raft, Transport, VoteResult, DEFAULT_COMMIT_TIMEOUT,
 };
 pub use shard::{
-    ClusterTopology, NodeInfo, Range, RouteTarget, DEFAULT_RANGE_SIZE, SPLIT_THRESHOLD,
+    ClusterStatusSnapshot, ClusterTopology, NodeInfo, NodeStatusSnapshot, Range,
+    RangeStatusSnapshot, RouteTarget, DEFAULT_RANGE_SIZE, SPLIT_THRESHOLD,
 };
 pub use multi_raft::MultiRaftCluster;
 pub use closed_ts::{

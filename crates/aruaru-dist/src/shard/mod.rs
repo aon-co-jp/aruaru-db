@@ -8,7 +8,10 @@
 
 pub mod topology;
 
-pub use topology::{ClusterTopology, NodeInfo, RouteTarget};
+pub use topology::{
+    ClusterStatusSnapshot, ClusterTopology, NodeInfo, NodeStatusSnapshot, RangeStatusSnapshot,
+    RouteTarget,
+};
 
 use serde::{Deserialize, Serialize};
 

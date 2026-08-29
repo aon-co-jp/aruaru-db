@@ -15,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 mod admin;
 mod cluster;
 mod ephemeral_pod;
+mod keyring;
 mod self_update;
 
 /// aruaru-DB server
@@ -253,6 +254,34 @@ async fn main() -> anyhow::Result<()> {
     ) {
         Ok((node, driver)) => {
             admin_state.attach_cluster(node.clone());
+            // 【2026-08-29新設】バイナリRaft/WALプロトコルリスナー
+            // (`aruaru_dist::serve_binary_raft`、REST/JSON-over-HTTPを
+            // 一切使わない生TCPバイナリ実装、詳細は`binary_transport.rs`
+            // モジュールdoc参照)を、既存のHTTP管理APIポートから固定
+            // オフセット(`cluster::BINARY_RAFT_PORT_OFFSET`)ずらした
+            // ポートで起動する。ここがAppendEntries/RequestVote・closed
+            // timestamp side transportの実際の受信口になる——
+            // `/admin/raft/*`・`/admin/closed-timestamp/receive`
+            // (REST)はもはやノード間通信の主経路ではない。
+            let binary_bind_addr: std::net::SocketAddr = format!(
+                "0.0.0.0:{}",
+                cli.gql_port + cluster::BINARY_RAFT_PORT_OFFSET
+            )
+            .parse()
+            .expect("valid binary raft bind address");
+            let binary_listener_node = node.clone();
+            let binary_listener_closed_ts = admin_state.closed_ts_coordinator();
+            tokio::spawn(async move {
+                if let Err(e) = aruaru_dist::serve_binary_raft(
+                    binary_bind_addr,
+                    binary_listener_node,
+                    Some(binary_listener_closed_ts),
+                )
+                .await
+                {
+                    tracing::error!(error = %e, "binary Raft/WAL listener exited");
+                }
+            });
             if self_is_learner {
                 tracing::info!(
                     node_id = cli.raft_id,
@@ -297,7 +326,15 @@ async fn main() -> anyhow::Result<()> {
     let gql_replicator = replicator.clone();
     let http_handle = tokio::spawn(async move {
         use poem::middleware::Cors;
-        use poem::{get, handler, listener::TcpListener, EndpointExt, Route, Server};
+        use poem::{get, handler, listener::TcpListener, post, web::Data, EndpointExt, Route, Server};
+
+        // `admin_state`は下の`.nest("/admin", admin::admin_routes(admin_state))`
+        // で消費(move)されるため、自己発行エンドポイント用にキー
+        // レジストリだけ先に複製しておく。
+        let keyring_for_self_issue = admin_state.keyring.clone();
+        // GraphQL `clusterStatus`がREST `/admin/cluster`と同じトポロジを
+        // 参照するための共有ハンドル(2026-08-29新設)。
+        let topology_for_graphql = admin_state.topology_handle();
 
         // Federation SDL を返すエンドポイント (wgc subgraph publish 用)
         #[handler]
@@ -311,8 +348,41 @@ async fn main() -> anyhow::Result<()> {
             "ok"
         }
 
+        // 【2026-08-29新設】APIキー自動発行(自動承認込み)。認証を要求
+        // しない——「認証無しで即座に発行できる」こと自体が承認手続き
+        // そのもの(RPoemの`POST /api/keys/self-issue`と同じ設計、
+        // `keyring.rs`モジュールdoc参照)。そのため`/admin/*`配下
+        // (`admin::admin_routes`が全体を認証で包む)ではなく、この
+        // トップレベルRouteに直接登録する。発行するキーは既定で
+        // `viewer`ロール・24時間TTLに限定し、無制限の権限を無認証で
+        // 渡さない設計にした。
+        #[handler]
+        fn self_issue_key(
+            keyring: Data<&std::sync::Arc<crate::keyring::KeyGuardian>>,
+        ) -> poem::web::Json<serde_json::Value> {
+            let key = keyring.issue(
+                "self-issued",
+                "viewer",
+                Some(chrono::Duration::hours(crate::keyring::DEFAULT_SELF_ISSUE_TTL_HOURS)),
+            );
+            poem::web::Json(serde_json::json!({
+                "key": key,
+                "role": "viewer",
+                "expires_in_hours": crate::keyring::DEFAULT_SELF_ISSUE_TTL_HOURS,
+                "note_ja": "このキーはviewerロール・24時間限定です。より強い権限が\
+                    必要な操作は、引き続きARUARU_DB_ADMIN_TOKENを使うか、\
+                    信頼できる管理者がPOST /admin/keys/revokeで既存キーを\
+                    無効化した上で別途発行してください。",
+                "note_en": "This key is scoped to the viewer role and expires in 24h. \
+                    Operations requiring stronger privileges still need \
+                    ARUARU_DB_ADMIN_TOKEN, or a trusted admin issuing a \
+                    separate key."
+            }))
+        }
+
         let app = Route::new()
             .at("/healthz", get(healthz))
+            .at("/v1/keys/self-issue", post(self_issue_key).data(keyring_for_self_issue))
             .at("/graphql", aruaru_graphql::graphql_endpoint(
                 gql_engine.clone(),
                 aruaru_graphql::AdminCtx {
@@ -324,6 +394,7 @@ async fn main() -> anyhow::Result<()> {
                     // Arc<dyn ReplicatedWriter> をGraphQL側にも共有する
                     // (cluster_propose resolverのRaftWriter経由化のため)。
                     replicator: gql_replicator.clone(),
+                    topology: Some(topology_for_graphql.clone()),
                 },
             ))
             .at("/graphql/sdl", get(subgraph_sdl))

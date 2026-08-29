@@ -20,6 +20,7 @@
 //!
 //! この分離により、合意エンジンを openraft に差し替えてもログ/適用ロジックは再利用できる。
 
+pub mod binary_transport;
 pub mod command;
 pub mod driver;
 pub mod log;
@@ -30,6 +31,7 @@ pub mod sim;
 pub mod transport;
 pub mod writer;
 
+pub use binary_transport::{serve_binary_raft, BinaryTcpTransport};
 pub use command::{Command, CommandResponse};
 pub use driver::RaftDriver;
 pub use log::ReplicatedLog;
