@@ -1,5 +1,21 @@
 # aruaru-DB 🦀
 
+> **Updated 2026-08-29**: Added automatic API-key lifecycle management
+> (self-issue / self-approve / self-revoke / self-expire, an independent
+> reimplementation of RPoem's `KeyGuardian` design — no direct Cargo
+> dependency between the two repos), removed REST entirely from
+> node-to-node Raft/WAL traffic (binary framed transport instead), and
+> continued the staged REST→GraphQL migration of `/admin/*` operational
+> endpoints (`clusterStatus`, `backupSchedule`, `federatedSources` now
+> read/write the same shared state as their REST counterparts, instead
+> of returning fixed stub values). Web research (Shopify's REST Admin
+> API sunset, and a Japanese case study) confirmed that an instant full
+> REST removal is not the 2026 industry-standard pattern — staged
+> migration is. `parallel_config`/`parallel_jobs` remain intentionally
+> unconnected: their GraphQL schema shape doesn't match the REST
+> `ParallelConfig` fields at all, and a lossy/misleading mapping was
+> avoided on purpose. See `CLAUDE.md`'s HANDOFF entries for that date.
+
 > 📌 Pending task (2026-08-06): a plan exists to incorporate Toshiba SBM / DeepSeek techniques. See [CLAUDE.md](CLAUDE.md) for details.
 
 > **Updated 2026-08-20**: Added an optional self-update feature

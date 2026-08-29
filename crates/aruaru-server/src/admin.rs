@@ -20,6 +20,7 @@ use poem::{get, handler, post, web::Data, web::Json, Endpoint, EndpointExt, Requ
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use aruaru_dist::admin_shared::{BackupScheduleState, FederatedSourceEntry, SharedBackupSchedule, SharedFederatedSources};
 use aruaru_query::parser::{self, Statement};
 use aruaru_query::{QueryEngine, QueryResponse, Value as SqlValue};
 use aruaru_registry::Registry;
@@ -32,9 +33,14 @@ pub struct AdminState {
     pub engine: Arc<QueryEngine>,
     pub registry: Arc<Registry>,
     backups: Mutex<Vec<BackupManifest>>,
-    schedule: Mutex<Option<ScheduleInfo>>,
+    /// 【2026-08-29改修】`Arc<Mutex<..>>`化——`aruaru_dist::admin_shared`の
+    /// 共有型を使い、GraphQL側(`AdminCtx.schedule`)へ`schedule_handle()`
+    /// 経由で同一インスタンスを渡す(`topology`と同じパターン)。
+    schedule: SharedBackupSchedule,
     parallel: Mutex<ParallelConfig>,
-    federation: Mutex<Vec<FederatedSource>>,
+    /// 【2026-08-29改修】同上、`federation_handle()`経由でGraphQL
+    /// (`AdminCtx.federation`)と共有する。
+    federation: SharedFederatedSources,
     /// クラスタトポロジ (Range 配置 + ノード)
     /// 【2026-08-29改修】`Arc<Mutex<..>>`化——GraphQL側(`aruaru_graphql::
     /// AdminCtx`)へ`topology_handle()`経由で同一インスタンスを共有し、
@@ -108,9 +114,9 @@ impl AdminState {
             engine,
             registry,
             backups: Mutex::new(Vec::new()),
-            schedule: Mutex::new(None),
+            schedule: Arc::new(Mutex::new(None)),
             parallel: Mutex::new(ParallelConfig::default()),
-            federation: Mutex::new(Vec::new()),
+            federation: Arc::new(Mutex::new(Vec::new())),
             topology: Arc::new(Mutex::new(aruaru_dist::ClusterTopology::single_node(1, "127.0.0.1:5432"))),
             cluster: Mutex::new(None),
             #[cfg(feature = "disaster_email_backup")]
@@ -176,6 +182,19 @@ impl AdminState {
     /// トポロジインスタンスを共有するためのアクセサ。
     pub fn topology_handle(&self) -> Arc<Mutex<aruaru_dist::ClusterTopology>> {
         self.topology.clone()
+    }
+
+    /// 【2026-08-29新設】GraphQL側(`AdminCtx.schedule`)へ同一のバックアップ
+    /// スケジュール状態を共有するためのアクセサ(`topology_handle`と同じ
+    /// パターン)。
+    pub fn schedule_handle(&self) -> SharedBackupSchedule {
+        self.schedule.clone()
+    }
+
+    /// 【2026-08-29新設】GraphQL側(`AdminCtx.federation`)へ同一の
+    /// フェデレーションソース一覧を共有するためのアクセサ。
+    pub fn federation_handle(&self) -> SharedFederatedSources {
+        self.federation.clone()
     }
 }
 
@@ -278,13 +297,9 @@ struct BackupManifest {
     branch: String,
 }
 
-#[derive(Clone, Serialize)]
-struct ScheduleInfo {
-    cron: String,
-    enabled: bool,
-    kind: String,
-    updated_at: String,
-}
+// `ScheduleInfo`は`aruaru_dist::admin_shared::BackupScheduleState`(共有型)
+// へ統合済み(2026-08-29)——REST/GraphQL両方が同じ構造体・同じ
+// `Arc<Mutex<..>>`インスタンスを参照する。
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ParallelConfig {
@@ -311,18 +326,8 @@ impl Default for ParallelConfig {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct FederatedSource {
-    name: String,
-    kind: String,
-    uri: String,
-    read_only: bool,
-    pushdown: bool,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    table_count: Option<u32>,
-}
+// `FederatedSource`は`aruaru_dist::admin_shared::FederatedSourceEntry`
+// (共有型)へ統合済み(2026-08-29)。
 
 // ── リクエスト型 ───────────────────────────────────────────────
 
@@ -399,7 +404,7 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
     route
         .at("/backup", get(list_backups).post(create_backup))
         .at("/backup/restore", post(restore_backup))
-        .at("/backup/schedule", post(set_schedule))
+        .at("/backup/schedule", get(get_schedule).post(set_schedule))
         .at("/migrate/test", post(migrate_test))
         .at("/migrate/preview", post(migrate_preview))
         .at("/migrate/run", post(migrate_run))
@@ -552,8 +557,13 @@ fn restore_backup(state: Data<&Arc<AdminState>>, Json(req): Json<RestoreRequest>
 }
 
 #[handler]
+fn get_schedule(state: Data<&Arc<AdminState>>) -> Json<Value> {
+    Json(serde_json::to_value(state.schedule.lock().clone()).unwrap())
+}
+
+#[handler]
 fn set_schedule(state: Data<&Arc<AdminState>>, Json(req): Json<ScheduleRequest>) -> Json<Value> {
-    *state.schedule.lock() = Some(ScheduleInfo {
+    *state.schedule.lock() = Some(BackupScheduleState {
         cron: req.cron.clone(),
         enabled: req.enabled,
         kind: req.kind,
@@ -800,7 +810,7 @@ fn list_federation(state: Data<&Arc<AdminState>>) -> Json<Value> {
 }
 
 #[handler]
-fn register_federation(state: Data<&Arc<AdminState>>, Json(mut src): Json<FederatedSource>) -> Json<Value> {
+fn register_federation(state: Data<&Arc<AdminState>>, Json(mut src): Json<FederatedSourceEntry>) -> Json<Value> {
     src.status = Some("unknown".into());
     let mut list = state.federation.lock();
     if list.iter().any(|s| s.name == src.name) {

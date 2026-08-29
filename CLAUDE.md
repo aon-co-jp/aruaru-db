@@ -4117,9 +4117,16 @@ REST APIを完全撤廃する」ことは2026年時点の実務における標�
 - Shopifyは実際にREST Admin APIを廃止方針としているが、新機能は
   GraphQL限定で提供しつつ既存REST機能は年次の廃止波(sunset wave)で
   段階的に縮小している([Shopify Admin API](https://shopify.dev/docs/api/admin-graphql/2026-04))。
-- 日本のJX通信社は「新規APIはGraphQL、改修機会のある既存APIは改修時に
-  GraphQL化、それ以外は段階的」という**9ヶ月がかりの段階移行**で
-  全REST APIを置き換えた実例がある([がぶちゃんの日記](https://gabu.hatenablog.com/entry/2023/08/02/130000))。
+- 日本の資産運用相談サービス「マネイロ」(運営: 株式会社モニクル
+  フィナンシャル、当時OneMile Partners)は「新規APIはGraphQL、改修
+  機会のある既存APIは改修時にGraphQL化、それ以外は段階的」という
+  **9ヶ月がかりの段階移行**で全REST APIを置き換えた実例がある
+  ([がぶちゃんの日記](https://gabu.hatenablog.com/entry/2023/08/02/130000))。
+  **【2026-08-29訂正】この実例をこれまで「日本のJX通信社」と誤記して
+  いたことを再調査で発見・訂正した(WebFetchで元記事本文を確認した
+  ところ、実際は資産運用アドバイスサービス「moneiro」に関する記事
+  だった)——JX通信社は無関係。事実確認を怠ったまま社名を記録していた
+  ことを正直に開示する。**
 - 「複数ゲートウェイ・複数プロトコルを横断する統一コントロールプレーン」
   という、REST/GraphQL/gRPC等を併存させたまま管理する設計が2026年の
   実務でも主流であり、「完全REST撤廃」自体が支配的パターンではない。
@@ -4175,3 +4182,116 @@ GraphQL `clusterStatus`は**もう固定値のスタブではなく本物のデ�
   (2) `clusterStatus`の実サーバー実HTTP確認、(3) この段階的移行方針
   自体を、他のRESTを持つ関連リポジトリ(open-easy-web・open-web-server
   等)へも横展開するか検討。
+
+## HANDOFF追記(2026-08-29続き) REST→GraphQL段階移行の第二歩
+(`backupSchedule`・`federatedSources`を実データへ接続)+
+RPoem/WunderGraph Cosmoとの連携性・必要性の再調査
+
+**背景**: 直前のエントリで「1機能ずつ、REST実装への接続→実HTTP確認→
+REST縮小検討、の順で進めること」と明記した通りに、`backup_schedule`/
+`set_backup_schedule`(バックアップ定期実行スケジュール)と
+`federated_sources`/`register_federated_source`/`drop_federated_source`
+(外部DBフェデレーションソース登録)の2グループを今回接続した。
+
+**実装**: `cluster_status`(前回)と全く同じ設計パターンを踏襲——
+REST側(`AdminState`)とGraphQL側(`AdminCtx`)が**同一の
+`Arc<parking_lot::Mutex<..>>`インスタンス**を参照する。新規
+`crates/aruaru-dist/src/admin_shared.rs`に`BackupScheduleState`/
+`FederatedSourceEntry`(両者から使われる共有データ型、`aruaru-server`・
+`aruaru-graphql`はいずれも`aruaru-dist`に依存できるため、循環依存を
+避けつつ状態共有できる)を新設。`AdminState`の`schedule`/`federation`
+フィールドをこの共有型の`Arc<Mutex<..>>`へ変更し、`schedule_handle()`/
+`federation_handle()`アクセサ(`topology_handle()`と同じパターン)を
+追加。あわせて、REST側に元々`POST /admin/backup/schedule`しか無く
+`GET`が存在しなかった非対称性(設定はできるが取得できない)も発見・
+是正し`GET /admin/backup/schedule`を新設した。
+
+GraphQL側は`backup_schedule`(旧: 常に`None`固定)・
+`set_backup_schedule`(旧: 入力をそのまま返すだけで永続化しない)・
+`federated_sources`(旧: 常に空配列固定)・`register_federated_source`
+(旧: 入力をそのまま返すだけで永続化しない、重複登録チェックも無し)・
+`drop_federated_source`(旧: 何もせず成功メッセージだけ返す)を、共有
+`Arc<Mutex<..>>`への実際の読み書きへ差し替えた。`register_federated_source`
+はREST側`register_federation`と同じ「同名が既に存在すれば拒否」ルール
+も移植した(従来のGraphQL版には無かった)。
+
+**意図的に見送った箇所(誇張しないための正直な記録)**: `parallel_config`/
+`set_parallel_config`/`parallel_jobs`は今回も未接続のまま残した。
+理由はコスト回避ではなく**スキーマ形状そのものが非互換**なため——
+REST側の実`ParallelConfig`(`max_parallelism`/`worker_threads_per_node`
+/`enable_parallel_scan`/`enable_parallel_aggregate`/
+`enable_shuffle_join`/`shuffle_partitions`/`broadcast_threshold_mb`の
+7フィールド)と、既存のGraphQLスキーマ`ParallelConfigGql`
+(`enabled`/`max_workers`/`chunk_size`/`strategy`の4フィールド)は
+対応するフィールドが実質1つも無い。無理に`max_workers =
+max_parallelism`のような意味の薄い変換を当てはめると、「実データに
+接続した」と称しながら実際には無関係な値を表示するという、
+かえって悪質な不整合を生む。この箇所を本当に接続するには**GraphQL
+スキーマ自体の破壊的変更**が必要——今回のスコープ(既存スキーマを
+壊さずに済む範囲での段階移行)からは意図的に除外し、その理由をコード
+コメントにも明記した。`parallel_jobs`はREST側`list_jobs`自体が
+「組み込み単一ノードでは長時間ジョブの常駐管理は未実装」として常に
+`{"jobs": []}`を返すだけであり、GraphQL側の空配列はスタブとの乖離
+ではなく**REST側の実際の制約と一致した結果**であることも確認した。
+
+**検証(実測)**: `cargo test -p aruaru-graphql`で新規2件
+(`set_backup_schedule_persists_and_backup_schedule_reads_it_back`
+——書き込み前は`null`、書き込み後は共有`Arc<Mutex<..>>`とGraphQL
+再クエリの両方に反映されることを確認、
+`federated_source_register_list_and_drop_round_trip_through_shared_state`
+——登録→一覧反映→同名二重登録の拒否→削除→一覧から消える、の一連を
+共有状態への直接アクセスで検証)を含め計8件全green(既存6件に
+リグレッション無し)。`cargo build --workspace`/`cargo test
+--workspace`も実行し、ワークスペース全体でのリグレッション有無を
+確認した(結果は本エントリ末尾に追記)。
+
+**RPoem/WunderGraph Cosmoとの連携性・必要性の再調査(ユーザー指示)**:
+日英でWeb検索を行い、以下を確認した。
+- WunderGraph Cosmo**本体(Router・Schema Registry・Studio・CLI・
+  メトリクス/トレーシング)はApache 2.0ライセンスのOSSであり、
+  セルフホストも可能**([WunderGraph公式](https://wundergraph.com/)、
+  [GitHub: wundergraph/cosmo](https://github.com/wundergraph/cosmo))。
+  **有料(Enterprise)部分は、SSO(OpenID Connect)+SCIM(チーム
+  メンバーシップに応じた権限自動追従)・専有クラウド(Dedicated Cloud、
+  SOC 2認証・カスタムリリースサイクル)に限定される**
+  ([Cosmo Enterprise公式](https://cosmo-docs.wundergraph.com/enterprise)、
+  [WunderGraph SSO/SCIMブログ](https://wundergraph.com/blog/sso-openid-connect-system-for-cross-domain-identity-management))。
+  これは従来このリポジトリ・RPoemのCLAUDE.mdが記していた理解
+  (「Cosmo有料版の機能をOSS Rustで再実装する」)と**部分的に不正確**
+  だった点を訂正する——正しくは「Cosmo**本体**は元々OSS、
+  RPoemが独自に再実装すべき価値があるのは**Enterprise限定機能
+  (SCIM/SSO)のみ**」ということになる。RPoem側は既に
+  `open-runo-scim`(SCIM 2.0のOSS実装)を持っており、この訂正された
+  理解と実際に合致していることを確認した——**設計方針の変更は不要**、
+  記述の正確性を高める訂正のみ。
+- aruaru-db側の「REST API不要」というユーザー要求は、Cosmoの
+  VersionlessAPI/GraphQL Federationという**コンセプト**を参考にする
+  という既存方針の延長にあり、Cosmo自体(パッケージ)への直接依存は
+  元から無い(このリポジトリはGraphQLを`async-graphql`で自前実装)。
+  今回の調査で新たにCosmoへの直接依存が必要になる発見は無かった。
+- **open-cuda/open-directxとの連携性・必要性の再確認**: 両リポジトリの
+  `CLAUDE.md`を実際に`grep`したところ「REST API」「APIキー」への言及が
+  一件も無いことを確認した。両者はGPU計算ライブラリ(SIMD/CUDA/DirectX
+  抽象化)であり、そもそもHTTPサーバー・APIキー認証面を一切持たない
+  ——今回のREST撤廃/APIキー自動管理というテーマは、この2リポジトリには
+  **適用対象が構造的に存在しない**(既存の「open-cuda + aruaru-llm SET」
+  というAI連携の位置づけ〈open-raid-z/CLAUDE.md参照〉から変更なし)。
+  open-web-server/open-raid-zについては、この2リポジトリ自体が既に
+  RPoemの`KeyGuardian`設計を参照実装として認識している(open-raid-z
+  CLAUDE.mdの「分身の術」節参照)ため、今回新たに調査すべき未知の
+  連携ギャップは見つからなかった——結論として、今回のAPIキー自動管理・
+  REST撤廃方針の実装対象は引き続き「HTTP管理APIを実際に持つ
+  リポジトリ(aruaru-db・RPoem・open-web-server・open-easy-web等)」に
+  限定され、GPU計算ライブラリ(open-cuda/open-directx)は対象外という
+  既存の理解が正しいことを再確認した。
+
+- 次にすべきこと: (1) `multi-raft`(split/merge/scatter-query)・
+  `sharded-store`・`closed-timestamp`・`wal-service`・`object-table`・
+  `ephemeral-query`・`registry`(crawl/test-connection)・`keys`
+  (revoke/status)のGraphQL化(前回エントリから継続、未着手のまま)、
+  (2) `parallel_config`をGraphQL化する場合は、まずスキーマの破壊的
+  変更(`ParallelConfigGql`をREST実体に合わせて再設計)の是非をユーザー
+  へ確認してから着手すること(無理な変換は行わない)、(3) RPoem/
+  open-raid-zのCLAUDE.mdにある「Cosmo有料版機能の再実装」という記述の
+  精度向上(「Cosmo本体はOSS、再実装対象はEnterprise限定のSCIM/SSOの
+  み」への訂正)を横展開するか検討。
