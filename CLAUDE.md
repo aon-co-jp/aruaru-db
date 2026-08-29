@@ -58,19 +58,32 @@
 > ### 🔄 セッション再開用メモ(2026-08-29時点、別アカウント/別セッション
 > からでもここだけ読めば続きから着手できるようにするための要約)
 >
-> - **直近3コミット**(`git log --oneline -3`で確認可): (1)
->   `backupSchedule`/`federatedSources`をREST実データへ接続、(2)
->   `keyStatus`/`revokeKeys`を新設しREST `/admin/keys/*`と同一の
->   `KeyGuardian`(`crates/aruaru-dist/src/keyring.rs`)を共有、(3)
->   本セクション(最重要事項)をファイル冒頭へ固定。いずれも
->   `cargo build --workspace`/`cargo test --workspace`(19テスト
->   バイナリ、失敗0件)で検証済み・pushまで完了。
-> - **今すぐ着手できる次の一手**: GraphQL側にresolver自体がまだ無い
->   `multi-raft`(split/merge/scatter-query)・`sharded-store`・
->   `closed-timestamp`・`wal-service`・`object-table`・
->   `ephemeral-query`のうち1つを選び、`admin_shared.rs`/`keyring.rs`と
->   同じ「REST(`AdminState`)とGraphQL(`AdminCtx`)が`aruaru-dist`
->   経由で同一の`Arc<Mutex<..>>`を共有する」パターンで接続する
+> - **直近の到達点**(`git log --oneline`で確認可): `backupSchedule`/
+>   `federatedSources`/`keyStatus`/`revokeKeys` をREST実データへ接続
+>   (第1〜3歩)。**第4歩(2026-08-29 続き3)= `object-table` を
+>   「REST完全撤廃」の初の雛形に**: `objectTable` query +
+>   `objectTableCommit`/`objectTablePrune` mutation を新設し、
+>   `admin.rs` から `/admin/object-table` `/commit` `/prune` の
+>   **3ルート・3ハンドラ・リクエスト構造体4つを削除**。
+>   `object_table` フィールドと `object_table_handle()` だけ残し、
+>   GraphQL(`AdminCtx.object_table`)へ注入する唯一の経路にした。
+>   `cargo test -p aruaru-graphql -p aruaru-server` 失敗0件で検証済み。
+>   時間旅行(スナップショット連鎖)= VersionlessAPI の核なので
+>   SET価値の直接強化と判断して選定(闇雲な代替ではない)。
+> - **重要な区別**: `clusterStatus`/`backupSchedule`/`keyStatus` は
+>   **GraphQL実データ化のみで、対応するRESTルートはまだ消していない**
+>   (`/admin/cluster` 等は現存)。「REST完全撤廃」を名乗れるのは今の
+>   ところ `object-table` だけ。次はこの3つ(および下記候補)にも
+>   `object-table` と同じ「GraphQLでパリティ達成 → `admin.rs` から
+>   該当ルート削除」を適用してゆく。
+> - **今すぐ着手できる次の一手**: `multi-raft`(split/merge/
+>   scatter-query)・`sharded-store`・`closed-timestamp`・
+>   `wal-service`・`ephemeral-query` のうち1つを選び、**`object-table`
+>   と同じ手順**——(a) GraphQL query/mutation を新設しREST版と
+>   同じバリデーション・戻り値にする、(b) `AdminCtx` へ既存の
+>   `Arc<..>` を注入(`*_handle()` アクセサを足す)、(c) `admin.rs`
+>   から該当RESTルート・ハンドラ・リクエスト構造体を削除、(d)
+>   `cargo test -p aruaru-graphql -p aruaru-server`。
 >   ——**着手前に必ず「これはaruaru-db+RPoem SETとしての価値
 >   (SCIM/SSO相当・APIキー自動管理・VersionlessAPI互換)を強化
 >   するか」を自問すること**(闇雲な代替を避けるため)。
@@ -82,7 +95,8 @@
 >   `crawlRegistry`/`testRegistryConnection`はGraphQL側で既に実データ
 >   接続済み。
 > - 詳細な実装内容・検証ログは本ファイル内「HANDOFF追記(2026-08-29
->   〜続き2)」の3エントリを参照。
+>   〜続き3)」の4エントリを参照(続き3=`object-table`の初のREST
+>   ルート完全撤廃)。
 
 > **📌 2026-08-26追記: Windows用インストーラー`aruaru-db-installer.exe`を
 > 新設(命名規則統一)**: ユーザー指示「パワーシェルでインストールする
@@ -4427,3 +4441,55 @@ RPoemとSET(対)で使うことで初めてREST API不要・WunderGraph Cosmo
   「これはaruaru-db+RPoem SETとしての価値を強化するか」を自問した
   上で着手すること、(2) `parallel_config`のスキーマ再設計の是非を
   ユーザーへ確認、(3) RPoem/open-raid-zのCosmo記述精度向上の横展開。
+
+## HANDOFF追記(2026-08-29続き3) REST→GraphQL段階移行の第四歩
+(`object-table`=**初の「RESTルート完全撤廃」**)
+
+**背景(ユーザー指摘)**: 第1〜3歩(`clusterStatus`/`backupSchedule`/
+`keyStatus`)は「GraphQLを実データ化しただけで、対応するRESTルートは
+消していない」——つまりRESTは1本も不要になっていなかった。ユーザーの
+「REST APIを完全に不要にするのですよ、大丈夫ですか?」を受け、
+`object-table`を「GraphQLでパリティ達成 → `admin.rs`から該当ルートを
+削除」まで通す初の雛形とした。時間旅行(スナップショット連鎖)は
+VersionlessAPIの核なので、SET価値の直接強化と判断(闇雲な代替ではない)。
+
+**実装**:
+- `crates/aruaru-graphql/src/admin_resolvers.rs`: `objectTable` query
+  (status)、`objectTableCommit`/`objectTablePrune` mutation を新設。
+  REST版(`object_table_status`/`_commit`/`_prune`)と同じ戻り値・
+  同じバリデーション文言(`op is required ...` 等)を踏襲。bloom filter
+  引数はGraphQLで`BTreeMap`が表せないため`[{column, keys}]`の
+  `ObjectBlockBloomInput`リストへ変換。
+- `crates/aruaru-graphql/src/admin_types.rs`: `ObjectTableStatusGql`/
+  `ObjectTableSnapshotGql`/`ObjectTableCommitResultGql`/
+  `ObjectTablePruneResultGql`。
+- `crates/aruaru-server/src/admin.rs`: **`.at("/object-table" ...)`・
+  `/commit`・`/prune`の3ルート、`object_table_status`/`_commit`/
+  `_prune`の3ハンドラ、`ObjectBlockStat`/`ObjectBlockRequest`/
+  `ObjectTableCommitRequest`/`ObjectTablePruneRequest`の4構造体を削除**。
+  `object_table`フィールドと新設`object_table_handle()`だけ残す
+  (GraphQL `AdminCtx.object_table`へ注入する唯一の経路)。
+- `crates/aruaru-server/src/main.rs`: `admin_state.object_table_handle()`
+  をGraphQLへ配線。
+
+**検証(実測)**: `cargo test -p aruaru-graphql -p aruaru-server`
+失敗0件(`aruaru-graphql` 10テスト、新規
+`object_table_commit_prune_and_status_are_graphql_only`——コミット前は
+履歴空 → `objectTableCommit`×2 → `objectTable`で履歴2件・current.prev
+連鎖を確認 → `objectTablePrune(op:"lt", value:50)`でrange述語の
+segment読み飛ばし(keptBlocks=1, skippedSegments=1)を確認 →
+`op`欠落時のエラー文言も確認)。既存警告のみ(`build_cluster`/
+`propose_commit`/`ephemeral_pod.rs`の`super::*`、いずれも無関係)。
+
+**RPoem側**: grep確認済み——RPoemはaruaru-dbの`/admin/object-table`を
+参照していない(RPoem自身の`/admin/*`はappserver-tenants等の別物)。
+よってこの撤廃でRPoemは無変更。連携強化の実体は「時間旅行が
+RESTホップ無しでfederation GraphQLサーフェスに載る」こと。
+
+- 次にすべきこと: `multi-raft`/`sharded-store`/`closed-timestamp`/
+  `wal-service`/`ephemeral-query`に、`object-table`と同じ4手順
+  (GraphQL query/mutation新設 → `AdminCtx`へ`Arc`注入 → `admin.rs`から
+  RESTルート削除 → test)を適用。加えて第1〜3歩(`clusterStatus`/
+  `backupSchedule`/`keyStatus`)も、パリティは済んでいるので
+  `admin.rs`からのルート削除だけ実施すればREST撤廃が完了する。
+  `parallel_config`はスキーマ非互換のため引き続き保留(ユーザー確認前)。

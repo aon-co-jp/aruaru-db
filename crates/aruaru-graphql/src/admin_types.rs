@@ -175,6 +175,52 @@ pub struct KeyRevokeResultGql {
     pub revoked_count: i32,
 }
 
+// ── オブジェクトテーブル(Databend方式・時間旅行、2026-08-29(続き3)新設) ──
+//
+// REST `GET /admin/object-table` と同一の実データ(`aruaru-backup::
+// table_format::ObjectTable` のスナップショット連鎖)をGraphQLへ写す。
+// スナップショット連鎖=時間旅行=VersionlessAPI互換の実体なので、
+// aruaru-db + RPoem SET としての価値を直接強化する移行対象として選定。
+
+#[derive(SimpleObject, Clone)]
+pub struct ObjectTableSnapshotGql {
+    pub snapshot_id: String,
+    /// 直前スナップショットID(時間旅行の連鎖、根は None)。
+    pub prev_snapshot_id: Option<String>,
+    pub timestamp: i64,
+    pub segments: Vec<String>,
+    pub row_count: i64,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct ObjectTableStatusGql {
+    pub table_key: String,
+    /// 現在のスナップショット(未コミット時は None)。
+    pub current: Option<ObjectTableSnapshotGql>,
+    pub history_len: i32,
+    pub history: Vec<ObjectTableSnapshotGql>,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct ObjectTableCommitResultGql {
+    pub snapshot_id: String,
+    pub block_count: i32,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct ObjectTablePruneResultGql {
+    pub snapshot_id: String,
+    /// `"equality"`(bloom filter)/ `"range"`(min/max 統計)。
+    pub predicate: String,
+    pub column: String,
+    pub kept_blocks: i32,
+    /// range述語のみ。equalityでは 0。
+    pub skipped_segments: i32,
+    /// range述語のみ。equalityでは 0。
+    pub skipped_blocks: i32,
+    pub locations: Vec<String>,
+}
+
 // ── フェデレーション ───────────────────────────────────────────
 
 #[derive(SimpleObject, Clone)]

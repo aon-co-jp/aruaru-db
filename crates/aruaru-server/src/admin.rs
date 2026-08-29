@@ -95,10 +95,14 @@ pub struct AdminState {
     /// 【2026-08-24新設・橋渡し】Neon方式のsafekeeper/pageserver分離
     /// (`aruaru-dist::wal_service`)。`/admin/wal-service/*`として公開。
     wal_storage: Arc<aruaru_dist::DisaggregatedStorage>,
-    /// 【2026-08-24新設・橋渡し】Databend方式のオブジェクトストレージ
-    /// 直結テーブルフォーマット(`aruaru-backup::table_format`)。
-    /// `/admin/object-table/*`として公開。ObjectStoreの実体は依然として
-    /// インメモリ(`InMemoryObjectStore`)であり、S3へは未接続。
+    /// 【2026-08-24新設・橋渡し / 2026-08-29(続き3)RESTルート撤廃】Databend
+    /// 方式のオブジェクトストレージ直結テーブルフォーマット
+    /// (`aruaru-backup::table_format`)。かつては`/admin/object-table/*`と
+    /// してRESTでも公開していたが、`objectTable` query /
+    /// `objectTableCommit`・`objectTablePrune` mutationへ完全移行し、REST
+    /// ルートは削除した。この`Arc`は`object_table_handle()`経由でGraphQL
+    /// (`AdminCtx.object_table`)へ注入するためだけに残す。ObjectStoreの
+    /// 実体は依然としてインメモリ(`InMemoryObjectStore`)であり、S3へは未接続。
     object_table: Arc<aruaru_backup::table_format::ObjectTable>,
     /// 【2026-08-29新設】APIキー自動ライフサイクル管理(`aruaru_dist::keyring::
     /// KeyGuardian`)。既存の`ARUARU_DB_ADMIN_TOKEN`静的トークンを置き
@@ -196,6 +200,16 @@ impl AdminState {
     /// フェデレーションソース一覧を共有するためのアクセサ。
     pub fn federation_handle(&self) -> SharedFederatedSources {
         self.federation.clone()
+    }
+
+    /// 【2026-08-29(続き3)新設】GraphQL側(`AdminCtx.object_table`)へ
+    /// Databend方式オブジェクトテーブル(`aruaru-backup::table_format::
+    /// ObjectTable`)を注入するためのアクセサ。スナップショット連鎖
+    /// (時間旅行=VersionlessAPIの実体)への唯一のアクセス経路は
+    /// GraphQL(`objectTable` query / `objectTableCommit`・
+    /// `objectTablePrune` mutation)——RESTルートは撤廃済み。
+    pub fn object_table_handle(&self) -> Arc<aruaru_backup::table_format::ObjectTable> {
+        self.object_table.clone()
     }
 }
 
@@ -448,9 +462,11 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         .at("/wal-service/append", post(wal_service_append))
         .at("/wal-service/page", post(wal_service_page))
         .at("/wal-service/image-layer", post(wal_service_image_layer))
-        .at("/object-table", get(object_table_status))
-        .at("/object-table/commit", post(object_table_commit))
-        .at("/object-table/prune", post(object_table_prune))
+        // 【2026-08-29(続き3)REST完全撤廃】object-table の3操作(status/
+        // commit/prune)はGraphQL `objectTable` query / `objectTableCommit`
+        // ・`objectTablePrune` mutationへ完全移行済み(REST→GraphQL段階
+        // 移行の既定方針に基づき、以後 object-table にRESTルートは持たない
+        // ——これを他エンドポイント撤廃の雛形とする)。
         .at("/registry", get(registry_list))
         .at("/registry/summary", get(registry_summary))
         .at("/registry/crawl", post(registry_crawl))
@@ -1748,136 +1764,5 @@ fn wal_service_image_layer(state: Data<&Arc<AdminState>>, Json(req): Json<WalPag
             "dropped_deltas": dropped,
         })),
         Err(e) => Json(json!({ "success": false, "page_key": req.page_key, "lsn": lsn, "message": e.to_string() })),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ObjectBlockStat {
-    column: String,
-    min: f64,
-    max: f64,
-    #[serde(default)]
-    null_count: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ObjectBlockRequest {
-    location: String,
-    row_count: u64,
-    size_bytes: u64,
-    #[serde(default)]
-    stats: Vec<ObjectBlockStat>,
-    /// 等値枝刈り用 bloom filter に入れるキー。
-    #[serde(default)]
-    bloom: std::collections::BTreeMap<String, Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ObjectTableCommitRequest {
-    blocks: Vec<ObjectBlockRequest>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ObjectTablePruneRequest {
-    #[serde(default)]
-    snapshot_id: Option<String>,
-    column: String,
-    /// 範囲述語: `"eq"` / `"lt"` / `"le"` / `"gt"` / `"ge"`
-    #[serde(default)]
-    op: Option<String>,
-    #[serde(default)]
-    value: Option<f64>,
-    /// 等値述語(bloom filter による枝刈り)。`value`より優先する。
-    #[serde(default)]
-    key: Option<String>,
-}
-
-/// `GET /admin/object-table` — 現在のスナップショットと履歴(時間旅行の
-/// 連鎖)を返す。
-#[handler]
-fn object_table_status(state: Data<&Arc<AdminState>>) -> Json<Value> {
-    let t = &state.object_table;
-    match (t.current_snapshot(), t.snapshot_history()) {
-        (Ok(cur), Ok(history)) => Json(json!({
-            "success": true,
-            "table_key": t.table_key(),
-            "current": cur,
-            "history_len": history.len(),
-            "history": history,
-        })),
-        (Err(e), _) | (_, Err(e)) => Json(json!({ "success": false, "message": e.to_string() })),
-    }
-}
-
-/// `POST /admin/object-table/commit` — blockメタデータ群を1 segmentとして
-/// 書き、MetaSrv の CAS が成功したらコミット成立(Databend方式)。
-#[handler]
-fn object_table_commit(state: Data<&Arc<AdminState>>, Json(req): Json<ObjectTableCommitRequest>) -> Json<Value> {
-    let mut blocks = Vec::with_capacity(req.blocks.len());
-    for b in &req.blocks {
-        let mut meta = aruaru_backup::table_format::BlockMeta::new(b.location.clone(), b.row_count, b.size_bytes);
-        for s in &b.stats {
-            meta = meta.with_stats(&s.column, s.min, s.max, s.null_count);
-        }
-        for (col, keys) in &b.bloom {
-            meta = meta.with_bloom(col, keys.iter().map(|s| s.as_str()));
-        }
-        blocks.push(meta);
-    }
-    let count = blocks.len();
-    match state.object_table.commit_blocks(blocks) {
-        Ok(id) => Json(json!({ "success": true, "snapshot_id": id, "block_count": count })),
-        Err(e) => Json(json!({ "success": false, "message": e.to_string() })),
-    }
-}
-
-/// `POST /admin/object-table/prune` — 3層メタデータでの枝刈りを実行し、
-/// 「読む必要のあるblockだけ」と読み飛ばした数を返す。
-#[handler]
-fn object_table_prune(state: Data<&Arc<AdminState>>, Json(req): Json<ObjectTablePruneRequest>) -> Json<Value> {
-    use aruaru_backup::table_format::RangeOp;
-    let t = &state.object_table;
-    let snapshot_id = match req.snapshot_id.clone() {
-        Some(id) => id,
-        None => match t.current_snapshot() {
-            Ok(Some(s)) => s.snapshot_id,
-            Ok(None) => return Json(json!({ "success": false, "message": "table has no snapshot yet" })),
-            Err(e) => return Json(json!({ "success": false, "message": e.to_string() })),
-        },
-    };
-    if let Some(key) = &req.key {
-        return match t.prune_equality(&snapshot_id, &req.column, key) {
-            Ok(kept) => Json(json!({
-                "success": true, "snapshot_id": snapshot_id, "predicate": "equality",
-                "column": req.column, "key": key,
-                "kept_blocks": kept.len(),
-                "locations": kept.iter().map(|b| b.location.clone()).collect::<Vec<_>>(),
-            })),
-            Err(e) => Json(json!({ "success": false, "message": e.to_string() })),
-        };
-    }
-    let op = match req.op.as_deref() {
-        None => return Json(json!({ "success": false, "message": "op is required for range predicates (use `key` instead for equality)" })),
-        Some("eq") => return Json(json!({ "success": false, "message": "equality predicates must use `key` (bloom filter), not `op: eq`" })),
-        Some("lt") => RangeOp::Lt,
-        Some("le") => RangeOp::Le,
-        Some("gt") => RangeOp::Gt,
-        Some("ge") => RangeOp::Ge,
-        Some(other) => return Json(json!({ "success": false, "message": format!("unknown op: {other}") })),
-    };
-    let value = match req.value {
-        Some(v) => v,
-        None => return Json(json!({ "success": false, "message": "value (or key) is required" })),
-    };
-    match t.prune_range(&snapshot_id, &req.column, op, value) {
-        Ok((kept, skipped_segments, skipped_blocks)) => Json(json!({
-            "success": true, "snapshot_id": snapshot_id, "predicate": "range",
-            "column": req.column, "op": req.op, "value": value,
-            "kept_blocks": kept.len(),
-            "skipped_segments": skipped_segments,
-            "skipped_blocks": skipped_blocks,
-            "locations": kept.iter().map(|b| b.location.clone()).collect::<Vec<_>>(),
-        })),
-        Err(e) => Json(json!({ "success": false, "message": e.to_string() })),
     }
 }

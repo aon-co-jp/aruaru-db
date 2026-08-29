@@ -51,6 +51,14 @@ pub struct AdminCtx {
     /// 参照・特定オーナーのキー破棄ができる(従来GraphQL側にこの操作自体が
     /// 存在しなかった)。
     pub keyring: Option<Arc<aruaru_dist::keyring::KeyGuardian>>,
+    /// 【2026-08-29(続き3) REST完全撤廃】`AdminState.object_table`を
+    /// `object_table_handle()`経由で注入したDatabend方式オブジェクト
+    /// テーブル。スナップショット連鎖(時間旅行=VersionlessAPIの実体)
+    /// への唯一のアクセス経路がこの`objectTable` query /
+    /// `objectTableCommit`・`objectTablePrune` mutation——旧 REST
+    /// `/admin/object-table*` 3ルートは`admin.rs`から削除済み。`None`の
+    /// 場合(将来サーバー構成が変わった場合の保険)は空の状態を返す。
+    pub object_table: Option<Arc<aruaru_backup::table_format::ObjectTable>>,
 }
 
 /// `x-admin-token`ヘッダーを検証する(2026-08-01追加、実バグ修正)。
@@ -91,6 +99,19 @@ fn admin<'a>(ctx: &Context<'a>) -> Result<&'a AdminCtx> {
         .map_err(|_| async_graphql::Error::new("AdminCtx not in context"))
 }
 
+/// `aruaru_backup::table_format::TableSnapshot` → GraphQL出力型への変換
+/// (`object_table` resolver用、REST `object_table_status`の`json!`と
+/// 同じフィールドを写す)。
+fn snapshot_to_gql(s: aruaru_backup::table_format::TableSnapshot) -> ObjectTableSnapshotGql {
+    ObjectTableSnapshotGql {
+        snapshot_id: s.snapshot_id,
+        prev_snapshot_id: s.prev_snapshot_id,
+        timestamp: s.timestamp,
+        segments: s.segments,
+        row_count: s.row_count as i64,
+    }
+}
+
 // ── 入力型 ───────────────────────────────────────────────────
 
 #[derive(InputObject)]
@@ -110,6 +131,36 @@ pub struct ScheduleInput {
     pub enabled: bool,
     pub cron: String,
     pub kind: String,
+}
+
+// ── オブジェクトテーブル(Databend方式、2026-08-29(続き3) REST完全撤廃) ──
+
+#[derive(InputObject)]
+pub struct ObjectBlockStatInput {
+    pub column: String,
+    pub min: f64,
+    pub max: f64,
+    #[graphql(default)]
+    pub null_count: i64,
+}
+
+/// bloom filter へ入れる等値枝刈り用キー(REST版の
+/// `BTreeMap<String, Vec<String>>`をGraphQLで表現できる形へ変換)。
+#[derive(InputObject)]
+pub struct ObjectBlockBloomInput {
+    pub column: String,
+    pub keys: Vec<String>,
+}
+
+#[derive(InputObject)]
+pub struct ObjectBlockInput {
+    pub location: String,
+    pub row_count: i64,
+    pub size_bytes: i64,
+    #[graphql(default)]
+    pub stats: Vec<ObjectBlockStatInput>,
+    #[graphql(default)]
+    pub bloom: Vec<ObjectBlockBloomInput>,
 }
 
 #[derive(InputObject)]
@@ -347,6 +398,40 @@ impl AdminQuery {
         Ok(KeyStatusGql { issued_key_count: count as i32 })
     }
 
+    // ── オブジェクトテーブル: 時間旅行(VersionlessAPIの実体) ──────
+
+    /// 【2026-08-29(続き3) REST完全撤廃】現在のスナップショットと履歴
+    /// (時間旅行の連鎖)を返す。旧 REST `GET /admin/object-table`の
+    /// 置き換えで、そのルートは削除済み——スナップショット連鎖を
+    /// 参照する経路はこの query のみ。
+    async fn object_table(&self, ctx: &Context<'_>) -> Result<ObjectTableStatusGql> {
+        let a = admin(ctx)?;
+        let Some(t) = a.object_table.as_ref() else {
+            return Ok(ObjectTableStatusGql {
+                table_key: String::new(),
+                current: None,
+                history_len: 0,
+                history: Vec::new(),
+            });
+        };
+        let current = t
+            .current_snapshot()
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map(snapshot_to_gql);
+        let history: Vec<_> = t
+            .snapshot_history()
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .into_iter()
+            .map(snapshot_to_gql)
+            .collect();
+        Ok(ObjectTableStatusGql {
+            table_key: t.table_key(),
+            current,
+            history_len: history.len() as i32,
+            history,
+        })
+    }
+
     // ── マイグレーション: スキーマプレビュー ────────────────
 
     async fn preview_source(
@@ -381,6 +466,122 @@ pub struct AdminMutation;
 
 #[Object]
 impl AdminMutation {
+    // ── オブジェクトテーブル: 時間旅行(VersionlessAPIの実体) ──────
+    //
+    // 【2026-08-29(続き3) REST完全撤廃】旧 REST `POST /admin/object-table/
+    // commit`・`POST /admin/object-table/prune` の等価。両ルートは
+    // `admin.rs`から削除済みで、これがコミット/枝刈りの唯一の経路。
+
+    /// blockメタデータ群を1 segmentとして書き、MetaSrv の CAS が成功
+    /// したらコミット成立(Databend方式)。新スナップショットIDを返す。
+    async fn object_table_commit(
+        &self,
+        ctx: &Context<'_>,
+        blocks: Vec<ObjectBlockInput>,
+    ) -> Result<ObjectTableCommitResultGql> {
+        let a = admin(ctx)?;
+        let t = a
+            .object_table
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("object table is not configured"))?;
+        let mut metas = Vec::with_capacity(blocks.len());
+        for b in &blocks {
+            let mut meta = aruaru_backup::table_format::BlockMeta::new(
+                b.location.clone(),
+                b.row_count as u64,
+                b.size_bytes as u64,
+            );
+            for s in &b.stats {
+                meta = meta.with_stats(&s.column, s.min, s.max, s.null_count as u64);
+            }
+            for bl in &b.bloom {
+                meta = meta.with_bloom(&bl.column, bl.keys.iter().map(|s| s.as_str()));
+            }
+            metas.push(meta);
+        }
+        let block_count = metas.len() as i32;
+        let snapshot_id = t
+            .commit_blocks(metas)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(ObjectTableCommitResultGql { snapshot_id, block_count })
+    }
+
+    /// 3層メタデータでの枝刈り。等値なら`key`(bloom filter)、範囲なら
+    /// `op`(`lt`/`le`/`gt`/`ge`)+`value`(min/max 統計)。`snapshotId`
+    /// 省略時は現在のスナップショット。REST版のバリデーション文言を踏襲。
+    async fn object_table_prune(
+        &self,
+        ctx: &Context<'_>,
+        column: String,
+        snapshot_id: Option<String>,
+        op: Option<String>,
+        value: Option<f64>,
+        key: Option<String>,
+    ) -> Result<ObjectTablePruneResultGql> {
+        use aruaru_backup::table_format::RangeOp;
+        let a = admin(ctx)?;
+        let t = a
+            .object_table
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("object table is not configured"))?;
+        let snapshot_id = match snapshot_id {
+            Some(id) => id,
+            None => {
+                t.current_snapshot()
+                    .map_err(|e| async_graphql::Error::new(e.to_string()))?
+                    .ok_or_else(|| async_graphql::Error::new("table has no snapshot yet"))?
+                    .snapshot_id
+            }
+        };
+        if let Some(key) = key {
+            let kept = t
+                .prune_equality(&snapshot_id, &column, &key)
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            return Ok(ObjectTablePruneResultGql {
+                snapshot_id,
+                predicate: "equality".into(),
+                column,
+                kept_blocks: kept.len() as i32,
+                skipped_segments: 0,
+                skipped_blocks: 0,
+                locations: kept.iter().map(|b| b.location.clone()).collect(),
+            });
+        }
+        let range_op = match op.as_deref() {
+            None => {
+                return Err(async_graphql::Error::new(
+                    "op is required for range predicates (use `key` instead for equality)",
+                ))
+            }
+            Some("eq") => {
+                return Err(async_graphql::Error::new(
+                    "equality predicates must use `key` (bloom filter), not `op: eq`",
+                ))
+            }
+            Some("lt") => RangeOp::Lt,
+            Some("le") => RangeOp::Le,
+            Some("gt") => RangeOp::Gt,
+            Some("ge") => RangeOp::Ge,
+            Some(other) => {
+                return Err(async_graphql::Error::new(format!("unknown op: {other}")))
+            }
+        };
+        let value = value
+            .ok_or_else(|| async_graphql::Error::new("value (or key) is required"))?;
+        let (kept, skipped_segments, skipped_blocks) = t
+            .prune_range(&snapshot_id, &column, range_op, value)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(ObjectTablePruneResultGql {
+            snapshot_id,
+            predicate: "range".into(),
+            column,
+            kept_blocks: kept.len() as i32,
+            skipped_segments: skipped_segments as i32,
+            skipped_blocks: skipped_blocks as i32,
+            locations: kept.iter().map(|b| b.location.clone()).collect(),
+        })
+    }
+
     // ── レジストリ ──────────────────────────────────────────
 
     async fn crawl_registry(&self, ctx: &Context<'_>) -> Result<CrawlResultGql> {
@@ -866,6 +1067,13 @@ mod cluster_propose_tests {
             schedule: Some(Arc::new(parking_lot::Mutex::new(None))),
             federation: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
             keyring: Some(Arc::new(aruaru_dist::keyring::KeyGuardian::new())),
+            object_table: Some(Arc::new(aruaru_backup::table_format::ObjectTable::new(
+                Arc::new(aruaru_backup::table_format::InMemoryObjectStore::new()),
+                Arc::new(aruaru_backup::table_format::MetaService::new()),
+                "test",
+                1,
+                1,
+            ))),
         }
     }
 
@@ -1109,5 +1317,97 @@ mod cluster_propose_tests {
         // 件数は2のまま。
         let resp = schema.execute(authorized_request("query { keyStatus { issuedKeyCount } }")).await;
         assert_eq!(resp.data.into_json().unwrap()["keyStatus"]["issuedKeyCount"], 2);
+    }
+
+    // ── 2026-08-29(続き3)追加: object-table の status/commit/prune を
+    // GraphQL だけで完結できる(REST `/admin/object-table*` 撤廃後) ──
+    #[tokio::test]
+    async fn object_table_commit_prune_and_status_are_graphql_only() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), None));
+
+        // コミット前: 履歴は空。
+        let resp = schema
+            .execute(authorized_request(
+                "query { objectTable { tableKey historyLen current { snapshotId } } }",
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        let data = resp.data.into_json().unwrap();
+        assert_eq!(data["objectTable"]["historyLen"], 0);
+        assert!(data["objectTable"]["current"].is_null());
+
+        // objectTableCommit mutation を2回(旧 REST commit の置き換え)。
+        let commit = |q: &'static str| {
+            schema.execute(authorized_request(q))
+        };
+        let resp = commit(
+            r#"mutation { objectTableCommit(blocks: [
+                { location: "blk/1.parquet", rowCount: 10, sizeBytes: 1024,
+                  stats: [{ column: "age", min: 1, max: 40, nullCount: 0 }] }
+            ]) { snapshotId blockCount } }"#,
+        )
+        .await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        let s1 = resp.data.into_json().unwrap()["objectTableCommit"]["snapshotId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resp = commit(
+            r#"mutation { objectTableCommit(blocks: [
+                { location: "blk/2.parquet", rowCount: 5, sizeBytes: 512,
+                  stats: [{ column: "age", min: 60, max: 90, nullCount: 0 }] }
+            ]) { snapshotId blockCount } }"#,
+        )
+        .await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        let s2 = resp.data.into_json().unwrap()["objectTableCommit"]["snapshotId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // status: 履歴が積まれ、current の prev が s1。
+        let resp = schema
+            .execute(authorized_request(
+                "query { objectTable { historyLen current { snapshotId prevSnapshotId } } }",
+            ))
+            .await;
+        let ot = resp.data.into_json().unwrap();
+        let ot = &ot["objectTable"];
+        assert_eq!(ot["historyLen"], 2);
+        assert_eq!(ot["current"]["snapshotId"], s2);
+        assert_eq!(ot["current"]["prevSnapshotId"], s1.as_str());
+
+        // prune(range述語 age < 50): 60..90 の segment は読み飛ばされる。
+        let resp = schema
+            .execute(authorized_request(
+                r#"mutation { objectTablePrune(column: "age", op: "lt", value: 50) {
+                    predicate keptBlocks skippedSegments locations
+                } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        let p = resp.data.into_json().unwrap();
+        let p = &p["objectTablePrune"];
+        assert_eq!(p["predicate"], "range");
+        assert_eq!(p["keptBlocks"], 1);
+        assert_eq!(p["skippedSegments"], 1);
+        assert_eq!(p["locations"][0], "blk/1.parquet");
+
+        // prune のバリデーション文言(REST版踏襲)も維持。
+        let resp = schema
+            .execute(authorized_request(
+                r#"mutation { objectTablePrune(column: "age") { predicate } }"#,
+            ))
+            .await;
+        assert!(
+            resp.errors.iter().any(|e| e.message.contains("op is required")),
+            "errors: {:?}",
+            resp.errors
+        );
     }
 }
