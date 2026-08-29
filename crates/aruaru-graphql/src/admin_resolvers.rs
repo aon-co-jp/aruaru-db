@@ -37,6 +37,14 @@ pub struct AdminCtx {
     /// 対応)。`None`の場合(将来サーバー構成が変わった場合の保険)は
     /// 従来通り単一ノード相当のフォールバック値を返す。
     pub topology: Option<Arc<parking_lot::Mutex<aruaru_dist::ClusterTopology>>>,
+    /// 【2026-08-29新設】REST(`AdminState.schedule`)と同一インスタンスを
+    /// 共有するバックアップスケジュール状態。`backup_schedule`/
+    /// `set_backup_schedule`が固定値スタブを返していたギャップの解消。
+    pub schedule: Option<aruaru_dist::admin_shared::SharedBackupSchedule>,
+    /// 【2026-08-29新設】REST(`AdminState.federation`)と同一インスタンスを
+    /// 共有するフェデレーションソース一覧。`federated_sources`が常に
+    /// 空配列を返していたギャップの解消。
+    pub federation: Option<aruaru_dist::admin_shared::SharedFederatedSources>,
 }
 
 /// `x-admin-token`ヘッダーを検証する(2026-08-01追加、実バグ修正)。
@@ -180,9 +188,21 @@ impl AdminQuery {
         Ok(manifests.into_iter().map(manifest_to_gql).collect())
     }
 
+    /// 【2026-08-29改修】固定`None`スタブを廃止し、REST `/admin/backup/
+    /// schedule`(GET/POST)と同一の`SharedBackupSchedule`から実データを
+    /// 返す。`schedule`未配線時(将来の互換性保険)のみ`None`のまま
+    /// (未設定と区別が付かなくなる点は正直に受け入れる)。
     async fn backup_schedule(&self, ctx: &Context<'_>) -> Result<Option<ScheduleGql>> {
-        require_admin_token(ctx)?;
-        Ok(None)
+        let a = admin(ctx)?;
+        let Some(shared) = &a.schedule else { return Ok(None) };
+        Ok(shared.lock().clone().map(|s| ScheduleGql {
+            enabled: s.enabled,
+            cron: s.cron,
+            kind: s.kind,
+            // 実際のcron式からの次回実行時刻計算は未実装(REST側も
+            // 同様に持たない、誇張しない)。
+            next_run: None,
+        }))
     }
 
     // ── クラスタ ────────────────────────────────────────────
@@ -256,6 +276,20 @@ impl AdminQuery {
 
     // ── 並列実行 ────────────────────────────────────────────
 
+    /// 【2026-08-29時点、正直な既知の制約】REST側の実`ParallelConfig`
+    /// (`max_parallelism`/`worker_threads_per_node`/`enable_parallel_scan`
+    /// /`enable_parallel_aggregate`/`enable_shuffle_join`/
+    /// `shuffle_partitions`/`broadcast_threshold_mb`)と、この
+    /// `ParallelConfigGql`スキーマ(`enabled`/`max_workers`/`chunk_size`/
+    /// `strategy`)は**フィールド形状そのものが異なる**——`cluster_status`
+    /// や`backup_schedule`のような1:1の接続ができない。GraphQL
+    /// スキーマを変更する(破壊的変更)か、意味の薄い変換
+    /// (例: `max_workers = max_parallelism`、`chunk_size`に
+    /// `broadcast_threshold_mb`を無理に流用する等)で誤魔化すかの
+    /// 二択になるため、後者は行わず**固定値スタブのまま**にする
+    /// ことを選んだ(実データに見せかけて実は無関係な値、という状態は
+    /// 誤解を招くため)。次にこの箇所へ着手する場合は、GraphQL
+    /// スキーマ自体をREST実体に合わせて再設計すること。
     async fn parallel_config(&self, ctx: &Context<'_>) -> Result<ParallelConfigGql> {
         require_admin_token(ctx)?;
         Ok(ParallelConfigGql {
@@ -266,6 +300,10 @@ impl AdminQuery {
         })
     }
 
+    /// REST `/admin/parallel/jobs`も実際には長時間ジョブの常駐管理を
+    /// 持たず`{"jobs": []}`を返すだけ(`admin.rs::list_jobs`のコメント
+    /// 参照)——GraphQL側が空配列を返すのは、REST側と実際に一致した
+    /// 状態であり、スタブとの乖離ではない。
     async fn parallel_jobs(&self, ctx: &Context<'_>) -> Result<Vec<ParallelJobGql>> {
         require_admin_token(ctx)?;
         Ok(vec![])
@@ -273,9 +311,23 @@ impl AdminQuery {
 
     // ── フェデレーション ────────────────────────────────────
 
+    /// 【2026-08-29改修】固定空配列スタブを廃止し、REST `/admin/
+    /// federation`(GET/POST)と同一の`SharedFederatedSources`から実際に
+    /// 登録済みのソース一覧を返す。
     async fn federated_sources(&self, ctx: &Context<'_>) -> Result<Vec<FederatedSourceGql>> {
-        require_admin_token(ctx)?;
-        Ok(vec![])
+        let a = admin(ctx)?;
+        let Some(shared) = &a.federation else { return Ok(vec![]) };
+        Ok(shared
+            .lock()
+            .iter()
+            .map(|s| FederatedSourceGql {
+                name: s.name.clone(),
+                kind: s.kind.clone(),
+                uri: s.uri.clone(),
+                status: s.status.clone().unwrap_or_else(|| "unknown".into()),
+                tables: s.table_count.unwrap_or(0) as i32,
+            })
+            .collect())
     }
 
     // ── マイグレーション: スキーマプレビュー ────────────────
@@ -408,16 +460,29 @@ impl AdminMutation {
         }
     }
 
+    /// 【2026-08-29改修】入力をそのまま返すだけのスタブを廃止し、REST
+    /// `/admin/backup/schedule`(POST)と同一の`SharedBackupSchedule`へ
+    /// 実際に書き込む。以後`backup_schedule`クエリ・REST `GET
+    /// /admin/backup/schedule`の双方から同じ値が読める。
     async fn set_backup_schedule(
         &self,
         ctx: &Context<'_>,
         input: ScheduleInput,
     ) -> Result<ScheduleGql> {
-        require_admin_token(ctx)?;
-        Ok(ScheduleGql {
+        let a = admin(ctx)?;
+        let state = aruaru_dist::admin_shared::BackupScheduleState {
             enabled: input.enabled,
             cron: input.cron,
             kind: input.kind,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Some(shared) = &a.schedule {
+            *shared.lock() = Some(state.clone());
+        }
+        Ok(ScheduleGql {
+            enabled: state.enabled,
+            cron: state.cron,
+            kind: state.kind,
             next_run: None,
         })
     }
@@ -521,27 +586,57 @@ impl AdminMutation {
 
     // ── フェデレーション ────────────────────────────────────
 
+    /// 【2026-08-29改修】入力をそのまま返すだけのスタブを廃止し、REST
+    /// `/admin/federation`(POST)と同一の`SharedFederatedSources`へ実際に
+    /// 追加する。REST側と同じ「既に同名が存在すれば失敗」ルールを踏襲。
+    /// **正直な開示**: `status: "connected"`は実際に接続確認したわけ
+    /// ではない(REST側`register_federation`も同様に`"unknown"`を
+    /// セットするのみ、実接続確認は別の`test_registry_connection`/
+    /// `test_source_connection`ミューテーションの責務)——ここでは
+    /// REST側の`"unknown"`表記へ揃えた(誇張しない)。
     async fn register_federated_source(
         &self,
         ctx: &Context<'_>,
         input: FederatedSourceInput,
     ) -> Result<FederatedSourceGql> {
-        require_admin_token(ctx)?;
-        Ok(FederatedSourceGql {
+        let a = admin(ctx)?;
+        let entry = aruaru_dist::admin_shared::FederatedSourceEntry {
             name: input.name,
             kind: input.kind,
             uri: input.uri,
-            status: "connected".into(),
-            tables: 0,
+            read_only: true,
+            pushdown: false,
+            status: Some("unknown".into()),
+            table_count: None,
+        };
+        if let Some(shared) = &a.federation {
+            let mut list = shared.lock();
+            if list.iter().any(|s| s.name == entry.name) {
+                return Err(async_graphql::Error::new(format!("既に存在します: {}", entry.name)));
+            }
+            list.push(entry.clone());
+        }
+        Ok(FederatedSourceGql {
+            name: entry.name,
+            kind: entry.kind,
+            uri: entry.uri,
+            status: entry.status.unwrap_or_else(|| "unknown".into()),
+            tables: entry.table_count.unwrap_or(0) as i32,
         })
     }
 
+    /// 【2026-08-29改修】REST `/admin/federation/drop`と同一の
+    /// `SharedFederatedSources`から実際に削除する(従来は何もせず成功
+    /// メッセージだけを返すスタブだった)。
     async fn drop_federated_source(
         &self,
         ctx: &Context<'_>,
         name: String,
     ) -> Result<MutationResult> {
-        require_admin_token(ctx)?;
+        let a = admin(ctx)?;
+        if let Some(shared) = &a.federation {
+            shared.lock().retain(|s| s.name != name);
+        }
         Ok(MutationResult { success: true, commit_id: None, message: format!("'{name}' を削除しました。") })
     }
 
@@ -741,6 +836,8 @@ mod cluster_propose_tests {
             topology: Some(Arc::new(parking_lot::Mutex::new(
                 aruaru_dist::ClusterTopology::single_node(1, "127.0.0.1:5432"),
             ))),
+            schedule: Some(Arc::new(parking_lot::Mutex::new(None))),
+            federation: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
         }
     }
 
@@ -859,5 +956,90 @@ mod cluster_propose_tests {
         let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), None));
         let resp = schema.execute("query { log(limit: 1) { id } }").await;
         assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+    }
+
+    // ── 2026-08-29追加: backup_schedule / federated_sources のREST実
+    // 状態接続の検証(従来の固定値スタブからの脱却、`cluster_status`の
+    // 検証と同じ精神——`AdminCtx`が共有する`Arc<Mutex<..>>`を直接読んで、
+    // resolverが返す値と一致することを確認する)。
+
+    #[tokio::test]
+    async fn set_backup_schedule_persists_and_backup_schedule_reads_it_back() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let ctx = admin_ctx(engine.clone(), None);
+        let shared_schedule = ctx.schedule.clone().unwrap();
+        let schema = build_schema(engine.clone(), ctx);
+
+        // 書き込み前は未設定(None)。
+        let resp = schema.execute(authorized_request("query { backupSchedule { cron enabled } }")).await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        assert!(resp.data.into_json().unwrap()["backupSchedule"].is_null());
+
+        let resp = schema
+            .execute(authorized_request(
+                r#"mutation { setBackupSchedule(input: {enabled: true, cron: "0 3 * * *", kind: "full"}) { cron enabled kind } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        let data = resp.data.into_json().unwrap();
+        assert_eq!(data["setBackupSchedule"]["cron"], "0 3 * * *");
+        assert_eq!(data["setBackupSchedule"]["enabled"], true);
+
+        // REST側と共有する`Arc<Mutex<..>>`自体にも実際に書き込まれている
+        // ことを直接確認(GraphQL経由の書き込みがREST GETからも見える
+        // ことの傍証)。
+        assert_eq!(shared_schedule.lock().as_ref().unwrap().cron, "0 3 * * *");
+
+        // 再クエリで直前の書き込みが読める(スタブなら常にnullのまま)。
+        let resp = schema.execute(authorized_request("query { backupSchedule { cron enabled } }")).await;
+        let data = resp.data.into_json().unwrap();
+        assert_eq!(data["backupSchedule"]["cron"], "0 3 * * *");
+        assert_eq!(data["backupSchedule"]["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn federated_source_register_list_and_drop_round_trip_through_shared_state() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let ctx = admin_ctx(engine.clone(), None);
+        let shared_federation = ctx.federation.clone().unwrap();
+        let schema = build_schema(engine.clone(), ctx);
+
+        // 登録前は空(スタブなら常に空のまま区別が付かないが、以降の
+        // 登録・削除で実際に増減することを確認する)。
+        let resp = schema.execute(authorized_request("query { federatedSources { name } }")).await;
+        assert_eq!(resp.data.into_json().unwrap()["federatedSources"].as_array().unwrap().len(), 0);
+
+        let resp = schema
+            .execute(authorized_request(
+                r#"mutation { registerFederatedSource(input: {name: "wh", kind: "postgres", uri: "postgres://x/y"}) { name status } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        assert_eq!(shared_federation.lock().len(), 1, "REST側と共有する状態に実際に追加されているはず");
+
+        // 同名の二重登録はREST側と同じくエラーになる。
+        let resp = schema
+            .execute(authorized_request(
+                r#"mutation { registerFederatedSource(input: {name: "wh", kind: "postgres", uri: "postgres://x/y"}) { name } }"#,
+            ))
+            .await;
+        assert!(!resp.errors.is_empty(), "duplicate name should be rejected");
+
+        let resp = schema.execute(authorized_request("query { federatedSources { name } }")).await;
+        let data = resp.data.into_json().unwrap();
+        assert_eq!(data["federatedSources"].as_array().unwrap().len(), 1);
+        assert_eq!(data["federatedSources"][0]["name"], "wh");
+
+        let resp = schema
+            .execute(authorized_request(r#"mutation { dropFederatedSource(name: "wh") { success } }"#))
+            .await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        assert_eq!(shared_federation.lock().len(), 0, "削除後は共有状態からも消えているはず");
     }
 }

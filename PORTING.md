@@ -282,6 +282,19 @@ cargo run -p aruaru-backup --bin backup-cli -- restore --path ./backups/<manifes
 (`aruaru-wire` または `aruaru-graphql`)だけを依存に加えれば足りる
 (いずれも `aruaru-core`/`aruaru-query` を共通基盤として利用)。
 
+**REST→GraphQL段階移行の状況(2026-08-29時点)**: `/admin/*`のREST
+エンドポイントのうち、`clusterStatus`・`backupSchedule`・
+`federatedSources`(および対応するmutation)はGraphQL側が
+`crates/aruaru-dist/src/admin_shared.rs`の共有型経由でREST側と
+**同一の状態インスタンス**を参照するよう接続済み——移植先で新しい
+REST/GraphQL両対応の管理データを追加する場合は、この
+`Arc<parking_lot::Mutex<..>>`共有パターンを踏襲すること
+(`AdminState::topology_handle()`/`schedule_handle()`/
+`federation_handle()`が実例)。`parallel_config`・`multi-raft`・
+`sharded-store`・`closed-timestamp`・`wal-service`・`object-table`・
+`ephemeral-query`・`registry`(crawl/test-connection)・`keys`は
+GraphQL側が未接続のまま(詳細・理由は`CLAUDE.md`のHANDOFF参照)。
+
 ## 8. 移植・拡張時の注意
 
 他プロジェクトへ移植・拡張する際、依存クレートの現状(バージョン・

@@ -1,4 +1,5 @@
 //! aruaru-dist: 分散レイヤー (openraft + Range シャーディング)
+pub mod admin_shared;
 pub mod closed_ts;
 pub mod dual_database;
 #[cfg(feature = "disaster_email_backup")]

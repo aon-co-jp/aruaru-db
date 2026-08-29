@@ -335,6 +335,11 @@ async fn main() -> anyhow::Result<()> {
         // GraphQL `clusterStatus`がREST `/admin/cluster`と同じトポロジを
         // 参照するための共有ハンドル(2026-08-29新設)。
         let topology_for_graphql = admin_state.topology_handle();
+        // バックアップスケジュール・フェデレーションソースも同様に共有
+        // (2026-08-29新設、`backup_schedule`/`federated_sources`の
+        // GraphQLスタブをREST実状態へ接続する対応)。
+        let schedule_for_graphql = admin_state.schedule_handle();
+        let federation_for_graphql = admin_state.federation_handle();
 
         // Federation SDL を返すエンドポイント (wgc subgraph publish 用)
         #[handler]
@@ -395,6 +400,8 @@ async fn main() -> anyhow::Result<()> {
                     // (cluster_propose resolverのRaftWriter経由化のため)。
                     replicator: gql_replicator.clone(),
                     topology: Some(topology_for_graphql.clone()),
+                    schedule: Some(schedule_for_graphql.clone()),
+                    federation: Some(federation_for_graphql.clone()),
                 },
             ))
             .at("/graphql/sdl", get(subgraph_sdl))
