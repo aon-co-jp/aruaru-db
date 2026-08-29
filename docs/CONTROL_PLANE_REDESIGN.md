@@ -421,6 +421,20 @@ config/
 - **P3 B2/B3 の残り** ephemeral-query / multi-raft / sharded-store put/get /
   closed-timestamp / wal-service を GraphQL query/mutation 化。対応 `/admin`
   ルート削除。Tauri/Android/web を GraphQL クライアントへ。
+  - **クレート境界の注意（続き8 調査）**: `aruaru-graphql` のリゾルバは
+    `aruaru-server` の `mod` を参照できない。難易度で 2 群に分かれる:
+    - **AdminCtx 注入で素直に行ける**（状態が `aruaru-dist`/`aruaru-query`
+      型で、`object_table`/`keyring`/`topology` と同じパターン）:
+      `closed-timestamp`（`Arc<ClosedTimestampCoordinator>`、既に
+      `closed_ts_coordinator()` あり）、`wal-service`
+      （`Arc<DisaggregatedStorage>`）、`sharded-store`
+      （`ShardedRowStore<String>`）。→ P3 はここから着手。
+    - **リファクタが要る**: `ephemeral-query`（`current_exe()` で自分自身を
+      `--ephemeral-worker` で再起動する `aruaru-server` 固有処理。
+      `AdminCtx` に `Arc<dyn EphemeralRunner>` trait を注入して
+      `aruaru-server` 側で実装、が候補）、`multi-raft`
+      （`MultiRaftCluster<crate::cluster::EngineApplier>` が server-local
+      ジェネリック。trait object 化 or applier をクレート移動）。
 - **P4 `/admin` ルーター＋残る非 GraphQL HTTP を撤去**
   `admin::admin_routes` を撤去、`admin.rs` を GraphQL リゾルバのヘルパーだけに。
   **ノード間 `/raft/*`・side transport（`/closed-timestamp/receive|publish`）を
