@@ -1,30 +1,42 @@
 # aruaru-DB 🦀
 
-> **Updated 2026-08-29**: aruaru-db is designed to be used **as a SET
-> (paired) with RPoem** — only together do they deliver "no REST API
-> needed, compatible with WunderGraph Cosmo's paid Enterprise tier"
-> (see the pinned top-of-file note in `CLAUDE.md`). Added automatic
-> API-key lifecycle management
-> (self-issue / self-approve / self-revoke / self-expire, an independent
-> reimplementation of RPoem's `KeyGuardian` design — no direct Cargo
-> dependency between the two repos), removed REST entirely from
-> node-to-node Raft/WAL traffic (binary framed transport instead), and
-> continued the staged REST→GraphQL migration of `/admin/*` operational
-> endpoints (`clusterStatus`, `backupSchedule`, `federatedSources` now
-> read/write the same shared state as their REST counterparts, instead
-> of returning fixed stub values). Web research (Shopify's REST Admin
-> API sunset, and a Japanese case study) confirmed that an instant full
-> REST removal is not the 2026 industry-standard pattern — staged
-> migration is. `parallel_config`/`parallel_jobs` remain intentionally
-> unconnected: their GraphQL schema shape doesn't match the REST
-> `ParallelConfig` fields at all, and a lossy/misleading mapping was
-> avoided on purpose. See `CLAUDE.md`'s HANDOFF entries for that date.
-> Also note: `open-cuda`/`open-directx` are currently out of scope for
-> this SET policy (no HTTP surface), but this is a provisional call
-> for right now, not permanent — if `open-directx`'s DirectX
-> compatibility work matures and OS-level/hardware-accelerator
-> execution paths (`open-directx`/`open-cpu`) become more advantageous
-> for apps, re-evaluate whether they should join this SET.
+> **Updated 2026-08-29 (pivoted to a ground-up redesign of the admin
+> plane)**: aruaru-db is designed to be used **as a SET (paired) with
+> RPoem** — only together do they deliver "no REST API needed,
+> compatible with WunderGraph Cosmo's paid Enterprise tier". Moving
+> `/admin/*` REST endpoints to GraphQL mutations one by one turned out
+> to be *just relocating an anti-pattern* (live per-field mutation of a
+> running process's internal state). In response, a canonical design
+> document — **[`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md)** —
+> was created and the work pivoted to a ground-up redesign.
+> New design philosophy (§2, 12 principles): **express everything as a
+> declaration of desired state plus reconciliation; never place
+> imperative RPC on the data plane** — the common solution shared by
+> Kubernetes/GitOps, WunderGraph Cosmo, TiDB/TiFlash and SPIFFE. The
+> data plane (`aruaru-server`) will ultimately expose only `/graphql`,
+> `/graphql/sdl`, `/health*` and `/metrics`; **all REST APIs, `/admin/*`
+> included, are being removed completely**. Operational config becomes a
+> declarative `aruaru.yaml` with hot reload (no runtime mutations). API
+> keys have a fully automatic lifecycle (self-issue / self-approve /
+> self-revoke / self-expire).
+>
+> Progress (of phases P0–P6, as of 2026-08-29): P0 design frozen /
+> P1 declarative-config foundation (`aruaru-server::config`, `--config`,
+> hot reload) done / P2 `query.parallel` (reduced to 4 fields) and
+> `follower_read.target_lag_ms` (fully hot-reloadable) done / P3
+> `/admin/parallel*` and `/v1/keys/self-issue` REST endpoints removed
+> (now GraphQL `explainDistributed`, `parallelJobs`, `selfIssueKey`).
+> Appendix A surveys real "CockroachDB × Snowflake hybrid" databases
+> (TiDB/TiFlash etc.); Appendix B documents the Cosmo technology that
+> makes REST removal possible (Federation / Connect / Persisted
+> Operations / Schema Registry + CDN). Details, remaining work and a
+> resume message are in `CLAUDE.md` — see the top "session resume note"
+> and the HANDOFF entries (continued 5+).
+>
+> Note: `open-cuda`/`open-directx` remain out of scope for this SET
+> policy for now (no HTTP surface), but this is a provisional call, not
+> permanent — revisit if `open-directx`'s DirectX work matures and
+> OS-level/hardware-accelerator execution paths become advantageous.
 
 > 📌 Pending task (2026-08-06): a plan exists to incorporate Toshiba SBM / DeepSeek techniques. See [CLAUDE.md](CLAUDE.md) for details.
 

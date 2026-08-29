@@ -1,17 +1,31 @@
 # aruaru-DB 🦀
 
-> **2026-08-29 更新**: aruaru-dbは**RPoemとSET(対)で使うことで初めて
-> 「REST API不要・WunderGraph Cosmo有料版(Enterprise)互換」という
-> 価値が成立する**設計(詳細は`CLAUDE.md`冒頭の最重要事項を参照)。
-> APIキーを人間が手動発行・管理する必要をゼロにする自動ライフサイクル
-> 管理(自動発行・自動承認・自動破棄・自動削除、RPoem `KeyGuardian`と
-> 同じ設計を独立実装)、Raft/WALノード間通信のREST完全撤廃(バイナリ
-> フレーム化)、GraphQL管理APIのスタブを実データへ段階的に接続
-> (`clusterStatus`・`backupSchedule`・`federatedSources`・`keyStatus`/
-> `revokeKeys`)を実施。2026年時点の実務(Shopify・国内資産運用サービス
-> 「マネイロ」の事例)を調査した結果、REST廃止は「即時全廃」ではなく
-> 段階移行が標準パターンと判断——詳細・残る作業は`CLAUDE.md`の
-> HANDOFF参照。
+> **2026-08-29 更新(管理面の抜本再設計に移行)**: aruaru-dbは**RPoemと
+> SET(対)で使うことで初めて「REST API不要・WunderGraph Cosmo有料版
+> (Enterprise)互換」という価値が成立する**設計。「RESTを1本ずつ
+> GraphQL mutationへ移す」だけでは *稼働中プロセスの生状態をフィールド
+> 単位でライブ書き換えするアンチパターン* の移送にすぎない、という
+> 指摘を受け、**正本の設計文書 [`docs/CONTROL_PLANE_REDESIGN.md`]
+> (docs/CONTROL_PLANE_REDESIGN.md) を新設**して抜本再設計へ移行した。
+> 新・設計哲学(§2、12か条): **すべてを「望ましい状態の宣言」と
+> reconciliation で表し、データプレーンに命令的 RPC を置かない**
+> (K8s/GitOps・WunderGraph Cosmo・TiDB/TiFlash・SPIFFE の共通解)。
+> データプレーン(`aruaru-server`)が公開するHTTPは最終的に `/graphql`・
+> `/graphql/sdl`・`/health*`・`/metrics` のみとし、**`/admin/*` を含む
+> REST APIを全撤廃**する。運用設定は宣言的 `aruaru.yaml` +
+> ホットリロード(実行時ミューテーション廃止)。APIキーは完全自動
+> ライフサイクル(自動発行・自動承認・自動破棄・自動削除)。
+>
+> 進捗(2026-08-29 時点、P0〜P6 のうち): P0 設計確定 / P1 宣言的設定
+> 基盤(`aruaru-server::config`、`--config`、ホットリロード)完了 /
+> P2 `query.parallel`(4フィールド化)・`follower_read.target_lag_ms`
+> (完全ホットリロード)完了 / P3 `/admin/parallel*`・`/v1/keys/self-issue`
+> の REST 撤廃完了(GraphQL `explainDistributed`・`parallelJobs`・
+> `selfIssueKey` へ)。付録 A に「CockroachDB×Snowflake ハイブリッド
+> 変種の実在DB(TiDB/TiFlash 等)」調査、付録 B に「REST撤廃を可能に
+> する Cosmo の技術(Federation / Connect / Persisted Operations /
+> Schema Registry+CDN)」。詳細・残作業・復活用メッセージは `CLAUDE.md`
+> 冒頭「🔄 セッション再開用メモ」と HANDOFF(続き5〜)。
 >
 > **2026-07-25 更新**: 開発方針ファイル(`CLAUDE.md`)の見出しを
 > 「開発方針＆開発環境ルール」から「設計思想＆開発方針＆開発環境ルール」
