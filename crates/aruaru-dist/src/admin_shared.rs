@@ -50,6 +50,37 @@ pub struct FederatedSourceEntry {
 /// 登録済みフェデレーションソース一覧を共有するハンドル。
 pub type SharedFederatedSources = Arc<Mutex<Vec<FederatedSourceEntry>>>;
 
+/// 並列/分散クエリ実行の設定(**GraphQL `ParallelConfigGql` と同じ4
+/// フィールド**)。
+///
+/// # 背景(2026-08-29 再設計 P2)
+///
+/// 従来 REST 側(`aruaru-server::admin` の独自 `ParallelConfig`、7
+/// フィールド)と GraphQL 側(4フィールド・スタブ)でスキーマが非互換
+/// だった。ユーザー判断により「GraphQL の4フィールド
+/// (`enabled`/`max_workers`/`chunk_size`/`strategy`)を正とし REST を
+/// そこへ寄せる」方針が確定。再設計ではこの設定は宣言的
+/// `aruaru.yaml: query.parallel` が正本で、`reconcile` がここへ書き込み、
+/// GraphQL `parallelConfig` query と REST `/admin/parallel/explain` が
+/// ここを読む(`setParallelConfig` mutation・`GET/POST /admin/parallel`
+/// は撤廃)。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParallelConfigState {
+    pub enabled: bool,
+    pub max_workers: u32,
+    pub chunk_size: u32,
+    pub strategy: String,
+}
+
+impl Default for ParallelConfigState {
+    fn default() -> Self {
+        Self { enabled: false, max_workers: 4, chunk_size: 10_000, strategy: "hash".into() }
+    }
+}
+
+/// `ParallelConfigState` を共有するハンドル。
+pub type SharedParallelConfig = Arc<Mutex<ParallelConfigState>>;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -137,10 +137,10 @@ APIキー・ライフサイクル（KeyGuardian）             ← open-runo-rou
 | `GET/POST /admin/parallel` | **B1** | `aruaru.yaml: query.parallel`（4 フィールド: enabled/max_workers/chunk_size/strategy） |
 | `GET/POST /admin/federation`, `/federation/drop` | **B1** | `aruaru.yaml: federation.sources[]`（登録済み外部ソース一覧） |
 | `POST /admin/cluster/node`（配置意図） | **B1** | `execution-config: cluster.nodes[]`（望ましいノード構成） |
-| closed-timestamp の `target_lag` | **B1** | `aruaru.yaml: follower_read.target_lag_ms` |
-| wal-service の safekeeper quorum | **B1** | `aruaru.yaml: wal.safekeepers` / `wal.quorum` |
-| disaster-email-backup の宛先設定 | **B1** | `aruaru.yaml: disaster_backup.email`（feature-gated） |
-| sharded-store の shard 数 | **B1** | `aruaru.yaml: sharded_store.shards`（0 = コア数） |
+| closed-timestamp の `target_lag` | **B1（ホットリロード）** | `aruaru.yaml: follower_read.target_lag_ms`。全 tracker が同一 `Arc<AtomicU64>` を共有し `set_target_lag_nanos` で即反映（P2 実装済み） |
+| wal-service の safekeeper quorum | **B1（静的）** | `aruaru.yaml: wal.safekeepers` / `wal.quorum`。台数は構築時固定 → reconcile は `restart_required` を報告するのみ（進行中状態を失わないため意図的） |
+| disaster-email-backup の宛先設定 | **B1** | `aruaru.yaml: disaster_backup.email`（feature-gated、P3 で reconcile 接続） |
+| sharded-store の shard 数 | **B1（静的）** | `aruaru.yaml: sharded_store.shards`（0 = コア数）。shard 数は構築時固定 → `restart_required` |
 | `POST /admin/backup`（作成） | **B2** | `Mutation.createBackup`（実装済み） |
 | `POST /admin/backup/restore` | **B2** | `Mutation.restoreBackup`（実装済み） |
 | `POST /admin/migrate/run`, `/migrate/instance` | **B2** | `Mutation.runMigration`（実装済み） |
@@ -289,9 +289,23 @@ config/
   - P1 で reconcile 接続済み: `backup.schedule`・`federation.sources`。
     残り（`query.parallel` 等）は P2。
   - `aruaru.example.yaml` を同梱。`cargo test -p aruaru-server` 失敗 0。
-- **P2 B1 の移送** parallel / backup.schedule / federation / follower_read.lag /
-  wal / sharded_store / disaster_backup を config へ。対応する `/admin` ルートと
-  GraphQL `setX` スタブを削除。Tauri の設定タブを `aruaru.yaml` 編集に。
+- **P2 B1 の移送** ← **一部済（2026-08-29 続き7）**
+  - `query.parallel`（4フィールド化）: `AdminState.parallel` を
+    `admin_shared::ParallelConfigState` へ統一。`reconcile` 接続。
+    GraphQL `parallelConfig` query を実データ化、`setParallelConfig`
+    mutation と `ParallelConfigInput` を撤廃。REST `GET/POST /admin/parallel`
+    と `get_parallel`/`set_parallel` ハンドラと旧7フィールド `ParallelConfig`
+    構造体を削除。Tauri `get_parallel_config` を GraphQL へ、
+    `set_parallel_config` は「aruaru.yaml で管理」を返す形に。
+  - `follower_read.target_lag_ms`: `ClosedTimestampCoordinator` /
+    `ClosedTimestampTracker` の `target_lag_nanos` を `Arc<AtomicU64>` 共有に
+    変更（`set_target_lag_nanos`）。`reconcile` 接続。全 tracker へ即反映。
+  - `wal` / `sharded_store`: 静的扱いと確定（`restart_required`）。
+  - **P2 残り**: `disaster_backup.email` の reconcile 接続、
+    `/admin/parallel/explain`・`/admin/parallel/jobs` の GraphQL 実データ化 →
+    REST ルート撤廃（GraphQL `explainDistributed`・`parallelJobs` は現状
+    スタブ。実ロジックの移植が必要）。Tauri の設定タブ全体を
+    `aruaru.yaml` 編集 UI に。
 - **P3 B2/B3 の残り** ephemeral-query / multi-raft / sharded-store put/get /
   closed-timestamp / wal-service を GraphQL query/mutation 化。対応 `/admin`
   ルート削除。Tauri/Android/web を GraphQL クライアントへ。
@@ -326,3 +340,51 @@ config/
   「実行時ミューテーションで設定管理」構造は不変。却下。
 - **設定も GraphQL Subscription で配信** → 面白いが、Cosmo は素直に
   ポーリング。まずは Cosmo 準拠（P5）。Subscription 化は将来検討。
+
+---
+
+## 付録 A. 実在する「CockroachDB × Snowflake ハイブリッド変種」の調査(2026-08-29)
+
+ユーザー指示: 「aruaru-db は CockroachDB と Snowflake の良い所取りのハイブリッドの
+特殊な変種の実在する DATABASE の実装理論や技術を取り入れて」。英日で Google /
+GitHub 調査した結果。
+
+### A.1 該当する実在システムと、その要素技術
+
+| システム | Cockroach 側(強整合 OLTP) | Snowflake 側(分離・列指向 OLAP) | 橋渡しの要素技術 |
+|---|---|---|---|
+| **TiDB / TiKV + TiFlash**(PingCAP、VLDB 2020「TiDB: A Raft-based HTAP Database」)| TiKV = Multi-Raft、Region 単位、線形化可能 | **TiFlash** = 列指向レプリカ、独立スケール、`DeltaTree` エンジン | **Raft Learner** が行→列変換しながら非同期リプレイ。読み取り時に **Raft index + MVCC** で Snapshot Isolation を検証 |
+| **CockroachDB** 本体 | Range + closed timestamp + follower read + bounded staleness | ベクトル化実行、`Data Boost`(分離コンピュート)| closed timestamp(= aruaru-db が既に実装) |
+| **SingleStore** | 分散、行ストア | 列ストア、`Bottomless`(S3 無制限ストレージ、compute/storage 分離)| 単一エンジンで行↔列を統合(レプリカ非同期) |
+| **Neon** | Postgres 互換 | **safekeeper / pageserver 分離**(WAL サービス化)| = aruaru-db `wal_service` が既に借用 |
+| **Databend** | — | Snowflake 型、オブジェクトストレージ直結、Rust | = aruaru-db `table_format`(object-table)が既に借用 |
+| **RisingWave** | — | ストリーミング SQL、S3 ステートバックエンド、Rust | — |
+
+**「特殊な変種」の代表格は TiDB**(Raft 強整合 OLTP + 列指向 Raft-Learner レプリカで
+1 システム HTAP)。CockroachDB の「Raft・follower read」と Snowflake の
+「独立スケールする列指向解析ストア」を一体化している。
+
+### A.2 aruaru-db が既に取り込んでいるもの
+
+- CockroachDB: closed timestamp / follower read / bounded staleness
+  (`crates/aruaru-dist/src/closed_ts.rs`)、Multi-Raft(`multi_raft.rs`)、
+  Serverless の ephemeral SQL pod(`crates/aruaru-server/src/ephemeral_pod.rs`)
+- Snowflake 系: Neon 型 disaggregated storage(`wal_service`)、Databend 型
+  object-table(`table_format`)、ScyllaDB shard-per-core(`sharded_store`)
+
+### A.3 未取り込みで、取り入れる価値があるもの(将来フェーズ)
+
+1. **Raft-Learner 列指向レプリカ**(TiFlash 型)。`--raft-role learner` は既に
+   あるが、Learner 上で **行→列変換**して独立の解析ストアを作る部分が無い。
+   → RPoem 配信の execution-config で「どのテーブルに列レプリカを何個持つか」
+   を宣言(TiDB の `ALTER TABLE ... SET TIFLASH REPLICA n` 相当)。P5〜。
+2. **読み取り時の Raft index + MVCC による Snapshot Isolation 検証**。
+   今の closed timestamp(P2 でホットリロード化済み)と組み合わせ、Learner
+   レプリカからの一貫読み取りの根拠を厳密化する。
+3. **DeltaTree 型の更新耐性のある列エンジン**(頻繁な更新 + 高速スキャン両立)。
+   現状の object-table(不変セグメント + 時間旅行)に delta 層を足す方向。
+
+これらは本再設計(管理面の GraphQL 一本化)とは別トラックだが、**execution-config
+の配信内容**(どのテーブルを列レプリカ化するか等)として管理面に載るため、
+P5(コントロールプレーン)で接点を持つ。`docs/HYBRID_NETWORK_ARCHITECTURE.md`・
+`README-English.md` の HTAP 記述とも整合を取ること。

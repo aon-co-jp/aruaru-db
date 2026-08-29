@@ -56,14 +56,17 @@ federation:
     #   pushdown: false
 
 follower_read:
-  target_lag_ms: 3000
+  target_lag_ms: 3000    # ホットリロード可(全 closed-ts tracker へ即反映)
 
+# wal / sharded_store は safekeeper 台数・シャード数が構築時固定のため
+# 「静的」扱い。変更は検知して "要再起動" を警告するのみ(進行中状態を
+# 失わないため意図的にホットリロードしない。Cosmo の静的セクションと同じ)。
 wal:
   safekeepers: 3
   quorum: 2
 
 sharded_store:
-  shards: 0              # 0 = 論理コア数
+  shards: 0              # 0 = 論理コア数(静的)
 
 # disaster_backup:       # feature = "disaster_email_backup" のときのみ
 #   email:

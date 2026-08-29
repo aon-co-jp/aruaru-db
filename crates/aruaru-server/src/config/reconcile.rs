@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use aruaru_dist::admin_shared::{BackupScheduleState, FederatedSourceEntry};
+use aruaru_dist::admin_shared::{BackupScheduleState, FederatedSourceEntry, ParallelConfigState};
 
 use crate::admin::AdminState;
 
@@ -23,13 +23,21 @@ use super::AruaruConfig;
 pub struct ReconcileReport {
     pub schedule_changed: bool,
     pub federation_changed: bool,
-    /// 静的セクションに差分があり「要再起動」を警告した項目名。
+    pub parallel_changed: bool,
+    pub follower_read_lag_changed: bool,
+    /// 静的セクション(server / raft / wal / sharded_store)に差分があり
+    /// 「要再起動」を警告した項目名。`wal` と `sharded_store` は safekeeper
+    /// 台数・シャード数が構築時固定で、稼働中の再構成は進行中状態を
+    /// 失うため**意図的に静的扱い**とする(Cosmo の静的セクションと同じ)。
     pub restart_required: Vec<String>,
 }
 
 impl ReconcileReport {
     pub fn any_dynamic_change(&self) -> bool {
-        self.schedule_changed || self.federation_changed
+        self.schedule_changed
+            || self.federation_changed
+            || self.parallel_changed
+            || self.follower_read_lag_changed
     }
 }
 
@@ -52,6 +60,10 @@ pub fn reconcile(
             ("raft.node_id", prev.raft.node_id != new.raft.node_id),
             ("raft.role", prev.raft.role != new.raft.role),
             ("raft.peers", prev.raft.peers != new.raft.peers),
+            // wal / sharded_store は構築時固定(理由は ReconcileReport の doc)。
+            ("wal.safekeepers", prev.wal.safekeepers != new.wal.safekeepers),
+            ("wal.quorum", prev.wal.quorum != new.wal.quorum),
+            ("sharded_store.shards", prev.sharded_store.shards != new.sharded_store.shards),
         ] {
             if differs {
                 tracing::warn!(
@@ -60,6 +72,37 @@ pub fn reconcile(
                 );
                 report.restart_required.push(name.to_string());
             }
+        }
+    }
+
+    // ── query.parallel(4フィールド、完全ホットリロード) ────
+    {
+        let desired = ParallelConfigState {
+            enabled: new.query.parallel.enabled,
+            max_workers: new.query.parallel.max_workers,
+            chunk_size: new.query.parallel.chunk_size,
+            strategy: new.query.parallel.strategy.clone(),
+        };
+        let handle = state.parallel_handle();
+        let mut cur = handle.lock();
+        if *cur != desired {
+            *cur = desired;
+            report.parallel_changed = true;
+            tracing::info!(?cur, "aruaru.yaml: query.parallel を反映しました");
+        }
+    }
+
+    // ── follower_read.target_lag_ms(closed timestamp、完全ホットリロード) ──
+    {
+        let desired_nanos = new.follower_read.target_lag_ms.saturating_mul(1_000_000);
+        let coord = state.closed_ts_coordinator();
+        if coord.target_lag_nanos() != desired_nanos {
+            coord.set_target_lag_nanos(desired_nanos);
+            report.follower_read_lag_changed = true;
+            tracing::info!(
+                target_lag_ms = new.follower_read.target_lag_ms,
+                "aruaru.yaml: follower_read.target_lag_ms を全 tracker へ反映しました"
+            );
         }
     }
 
@@ -208,5 +251,62 @@ federation:
         let b = cfg_from("server:\n  pg_port: 5999\n");
         let r = reconcile(&b, Some(&a), &st);
         assert!(r.restart_required.iter().any(|s| s == "server.pg_port"));
+    }
+
+    #[test]
+    fn wal_and_sharded_store_changes_are_restart_required_not_hot() {
+        let st = state();
+        let a = cfg_from("wal:\n  quorum: 2\nsharded_store:\n  shards: 0\n");
+        let b = cfg_from("wal:\n  quorum: 3\nsharded_store:\n  shards: 8\n");
+        let r = reconcile(&b, Some(&a), &st);
+        assert!(r.restart_required.iter().any(|s| s == "wal.quorum"));
+        assert!(r.restart_required.iter().any(|s| s == "sharded_store.shards"));
+        assert!(!r.any_dynamic_change());
+    }
+
+    #[test]
+    fn parallel_config_hot_reloads_into_admin_state() {
+        let st = state();
+        let cfg = cfg_from(
+            r#"
+query:
+  parallel:
+    enabled: true
+    max_workers: 12
+    chunk_size: 5000
+    strategy: "range"
+"#,
+        );
+        let r = reconcile(&cfg, None, &st);
+        assert!(r.parallel_changed);
+        let cur = st.parallel_handle().lock().clone();
+        assert!(cur.enabled);
+        assert_eq!(cur.max_workers, 12);
+        assert_eq!(cur.chunk_size, 5000);
+        assert_eq!(cur.strategy, "range");
+
+        // 冪等
+        let r2 = reconcile(&cfg, Some(&cfg), &st);
+        assert!(!r2.parallel_changed);
+    }
+
+    #[test]
+    fn follower_read_target_lag_hot_reloads_into_coordinator() {
+        let st = state();
+        let coord = st.closed_ts_coordinator();
+        // 既存の tracker を1つ作っておき、変更が既存 tracker にも効くことを確認。
+        let tracker = coord.register_range(1);
+        assert_eq!(coord.target_lag_nanos(), 3_000_000_000);
+        assert_eq!(tracker.target_lag_nanos(), 3_000_000_000);
+
+        let cfg = cfg_from("follower_read:\n  target_lag_ms: 500\n");
+        let r = reconcile(&cfg, None, &st);
+        assert!(r.follower_read_lag_changed);
+        assert_eq!(coord.target_lag_nanos(), 500_000_000);
+        // 同一の Arc<AtomicU64> を共有しているので既存 tracker にも即反映。
+        assert_eq!(tracker.target_lag_nanos(), 500_000_000);
+
+        let r2 = reconcile(&cfg, Some(&cfg), &st);
+        assert!(!r2.follower_read_lag_changed);
     }
 }

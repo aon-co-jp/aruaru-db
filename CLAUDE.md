@@ -118,20 +118,37 @@
 >   =Cosmo の `watch_config` と同方式)。`aruaru.example.yaml` を同梱。
 >   P1 で実際に反映されるのは `backup.schedule` と `federation.sources`
 >   (7テスト、`cargo test -p aruaru-server` 失敗0)。
-> - **今すぐ着手できる次の一手 = P2(B1 の移送)**:
->   [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md) §4・§8。
->   `query.parallel`(4フィールド)/ `follower_read.target_lag_ms` /
->   `wal` / `sharded_store` を `aruaru.yaml` へ移し、`reconcile.rs` に
->   接続。対応する `/admin/parallel` 等の REST ルートと GraphQL の
->   `setParallelConfig` スタブを削除。`admin/src-tauri` の設定タブを
->   `aruaru.yaml` 編集に転換(REST 直叩きをやめる)。
->   `AdminState.parallel` は7フィールドの独自 `ParallelConfig` を廃し
->   4フィールド共有型へ寄せる。
+> - **P2(B1 の移送)= 主要部完了(2026-08-29 続き7)**:
+>   (1) `query.parallel` を4フィールド化。`AdminState.parallel` の旧7
+>   フィールド独自型を `admin_shared::ParallelConfigState` へ統一、
+>   `reconcile` 接続、GraphQL `parallelConfig` query を実データ化、
+>   `setParallelConfig` mutation と `ParallelConfigInput` を撤廃、REST
+>   `GET/POST /admin/parallel`・`get_parallel`/`set_parallel` を削除、
+>   Tauri `get_parallel_config` を GraphQL へ・`set_parallel_config` は
+>   「aruaru.yaml で管理」を返す形へ。(2) `follower_read.target_lag_ms`:
+>   `ClosedTimestampCoordinator`/`Tracker` の `target_lag_nanos` を
+>   `Arc<AtomicU64>` 共有に変更(`set_target_lag_nanos`)、`reconcile`
+>   接続、全 tracker へ即反映。(3) `wal`/`sharded_store` は静的扱い確定
+>   (`restart_required`)。`cargo test -p aruaru-dist -p aruaru-graphql
+>   -p aruaru-server` 失敗0(新規 reconcile 3件 + GraphQL 1件)。
+>   TiDB/TiFlash 等の調査結果を `docs/CONTROL_PLANE_REDESIGN.md` 付録 A へ。
+> - **今すぐ着手できる次の一手 = P2 残り → P3**:
+>   [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md) §8。
+>   P2 残り: `disaster_backup.email` の reconcile 接続、
+>   `/admin/parallel/explain`・`/admin/parallel/jobs` の GraphQL
+>   実データ化(`explainDistributed`・`parallelJobs` は現状スタブ、実
+>   ロジック移植が必要)→ REST 撤廃、Tauri 設定タブ全体の `aruaru.yaml`
+>   編集 UI 化。P3: `ephemeral-query`/`multi-raft`/`sharded-store` put/get/
+>   `closed-timestamp`/`wal-service` を GraphQL 化 → REST 撤廃。
+>   **P2/P3 とも着手前に grep で Tauri/Android/web の該当 REST 参照を
+>   確認**(参照があればそのクライアントも同一コミットで移行)。
 > - **既に完了済み(「未着手」と誤解しないこと)**: `registry`の
 >   `crawlRegistry`/`testRegistryConnection`はGraphQL側で既に実データ
 >   接続済み(再設計では B2/B3)。
-> - 続き3〜6 の詳細は本ファイル内「HANDOFF追記(2026-08-29〜続き6)」を
->   参照。再設計そのものの正本は `docs/CONTROL_PLANE_REDESIGN.md`。
+> - 続き3〜7 の詳細は本ファイル内「HANDOFF追記(2026-08-29〜続き7)」を
+>   参照。再設計そのものの正本は `docs/CONTROL_PLANE_REDESIGN.md`
+>   (付録 A に CockroachDB×Snowflake ハイブリッド変種=TiDB/TiFlash 等の
+>   調査と将来の取り込み候補)。
 
 > **📌 2026-08-26追記: Windows用インストーラー`aruaru-db-installer.exe`を
 > 新設(命名規則統一)**: ユーザー指示「パワーシェルでインストールする
@@ -4649,3 +4666,61 @@ restart_required)。既存警告のみ(ephemeral_pod の `super::*` 等、無関
 7フィールド独自型を4フィールド共有型へ置換。`/admin/parallel` 等の
 REST ルートと GraphQL `setParallelConfig` スタブを削除。`admin/src-tauri`
 の設定タブを `aruaru.yaml` 編集へ転換。
+
+## HANDOFF追記(2026-08-29続き7) 再設計 P2: B1 の移送(主要部)
+
+正本: `docs/CONTROL_PLANE_REDESIGN.md`。P1(設定基盤)に続き **P2(B1 =
+宣言的設定の移送)の主要部を実装**。
+
+**(1) `query.parallel` の4フィールド化**
+- `aruaru_dist::admin_shared::ParallelConfigState`(enabled/max_workers/
+  chunk_size/strategy)を新設。`AdminState.parallel` の旧7フィールド独自
+  `ParallelConfig`(max_parallelism 等)を廃し、この共有型へ統一。
+  `parallel_handle()` アクセサ追加。
+- `config::reconcile` に `query.parallel` を接続(完全ホットリロード、冪等)。
+- GraphQL: `parallelConfig` query を固定値スタブ → `AdminState.parallel` の
+  実効値を返す形へ。`setParallelConfig` mutation と `ParallelConfigInput`
+  を撤廃(設定は宣言的 aruaru.yaml が正本、実行時ミューテーション廃止)。
+  `AdminCtx.parallel` フィールド + main.rs 配線 + test helper 更新。
+- REST: `GET/POST /admin/parallel` ルートと `get_parallel`/`set_parallel`
+  ハンドラを削除。`explain_distributed` ハンドラを4フィールドへ移植
+  (shuffle パーティション数は `max_workers*8` を既定ヒューリスティックに)。
+  `/admin/parallel/explain`・`/admin/parallel/jobs` は P3 まで残置(理由:
+  GraphQL `explainDistributed`/`parallelJobs` が現状スタブで実ロジック
+  移植が必要)。
+- Tauri(`admin/src-tauri/src/main.rs`): `ParallelConfig` を4フィールド化。
+  `get_parallel_config` を GraphQL `parallelConfig` query へ。
+  `set_parallel_config` は「aruaru.yaml で管理」の案内を返す形へ。
+  ※ Tauri は独立パッケージ(tauri v2、ワークスペース外)でこの環境では
+  ビルド検証不可——ソース編集のみ。
+
+**(2) `follower_read.target_lag_ms` の完全ホットリロード化**
+- `crates/aruaru-dist/src/closed_ts.rs`: `ClosedTimestampCoordinator` と
+  `ClosedTimestampTracker` の `target_lag_nanos: u64` を
+  `Arc<AtomicU64>` 共有へ変更。`Coordinator::set_target_lag_nanos()` /
+  `target_lag_nanos()`、`Tracker::with_shared_lag()` を追加。
+  `register_range` が同一 Arc を全 tracker へ配る → 一度の store で
+  既存・新規どちらの tracker にも即反映。`new(u64)` 互換は維持
+  (内部で Arc 化。既存3テスト無変更で通過)。
+- `config::reconcile` に接続。
+
+**(3) `wal` / `sharded_store` は静的扱いと確定**
+- safekeeper 台数・シャード数は構築時固定で稼働中の再構成は進行中状態を
+  失う。reconcile は差分検知で `restart_required` を報告するのみ
+  (Cosmo の静的セクションと同じ扱い)。`aruaru.example.yaml` にコメント。
+
+**(4) 調査(ユーザー指示)**: 「CockroachDB × Snowflake ハイブリッド変種の
+実在DB」を英日で Google/GitHub 調査 → `docs/CONTROL_PLANE_REDESIGN.md`
+**付録 A**。代表格は TiDB/TiKV+TiFlash(Raft 強整合 OLTP + Raft-Learner
+列指向レプリカ、DeltaTree、読み取り時 Raft index + MVCC で SI 検証)。
+aruaru-db が既に持つもの/未取り込みで価値があるもの(Learner 列レプリカ、
+SI 読み取り検証、DeltaTree 型 delta 層)を整理。P5(コントロールプレーン)
+で execution-config の配信内容として接点。
+
+**検証**: `cargo test -p aruaru-dist -p aruaru-graphql -p aruaru-server`
+失敗0(aruaru-dist 72+1ignored、aruaru-graphql 11、aruaru-server config系
++3・GraphQL +1)。既存警告のみ。
+
+**次**: P2 残り(`disaster_backup.email` reconcile 接続、explain/jobs の
+GraphQL 実データ化 → REST 撤廃、Tauri 設定タブの aruaru.yaml 編集 UI 化)、
+その後 P3。
