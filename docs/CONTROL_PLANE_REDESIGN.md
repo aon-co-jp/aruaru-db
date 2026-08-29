@@ -1,8 +1,10 @@
 # 管理面の再設計 — 「REST API 不要」を抜本的に実現する
 
-> ステータス: **設計中（2026-08-29 起票）** / 対象: `aruaru-db` + `RPoem`（SET）
+> ステータス: **実装中（2026-08-29 起票）— P0 設計確定 / P1 完了 / P2 主要部完了**
+> 対象: `aruaru-db` + `RPoem`（SET）
 > 決定者: masahiro ishizuka（AON CEO）／ 起案: セッション横断作業
 > 関連: [`CLAUDE.md` 冒頭「🎯 最重要・最優先」](../CLAUDE.md) ・ [`PORTING.md`](../PORTING.md)
+> 進捗の詳細は `CLAUDE.md` 冒頭「🔄 セッション再開用メモ」と HANDOFF（続き5〜）。
 
 ---
 
@@ -54,46 +56,121 @@ GraphQL ＋ health ＋ metrics だけ」。
 
 ---
 
-## 2. 設計哲学（この再設計が従う原則）
+## 2. 新・設計哲学（この再設計の土台）
+
+### 2.0 一文で言うと
+
+> **すべては「望ましい状態（desired state）の宣言」と「それへ収束させる
+> reconciliation」で表す。データプレーンに命令的 RPC を置かない。**
+
+管理設定も、APIキーも、HTAP の列レプリカ配置も、同じ 1 つの考え方で扱う。
+「今こうしろ」（命令）ではなく「あるべき姿はこれ」（宣言）を書き、
+システムが差分を埋める。これは以下 4 つの実在システム群の**共通解**であり、
+本設計はそれを 1 つのエコシステム（aruaru-db + RPoem）に統合する。
+
+| 源流 | 借りる考え方 | 一次資料 |
+|---|---|---|
+| **Kubernetes / GitOps（Argo CD・Flux）** | 宣言的 state + 連続 reconciliation + 外部の不変な source of truth + ドリフト自動補正（self-healing） | [ArgoCD reconciliation](https://argo-cd.readthedocs.io/en/stable/operator-manual/reconcile/)、[GitOps principles](https://www.plural.sh/blog/what-is-gitops/) |
+| **WunderGraph Cosmo / Apollo GraphOS** | データプレーン（Router＝実行・可用性最優先）と コントロールプレーン（governance・設定配信）の分離。クライアントはコントロールプレーンに触れない | [Cosmo overview](https://cosmo-docs.wundergraph.com/overview)、[Cosmo router config](https://cosmo-docs.wundergraph.com/router/configuration) |
+| **TiDB / TiKV + TiFlash（VLDB 2020）** | Raft 強整合 OLTP と 列指向 OLAP を「Raft-Learner レプリカ」で 1 システム化、独立スケール。読み取り時に Raft index + MVCC で Snapshot Isolation を検証 | [TiDB: A Raft-based HTAP Database](https://www.vldb.org/pvldb/vol13/p3072-huang.pdf) |
+| **SPIFFE / SPIRE（NIST SP 800-207 Zero Trust）** | 「Attest → Issue → Authenticate」の自動ループ。短命クレデンシャルの自動ローテーション、孤児クレデンシャルの自動失効、静的シークレット・ゼロ | [SPIFFE](https://www.paloaltonetworks.com/cyberpedia/what-is-spiffe)、[CockroachLabs: SPIFFE/SPIRE で zero-trust DB 認証](https://www.cockroachlabs.com/blog/zero-trust-database-authentication-spiffe-spire/) |
+
+### 2.1 原則（12 か条）
+
+**A. プレーン分離**
 
 1. **データプレーンは GraphQL に徹する。**
-   `aruaru-server` が公開する HTTP は次だけ:
+   `aruaru-server` が公開する HTTP は
    `/graphql`・`/graphql/sdl`・`/health*`・`/metrics`・`/v1/keys/self-issue`・
-   内部 `/raft/*`。**`/admin/*` は 1 本も残さない。**
+   内部 `/raft/*` のみ。**`/admin/*` は 1 本も残さない。**
+   データプレーンは「可用性最優先で、コントロールプレーンが落ちても
+   動き続ける」（Cosmo Router と同じ立場）。
 
-2. **運用設定は宣言的ドキュメント。実行時ミューテーションではない。**
-   `aruaru.yaml`（静的）＋ RPoem コントロールプレーンが配信する
-   `execution-config`（動的）。`setX` という mutation は作らない。
-   設定変更は「ドキュメントを書き換える → リロードが走る → 反映」。
-   冪等・監査可能（Git 管理）・再現可能。
+2. **コントロールプレーンは RPoem。**
+   `open-runo-schema-registry`（execution-config 配信＝Cosmo の CDN 相当）・
+   `open-runo-feature-flags`・`open-runo-federation`（合成）・
+   `open-runo-scim` / `open-runo-security`（SCIM 2.0 / OIDC＝Cosmo
+   Enterprise 相当を OSS で）。`aruaru-server` はここから設定を
+   **取得する側**。クライアントはコントロールプレーンに直接触れない。
 
-3. **ホットリロードを最初から作り込む。**
-   `notify`（ファイル監視）＋ `SIGHUP`。設定の差分だけを稼働中の
-   `AppState` へ適用する `reconcile()` を用意する。既存動作を壊さない。
-
-4. **「一度きりのアクション」だけが GraphQL Mutation。**
-   `createBackup`・`runMigration`・`rebalanceCluster`・`revokeKeys`・
-   `objectTableCommit` … は冪等でない副作用操作＝正当な RPC。
-   これらは subgraph の `Mutation` に置く（VersionlessAPI の一部）。
-
-5. **観測は GraphQL Query ＋ Prometheus。**
-   `clusterStatus`・`keyStatus`・`parallelJobs`・`objectTable` 履歴 …
-   はグラフに載せる。数値カウンタは `/metrics` にも出す。
-
-6. **ノード間 RPC は管理面ではない。**
+3. **ノード間 RPC は管理面でも設定面でもない。**
    `/raft/append`・`/raft/vote`・`/closed-timestamp/receive|publish` は
-   クラスタ内部トランスポート。GraphQL 化しない。本再設計の対象外
-   （ただし将来はバイナリトランスポートへ寄せる — 別トピック）。
+   クラスタ内部トランスポート。GraphQL 化しない（将来バイナリ化は別トピック）。
 
-7. **コントロールプレーンは RPoem 側。**
-   `RPoem/crates/open-runo-schema-registry`・`open-runo-feature-flags`・
-   `open-runo-federation` が「Cosmo の Control Plane ＋ CDN」に相当する
-   役割を負う。`aruaru-server` はそこから execution-config を
-   **取得する側**（＝ Cosmo Router と同じ立場）。
+**B. 宣言と reconciliation（設定）**
 
-8. **SET の価値に寄与しない移送はしない。**
-   着手前に必ず自問: 「これは SCIM/SSO 相当・APIキー自動管理・
-   VersionlessAPI 互換のいずれかを強化するか」。
+4. **運用設定は宣言的ドキュメント。実行時ミューテーションではない。**
+   `aruaru.yaml`（このノード固有・静的寄り）＋ RPoem 配信の
+   `execution-config`（クラスタ全体・動的）。**`setX` mutation は作らない。**
+   設定変更は「ドキュメントを書き換える → reconcile が走る → 収束」。
+
+5. **source of truth は外部・不変・バージョン管理下（GitOps 原則）。**
+   `aruaru.yaml` は Git 管理される。稼働中プロセスの状態は
+   source of truth ではなく、その**射影**にすぎない。
+
+6. **reconcile は冪等で、差分だけを当てる。**
+   同じ config を何度当てても同じ結果。変わっていない項目は触らない。
+   （実装: `config::reconcile(new, previous, &state) -> ReconcileReport`）
+
+7. **ホットリロードは最初から作り込む。ドリフトは警告する。**
+   mtime ポーリング（Cosmo `watch_config` と同方式）＋ `SIGHUP`。
+   静的セクション（`server`/`raft`/`wal`/`sharded_store`）の変更は
+   「要再起動」を warn ログ＋`restart_required` に記録するだけ
+   （進行中状態を失わないための意図的な制約。Cosmo の静的セクションと同じ）。
+
+8. **壊れた設定を保存しても稼働中インスタンスは無事。**
+   YAML 解析エラー時は error ログを出して**直前の設定を維持**。
+
+**C. アクションと観測（GraphQL）**
+
+9. **「一度きりの副作用」だけが GraphQL Mutation。**
+   `createBackup`・`runMigration`・`rebalanceCluster`・`clusterPropose`・
+   `objectTableCommit` … は冪等でない＝正当な RPC。subgraph の `Mutation`
+   に置く（VersionlessAPI の一部）。「設定の書き込み」はここに**含めない**。
+
+10. **観測は GraphQL Query ＋ Prometheus。**
+    `clusterStatus`・`keyStatus`・`parallelConfig`（実効値）・
+    `objectTable` 履歴 … はグラフに載せる。数値カウンタは `/metrics` にも。
+
+**D. クレデンシャルも「宣言 + 自動ループ」（SPIFFE 哲学）**
+
+11. **APIキーは自動ライフサイクル。人間の承認キューを置かない。**
+    - 自動発行: `POST /v1/keys/self-issue`（認証不要＝「即発行できること
+      自体が承認手続き」）が `viewer` ロール・短命（既定 24h）キーを出す。
+    - 自動承認: 人手の approve ステップは存在しない。
+    - 自動破棄: GraphQL `revokeKeys(owner)` mutation（アクション）。
+    - 自動削除: 期限切れは `verify()` 実行時に検知してその場で除去。
+    正本の設計・実装は `crates/aruaru-dist/src/keyring.rs`（`KeyGuardian`）、
+    RPoem 側は `open-runo-router::keyring` が同じ設計を独立実装（Cargo 依存は
+    結合しない既存方針）。SPIFFE の「短命・自動ローテーション・孤児の自動
+    失効・静的シークレット ゼロ」を、mTLS/SVID の重装備なしに最小構成で。
+
+**E. HTAP ハイブリッドも「宣言」で（TiDB 哲学）**
+
+12. **列レプリカ配置・follower read の許容ラグ等も宣言的設定。**
+    「どのテーブルに列指向 Learner レプリカを何個持つか」は execution-config
+    に書く（TiDB の `ALTER TABLE … SET TIFLASH REPLICA n` を宣言化した相当）。
+    `follower_read.target_lag_ms`（P2 実装済み・完全ホットリロード）も同じ。
+    強整合 OLTP（Raft）と 列指向 OLAP（Learner）の**両立の度合い**を、
+    命令ではなく「望ましい姿」として表す。理論的裏付けは付録 A。
+
+### 2.2 判断フロー（新しいエンドポイント／設定を足すとき）
+
+```
+その項目は「望ましい状態」か？（何度書いても同じ結果か）
+├─ YES → 宣言的設定（aruaru.yaml / execution-config）へ。setX mutation は作らない。
+│         └─ 稼働中に無停止で変えられるか？
+│             ├─ YES → reconcile でホットリロード
+│             └─ NO  → 静的扱い。reconcile は restart_required を報告するのみ
+└─ NO（冪等でない副作用）
+    ├─ 状態の読み取りだけ → GraphQL Query（＋ /metrics）
+    ├─ 一度きりのアクション → GraphQL Mutation
+    └─ クラスタ内部通信   → 内部トランスポート（GraphQL 化しない）
+
+いずれの場合も着手前に自問:
+「これは aruaru-db + RPoem SET の価値（SCIM/SSO 相当・APIキー自動管理・
+ VersionlessAPI 互換）を強化するか？」→ NO なら、やらない。
+```
 
 ---
 
