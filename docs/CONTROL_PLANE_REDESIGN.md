@@ -405,15 +405,22 @@ config/
     `ClosedTimestampTracker` の `target_lag_nanos` を `Arc<AtomicU64>` 共有に
     変更（`set_target_lag_nanos`）。`reconcile` 接続。全 tracker へ即反映。
   - `wal` / `sharded_store`: 静的扱いと確定（`restart_required`）。
-  - **P2 残り**: `disaster_backup.email` の reconcile 接続、
-    `/admin/parallel/explain`・`/admin/parallel/jobs` の GraphQL 実データ化 →
-    REST ルート撤廃（GraphQL `explainDistributed`・`parallelJobs` は現状
-    スタブ。実ロジックの移植が必要）。Tauri の設定タブ全体を
-    `aruaru.yaml` 編集 UI に。
+  - **P2 残り（続き8 で一部消化）**:
+    - ✅ `/admin/parallel/explain`・`/admin/parallel/jobs` → 撤廃。
+      GraphQL `explainDistributed` query（実ロジック移植・`AdminMutation`
+      から `AdminQuery` へ移設）と `parallelJobs` query に一本化。Tauri
+      2 コマンドを GraphQL へ。→ **`/admin/parallel*` は完全撤廃**。
+    - ✅ `/v1/keys/self-issue` → `Mutation.selfIssueKey`（認証ガード無し、
+      `VcsMutation`）へ移設。`build_schema` が `AdminCtx.keyring` と同一
+      `KeyGuardian` を schema data へ注入。REST ルート・ハンドラ削除。
+    - ⏳ `disaster_backup.email` reconcile 接続: config スキーマは
+      `EmailBackupTargetConfig` と同じ 7 フィールドへ拡張済み。reconcile
+      本体は `feature = "disaster_email_backup"` ゲート + `replicator`
+      注入の要否判断 + feature ゲート付きテストが必要な**別スライス**。
+    - ⏳ Tauri 設定タブ全体の `aruaru.yaml` 編集 UI 化。
 - **P3 B2/B3 の残り** ephemeral-query / multi-raft / sharded-store put/get /
   closed-timestamp / wal-service を GraphQL query/mutation 化。対応 `/admin`
-  ルート削除。**`/v1/keys/self-issue` を `Mutation.selfIssueKey`（認証ガード
-  無し）へ移す。** Tauri/Android/web を GraphQL クライアントへ。
+  ルート削除。Tauri/Android/web を GraphQL クライアントへ。
 - **P4 `/admin` ルーター＋残る非 GraphQL HTTP を撤去**
   `admin::admin_routes` を撤去、`admin.rs` を GraphQL リゾルバのヘルパーだけに。
   **ノード間 `/raft/*`・side transport（`/closed-timestamp/receive|publish`）を

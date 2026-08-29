@@ -24,7 +24,6 @@ use aruaru_dist::admin_shared::{
     BackupScheduleState, FederatedSourceEntry, ParallelConfigState, SharedBackupSchedule,
     SharedFederatedSources, SharedParallelConfig,
 };
-use aruaru_query::parser::{self, Statement};
 use aruaru_query::{QueryEngine, QueryResponse, Value as SqlValue};
 use aruaru_registry::Registry;
 
@@ -304,7 +303,7 @@ fn check_admin_auth(
     if static_token.is_none() && keyring.count() == 0 {
         return Err((
             poem::http::StatusCode::SERVICE_UNAVAILABLE,
-            "admin API is not configured (set ARUARU_DB_ADMIN_TOKEN, or self-issue a key via POST /v1/keys/self-issue)",
+            "admin API is not configured (set ARUARU_DB_ADMIN_TOKEN, or self-issue a key via the GraphQL `selfIssueKey` mutation)",
         ));
     }
     Err((poem::http::StatusCode::UNAUTHORIZED, "invalid or missing x-admin-token header"))
@@ -421,14 +420,11 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         .at("/migrate/preview", post(migrate_preview))
         .at("/migrate/run", post(migrate_run))
         .at("/migrate/instance", post(migrate_instance))
-        // 【2026-08-29 再設計 P2】`GET/POST /admin/parallel`(設定の
-        // 読み書き)は撤廃。並列設定の正本は宣言的 `aruaru.yaml:
-        // query.parallel`(ホットリロード)、実効値の参照は GraphQL
-        // `parallelConfig` query。`/parallel/explain`・`/parallel/jobs`
-        // (プランの可視化・ジョブ一覧=観測系)は GraphQL 側リゾルバを
-        // 実データ化してから撤廃する(P3)。
-        .at("/parallel/explain", post(explain_distributed))
-        .at("/parallel/jobs", get(list_jobs))
+        // 【2026-08-29 再設計 P2/P3】`/admin/parallel*` は全撤廃。
+        // 設定 = 宣言的 `aruaru.yaml: query.parallel`(ホットリロード)、
+        // 実効値 = GraphQL `parallelConfig` query、
+        // 分散プラン = GraphQL `explainDistributed` query(実ロジック移植済み)、
+        // ジョブ一覧 = GraphQL `parallelJobs` query。
         .at("/federation", get(list_federation).post(register_federation))
         .at("/federation/test", post(federation_test))
         .at("/federation/drop", post(drop_federation))
@@ -725,87 +721,14 @@ fn migrate_instance(Json(req): Json<Value>) -> Json<Value> {
     }))
 }
 
-// ── ③ 分散並列化 ───────────────────────────────────────────────
+// ── ③ 分散並列化 ─────────────────────────────────────────────
 //
-// 【2026-08-29 再設計 P2】`get_parallel`/`set_parallel` は撤廃。
-// 並列設定の正本は宣言的 `aruaru.yaml: query.parallel`(`config::
-// reconcile` が `AdminState.parallel` へ反映)、実効値の参照は GraphQL
-// `parallelConfig` query。
-
-/// SQL から分散実行プラン (フラグメント列) を生成する。
-/// 集計を含めば ParallelScan→Shuffle→HashAggregate→Gather、
-/// 単純検索なら ParallelScan→Gather。並列度は設定値・行数から決める。
-///
-/// 【P2】設定は4フィールド(`enabled`/`max_workers`/`chunk_size`/
-/// `strategy`)へ簡素化された。`enabled=false` なら全段 parallelism=1、
-/// shuffle パーティション数は `max_workers*8` を既定ヒューリスティックと
-/// する(旧 `shuffle_partitions` 相当の明示設定は廃止)。
-#[handler]
-fn explain_distributed(state: Data<&Arc<AdminState>>, Json(req): Json<SqlRequest>) -> Json<Value> {
-    let cfg = state.parallel.lock().clone();
-    let kind = aruaru_query::classify_query(&req.sql);
-
-    // 対象テーブルと行数を推定
-    let table = match parser::parse(&req.sql) {
-        Ok(Statement::Select { table, .. }) => Some(table),
-        _ => None,
-    };
-    let rows = table
-        .as_ref()
-        .and_then(|t| state.engine.table_row_count(t))
-        .unwrap_or(0) as u64;
-    // 単一ノード。クラスタ化後に複数ノードへ分散する。
-    // 4フィールド設定へ簡素化: enabled=false なら parallelism=1。
-    let scan_par = if cfg.enabled { cfg.max_workers.min(8).max(1) } else { 1 };
-    // 旧 `shuffle_partitions` の明示設定は廃止。max_workers*8 を既定に。
-    let shuffle_partitions = if cfg.enabled { cfg.max_workers.saturating_mul(8).max(1) } else { 1 };
-
-    let mut frag_id = 0u32;
-    let mut next = || {
-        frag_id += 1;
-        frag_id
-    };
-
-    let mut fragments = vec![json!({
-        "id": next(),
-        "op": "ParallelScan",
-        "parallelism": scan_par,
-        "node_ids": [1],
-        "est_rows": rows,
-        "detail": format!("{} を Range 並列スキャン{}", table.clone().unwrap_or_else(|| "(table)".into()),
-            if cfg.enabled { format!(" (述語プッシュダウン, strategy={})", cfg.strategy) } else { " (並列実行無効)".into() }),
-    })];
-
-    if matches!(kind, aruaru_query::QueryKind::Olap) {
-        fragments.push(json!({
-            "id": next(), "op": "ShuffleExchange", "parallelism": shuffle_partitions,
-            "node_ids": [1], "est_rows": rows,
-            "detail": format!("ハッシュ再分配 ({} パーティション)", shuffle_partitions),
-        }));
-        fragments.push(json!({
-            "id": next(), "op": "HashAggregate",
-            "parallelism": scan_par,
-            "node_ids": [1], "est_rows": rows / 10 + 1,
-            "detail": "部分集計 → マージ (2段階集計)",
-        }));
-    }
-
-    fragments.push(json!({
-        "id": next(), "op": "Gather (Coordinator)", "parallelism": 1,
-        "node_ids": [1], "est_rows": rows / 10 + 1,
-        "detail": "全フラグメントの結果を集約",
-    }));
-
-    // プラン表示は「下から上」なので逆順に
-    fragments.reverse();
-    Json(json!({ "fragments": fragments, "query_kind": format!("{:?}", kind) }))
-}
-
-#[handler]
-fn list_jobs(_state: Data<&Arc<AdminState>>) -> Json<Value> {
-    // 組み込み単一ノードでは長時間ジョブの常駐管理は未実装。
-    Json(json!({ "jobs": [] }))
-}
+// 【2026-08-29 再設計 P2/P3】`/admin/parallel*` は全撤廃。
+//   設定       = 宣言的 `aruaru.yaml: query.parallel`
+//                (`config::reconcile` → `AdminState.parallel`、ホットリロード)
+//   実効値     = GraphQL `parallelConfig` query
+//   分散プラン = GraphQL `explainDistributed` query（実ロジック移植済み）
+//   ジョブ一覧 = GraphQL `parallelJobs` query
 
 // ── ④ 分散DB統合 (フェデレーション) ─────────────────────────────
 

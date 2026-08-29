@@ -181,14 +181,31 @@ pub struct ShardedStoreConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DisasterBackupConfig {
+    /// この宣言的設定を有効化するか（`feature = "disaster_email_backup"`
+    /// ビルドでのみ意味を持つ）。P3 で reconcile 接続予定。
+    #[allow(dead_code)]
+    pub enabled: bool,
+    #[allow(dead_code)]
     pub email: DisasterBackupEmail,
 }
 
+/// `open_raid_z_core::offsite_backup::EmailBackupTargetConfig` と同じ 7
+/// フィールド（`aruaru.yaml` に正直に全項目を出す）。`${VAR}` 展開で
+/// SMTP パスワードは環境変数名を渡す設計（値そのものは書かない）。
+/// P3 で `config::reconcile` の feature ゲート付き分岐が消費する。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[allow(dead_code)]
 pub struct DisasterBackupEmail {
-    pub to: Option<String>,
-    pub smtp: Option<String>,
+    pub smtp_host: Option<String>,
+    pub smtp_port: Option<u16>,
+    pub smtp_username: Option<String>,
+    /// SMTP パスワードが入っている**環境変数名**（値ではない）。
+    pub smtp_password_env: Option<String>,
+    pub from_address: Option<String>,
+    pub to_address: Option<String>,
+    #[serde(default)]
+    pub allow_plaintext_for_testing: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

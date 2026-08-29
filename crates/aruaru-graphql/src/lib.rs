@@ -67,6 +67,17 @@ pub struct MutationResult {
     pub message: String,
 }
 
+/// 【2026-08-29 再設計 P3】APIキー自己発行の結果。旧 REST
+/// `POST /v1/keys/self-issue` の等価。認証ガードは掛けない
+/// (「認証不要で即発行できること自体が承認手続き」= SPIFFE 哲学。
+/// `docs/CONTROL_PLANE_REDESIGN.md` §2 原則 11)。
+#[derive(SimpleObject, Clone)]
+pub struct SelfIssuedKeyGql {
+    pub key: String,
+    pub role: String,
+    pub expires_in_hours: i32,
+}
+
 fn engine<'a>(ctx: &Context<'a>) -> Result<&'a Arc<QueryEngine>> {
     ctx.data::<Arc<QueryEngine>>()
         .map_err(|_| async_graphql::Error::new("QueryEngine not in context"))
@@ -170,6 +181,20 @@ impl VcsMutation {
         }
         Ok(MutationResult { success: true, commit_id, message: "ok".into() })
     }
+
+    /// 【2026-08-29 再設計 P3】旧 REST `POST /v1/keys/self-issue` の等価。
+    /// **認証不要**(このリゾルバだけは admin トークンを要求しない)。
+    /// `viewer` ロール・既定 24h TTL の短命キーを即発行する。より強い権限は
+    /// `ARUARU_DB_ADMIN_TOKEN` か、管理者が `revokeKeys` で失効させた上で
+    /// 別途発行する。`KeyGuardian` が schema data に無い構成では失敗する。
+    async fn self_issue_key(&self, ctx: &Context<'_>) -> Result<SelfIssuedKeyGql> {
+        let keyring = ctx
+            .data::<Arc<aruaru_dist::keyring::KeyGuardian>>()
+            .map_err(|_| async_graphql::Error::new("self-issue is not configured on this server"))?;
+        let ttl_hours = aruaru_dist::keyring::DEFAULT_SELF_ISSUE_TTL_HOURS;
+        let key = keyring.issue("self-issued", "viewer", Some(chrono::Duration::hours(ttl_hours)));
+        Ok(SelfIssuedKeyGql { key, role: "viewer".into(), expires_in_hours: ttl_hours as i32 })
+    }
 }
 
 // ── 統合 Query / Mutation (MergedObject) ─────────────────────
@@ -193,7 +218,15 @@ fn builder() -> SchemaBuilder<QueryRoot, MutationRoot, EmptySubscription> {
 
 /// エンジンと管理状態を注入してスキーマを構築
 pub fn build_schema(engine: Arc<QueryEngine>, admin_ctx: AdminCtx) -> AruaruSchema {
-    builder().data(engine).data(admin_ctx).finish()
+    // 【2026-08-29 再設計 P3】`selfIssueKey`(認証不要 mutation)は
+    // `AdminCtx` ではなく schema data の `KeyGuardian` を直接引く
+    // (admin トークンを要求しないため)。`AdminCtx.keyring` と同一インスタンス。
+    let keyring = admin_ctx.keyring.clone();
+    let mut b = builder().data(engine).data(admin_ctx);
+    if let Some(k) = keyring {
+        b = b.data(k);
+    }
+    b.finish()
 }
 
 /// Federation SDL を出力 (wgc / hive CLI 用)

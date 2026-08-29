@@ -354,12 +354,8 @@ async fn main() -> anyhow::Result<()> {
     let gql_replicator = replicator.clone();
     let http_handle = tokio::spawn(async move {
         use poem::middleware::Cors;
-        use poem::{get, handler, listener::TcpListener, post, web::Data, EndpointExt, Route, Server};
+        use poem::{get, handler, listener::TcpListener, EndpointExt, Route, Server};
 
-        // `admin_state`は下の`.nest("/admin", admin::admin_routes(admin_state))`
-        // で消費(move)されるため、自己発行エンドポイント用にキー
-        // レジストリだけ先に複製しておく。
-        let keyring_for_self_issue = admin_state.keyring.clone();
         // GraphQL `keyStatus` query / `revokeKeys` mutation が参照する
         // KeyGuardian共有ハンドル(2026-08-29(続き)新設。続き4でREST
         // `/admin/keys/*`は撤廃し、GraphQLが唯一の管理経路になった)。
@@ -392,41 +388,15 @@ async fn main() -> anyhow::Result<()> {
             "ok"
         }
 
-        // 【2026-08-29新設】APIキー自動発行(自動承認込み)。認証を要求
-        // しない——「認証無しで即座に発行できる」こと自体が承認手続き
-        // そのもの(RPoemの`POST /api/keys/self-issue`と同じ設計、
-        // `keyring.rs`モジュールdoc参照)。そのため`/admin/*`配下
-        // (`admin::admin_routes`が全体を認証で包む)ではなく、この
-        // トップレベルRouteに直接登録する。発行するキーは既定で
-        // `viewer`ロール・24時間TTLに限定し、無制限の権限を無認証で
-        // 渡さない設計にした。
-        #[handler]
-        fn self_issue_key(
-            keyring: Data<&std::sync::Arc<aruaru_dist::keyring::KeyGuardian>>,
-        ) -> poem::web::Json<serde_json::Value> {
-            let key = keyring.issue(
-                "self-issued",
-                "viewer",
-                Some(chrono::Duration::hours(aruaru_dist::keyring::DEFAULT_SELF_ISSUE_TTL_HOURS)),
-            );
-            poem::web::Json(serde_json::json!({
-                "key": key,
-                "role": "viewer",
-                "expires_in_hours": aruaru_dist::keyring::DEFAULT_SELF_ISSUE_TTL_HOURS,
-                "note_ja": "このキーはviewerロール・24時間限定です。より強い権限が\
-                    必要な操作は、引き続きARUARU_DB_ADMIN_TOKENを使うか、\
-                    信頼できる管理者がGraphQL `revokeKeys` mutationで既存キーを\
-                    無効化した上で別途発行してください。",
-                "note_en": "This key is scoped to the viewer role and expires in 24h. \
-                    Operations requiring stronger privileges still need \
-                    ARUARU_DB_ADMIN_TOKEN, or a trusted admin issuing a \
-                    separate key."
-            }))
-        }
+        // 【2026-08-29 再設計 P3】APIキー自己発行の REST エンドポイント
+        // (`POST /v1/keys/self-issue`)は撤廃。GraphQL の**認証不要 mutation**
+        // `selfIssueKey`(`aruaru-graphql::VcsMutation`)へ移行済み。
+        // 「認証無しで即発行できること自体が承認手続き」という性質は
+        // mutation でもそのまま保てる。`KeyGuardian` は `build_schema` が
+        // `AdminCtx.keyring` と同一インスタンスを schema data へ渡す。
 
         let app = Route::new()
             .at("/healthz", get(healthz))
-            .at("/v1/keys/self-issue", post(self_issue_key).data(keyring_for_self_issue))
             .at("/graphql", aruaru_graphql::graphql_endpoint(
                 gql_engine.clone(),
                 aruaru_graphql::AdminCtx {
