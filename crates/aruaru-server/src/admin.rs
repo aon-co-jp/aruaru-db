@@ -474,14 +474,12 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         // Raft ノード間 RPC 受信エンドポイント
         .at("/raft/append", post(raft_append))
         .at("/raft/vote", post(raft_vote))
-        // 【2026-08-29新設】APIキー自動ライフサイクル管理。自己発行
-        // (`self_issue_key`)は認証不要のためこの`/admin/*`配下ではなく
-        // `main.rs`のトップレベルルート(`/v1/keys/self-issue`)に置く
-        // ——ここ(`/admin/keys/revoke`)は「発行済みキーの自動破棄」の
-        // みを扱うため、既存の`/admin/*`共通認証(静的トークンまたは
-        // 有効な発行済みキー)をそのまま要求してよい。
-        .at("/keys/revoke", post(revoke_key))
-        .at("/keys/status", get(keyring_status))
+        // 【2026-08-29(続き4)REST完全撤廃】APIキー自動ライフサイクル管理の
+        // 参照・破棄(旧 `GET /admin/keys/status`・`POST /admin/keys/revoke`)は
+        // GraphQL `keyStatus` query / `revokeKeys` mutation へ完全移行済み
+        // (object-table と同じ雛形。REST側にこれらのルートは持たない)。
+        // 自己発行 `self_issue_key` は認証不要のトップレベルルート
+        // `/v1/keys/self-issue`(`main.rs`)に残る——GraphQL等価は無い。
         .data(state.clone())
         .around(move |ep, req| {
             let state = state.clone();
@@ -494,25 +492,12 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         })
 }
 
-// ── APIキー自動ライフサイクル管理(2026-08-29新設) ──────────────
-
-#[derive(Deserialize)]
-struct RevokeKeyRequest {
-    owner: String,
-}
-
-/// 自動破棄: 指定オーナーが持つ全キーを即座に失効させる。
-#[handler]
-fn revoke_key(state: Data<&Arc<AdminState>>, Json(req): Json<RevokeKeyRequest>) -> Json<Value> {
-    let revoked = state.keyring.revoke_owner(&req.owner);
-    Json(json!({ "owner": req.owner, "revoked_count": revoked }))
-}
-
-/// 監視用: 現在登録されているキー件数(失効済み含む)。
-#[handler]
-fn keyring_status(state: Data<&Arc<AdminState>>) -> Json<Value> {
-    Json(json!({ "issued_key_count": state.keyring.count() }))
-}
+// ── APIキー自動ライフサイクル管理 ──────────────────────────────
+//
+// 【2026-08-29(続き4)REST完全撤廃】参照(`keyring_status`)・破棄
+// (`revoke_key`)はGraphQL `keyStatus` query / `revokeKeys` mutation
+// (`aruaru-graphql::admin_resolvers`)へ完全移行。共有インスタンスは
+// `aruaru_dist::keyring::KeyGuardian`(`AdminState.keyring`)のまま。
 
 // ── ① バックアップ ─────────────────────────────────────────────
 

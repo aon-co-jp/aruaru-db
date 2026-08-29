@@ -331,8 +331,9 @@ async fn main() -> anyhow::Result<()> {
         // で消費(move)されるため、自己発行エンドポイント用にキー
         // レジストリだけ先に複製しておく。
         let keyring_for_self_issue = admin_state.keyring.clone();
-        // GraphQL `keyStatus`/`revokeKeys`がREST `/admin/keys/*`と同じ
-        // KeyGuardianを参照するための共有ハンドル(2026-08-29(続き)新設)。
+        // GraphQL `keyStatus` query / `revokeKeys` mutation が参照する
+        // KeyGuardian共有ハンドル(2026-08-29(続き)新設。続き4でREST
+        // `/admin/keys/*`は撤廃し、GraphQLが唯一の管理経路になった)。
         let keyring_for_graphql = admin_state.keyring.clone();
         // GraphQL `clusterStatus`がREST `/admin/cluster`と同じトポロジを
         // 参照するための共有ハンドル(2026-08-29新設)。
@@ -381,7 +382,7 @@ async fn main() -> anyhow::Result<()> {
                 "expires_in_hours": aruaru_dist::keyring::DEFAULT_SELF_ISSUE_TTL_HOURS,
                 "note_ja": "このキーはviewerロール・24時間限定です。より強い権限が\
                     必要な操作は、引き続きARUARU_DB_ADMIN_TOKENを使うか、\
-                    信頼できる管理者がPOST /admin/keys/revokeで既存キーを\
+                    信頼できる管理者がGraphQL `revokeKeys` mutationで既存キーを\
                     無効化した上で別途発行してください。",
                 "note_en": "This key is scoped to the viewer role and expires in 24h. \
                     Operations requiring stronger privileges still need \

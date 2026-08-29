@@ -70,20 +70,30 @@
 >   `cargo test -p aruaru-graphql -p aruaru-server` 失敗0件で検証済み。
 >   時間旅行(スナップショット連鎖)= VersionlessAPI の核なので
 >   SET価値の直接強化と判断して選定(闇雲な代替ではない)。
-> - **重要な区別**: `clusterStatus`/`backupSchedule`/`keyStatus` は
->   **GraphQL実データ化のみで、対応するRESTルートはまだ消していない**
->   (`/admin/cluster` 等は現存)。「REST完全撤廃」を名乗れるのは今の
->   ところ `object-table` だけ。次はこの3つ(および下記候補)にも
->   `object-table` と同じ「GraphQLでパリティ達成 → `admin.rs` から
->   該当ルート削除」を適用してゆく。
+> - **RESTルート完全撤廃済み(2026-08-29 続き3/続き4)**: (1)
+>   `object-table`(`objectTable` query + `objectTableCommit`/
+>   `objectTablePrune` mutation。旧 `/admin/object-table*` 3ルート削除)、
+>   (2) `keys`(`keyStatus` query + `revokeKeys` mutation。旧
+>   `/admin/keys/status`・`/admin/keys/revoke` 削除。`/v1/keys/self-issue`
+>   は認証不要のトップレベルで存続——GraphQL等価無し)。いずれも
+>   grep で他クライアント(下記)の参照が無いことを確認してから削除。
+> - **ルート削除がまだできない「パリティ済み」組**: `clusterStatus`
+>   (`/admin/cluster`)・`backupSchedule`(`/admin/backup/schedule`)は
+>   GraphQL実データ化済みだが、**`admin/src-tauri/src/main.rs`(Tauri
+>   管理アプリ)・`android/.../MainActivity.kt`・`web/`(リバース
+>   プロキシ)が今もREST版を叩いている**。ルート削除の前にこれらの
+>   クライアントをGraphQLへ移す必要がある(この移行はユーザーに規模を
+>   共有してから着手)。`federation` も round-trip テスト済みだが
+>   Tauri アプリが `/admin/federation*` を使用。
 > - **今すぐ着手できる次の一手**: `multi-raft`(split/merge/
 >   scatter-query)・`sharded-store`・`closed-timestamp`・
 >   `wal-service`・`ephemeral-query` のうち1つを選び、**`object-table`
 >   と同じ手順**——(a) GraphQL query/mutation を新設しREST版と
 >   同じバリデーション・戻り値にする、(b) `AdminCtx` へ既存の
->   `Arc<..>` を注入(`*_handle()` アクセサを足す)、(c) `admin.rs`
->   から該当RESTルート・ハンドラ・リクエスト構造体を削除、(d)
->   `cargo test -p aruaru-graphql -p aruaru-server`。
+>   `Arc<..>` を注入(`*_handle()` アクセサを足す)、(c) grep で
+>   Tauri/Android/web クライアントが該当RESTを使っていないことを確認、
+>   (d) `admin.rs` から該当RESTルート・ハンドラ・リクエスト構造体を
+>   削除、(e) `cargo test -p aruaru-graphql -p aruaru-server`。
 >   ——**着手前に必ず「これはaruaru-db+RPoem SETとしての価値
 >   (SCIM/SSO相当・APIキー自動管理・VersionlessAPI互換)を強化
 >   するか」を自問すること**(闇雲な代替を避けるため)。
@@ -95,8 +105,9 @@
 >   `crawlRegistry`/`testRegistryConnection`はGraphQL側で既に実データ
 >   接続済み。
 > - 詳細な実装内容・検証ログは本ファイル内「HANDOFF追記(2026-08-29
->   〜続き3)」の4エントリを参照(続き3=`object-table`の初のREST
->   ルート完全撤廃)。
+>   〜続き4)」の5エントリを参照(続き3=`object-table`の初のREST
+>   ルート完全撤廃、続き4=`keys`のREST撤廃+撤廃可否のクライアント
+>   調査)。
 
 > **📌 2026-08-26追記: Windows用インストーラー`aruaru-db-installer.exe`を
 > 新設(命名規則統一)**: ユーザー指示「パワーシェルでインストールする
@@ -4153,8 +4164,9 @@ open-english側のユーザー指示「関連リポジトリのセキュリテ�
   既定24時間TTLのキーを即座に発行する。
 - **自動承認**: 「認証を要求せず即座に発行できる」こと自体が承認手続き
   そのもの——人間の承認待ちキューは存在しない。
-- **自動破棄**: `POST /admin/keys/revoke`(`{owner}`指定)で特定オーナー
-  の全キーを即座に失効。
+- **自動破棄**: GraphQL `revokeKeys(owner: "...")` mutation で特定オーナー
+  の全キーを即座に失効(2026-08-29続き4でREST `POST /admin/keys/revoke`
+  は撤廃、GraphQLが唯一の経路)。
 - **自動削除**: 期限切れキーは`verify()`実行時に検知されその場で
   レジストリから削除される(明示的なcronジョブ不要)。
 - 既存の`ARUARU_DB_ADMIN_TOKEN`静的トークンとは**完全に後方互換**
@@ -4493,3 +4505,40 @@ RESTホップ無しでfederation GraphQLサーフェスに載る」こと。
   `backupSchedule`/`keyStatus`)も、パリティは済んでいるので
   `admin.rs`からのルート削除だけ実施すればREST撤廃が完了する。
   `parallel_config`はスキーマ非互換のため引き続き保留(ユーザー確認前)。
+
+## HANDOFF追記(2026-08-29続き4) REST→GraphQL段階移行の第五歩
+(`keys`=2つ目の「RESTルート完全撤廃」+ 他エンドポイント撤廃可否の調査)
+
+**実装**: `object-table`(続き3)と同じ雛形を`keys`へ適用。
+- `crates/aruaru-server/src/admin.rs`: `.at("/keys/revoke" ...)`・
+  `.at("/keys/status" ...)`の2ルート、`revoke_key`/`keyring_status`の
+  2ハンドラ、`RevokeKeyRequest`構造体を削除。参照・破棄はGraphQL
+  `keyStatus` query / `revokeKeys` mutation(続き2で新設済み、パリティ
+  検証済み)が唯一の経路になった。認証(`check_admin_auth`が
+  `state.keyring`で発行済みキーを検証)は無変更。
+- `crates/aruaru-server/src/main.rs`: 自己発行APIの`note_ja`と
+  コメントの`POST /admin/keys/revoke`表記を`revokeKeys` mutationへ更新。
+  `/v1/keys/self-issue`(認証不要トップレベル、GraphQL等価無し)は存続。
+- `CLAUDE.md`: APIキー管理節の「自動破棄」を更新。
+
+**検証(実測)**: `cargo test -p aruaru-graphql -p aruaru-server`
+失敗0件(`aruaru-graphql` 10・`aruaru-server` 3+1ignored、続き3から
+テスト数不変=リグレッション無し)。既存警告のみ
+(`ephemeral_pod.rs`の`super::*`、`build_cluster`/`propose_commit`、無関係)。
+
+**撤廃可否のクライアント調査(重要)**: `clusterStatus`/`backupSchedule`/
+`federatedSources`もGraphQLパリティ済みだが、**`admin/src-tauri/src/
+main.rs`(Tauri管理アプリ)・`android/app/src/main/java/tokyo/runo/
+aruarudb/MainActivity.kt`・`web/`(リバースプロキシ)が今もREST
+`/admin/cluster`・`/admin/backup/schedule`・`/admin/federation*`を
+叩いている**ことをgrepで確認。これらのRESTルート削除は、先に
+Tauri/Android/webクライアントをGraphQLへ移行してから行う必要がある
+(この移行はユーザーに規模を共有してから着手)。`object-table`と`keys`が
+安全に撤廃できたのは、grepで他クライアントの参照が皆無だったため。
+
+- 次にすべきこと: (1) `multi-raft`/`sharded-store`/`closed-timestamp`/
+  `wal-service`/`ephemeral-query`のうち1つを、**着手前にgrepで
+  Tauri/Android/webの参照が無いことを確認した上で**、object-table雛形の
+  5手順で撤廃、(2) Tauri/Android/webクライアントのGraphQL移行計画を
+  ユーザーへ提示(これが済めば`cluster`/`backup/schedule`/`federation`も
+  撤廃可能)、(3) `parallel_config`はスキーマ非互換のため引き続き保留。
