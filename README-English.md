@@ -1,6 +1,10 @@
 # aruaru-DB 🦀
 
-> **Updated 2026-08-29**: Added automatic API-key lifecycle management
+> **Updated 2026-08-29**: aruaru-db is designed to be used **as a SET
+> (paired) with RPoem** — only together do they deliver "no REST API
+> needed, compatible with WunderGraph Cosmo's paid Enterprise tier"
+> (see the pinned top-of-file note in `CLAUDE.md`). Added automatic
+> API-key lifecycle management
 > (self-issue / self-approve / self-revoke / self-expire, an independent
 > reimplementation of RPoem's `KeyGuardian` design — no direct Cargo
 > dependency between the two repos), removed REST entirely from

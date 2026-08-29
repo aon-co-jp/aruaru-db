@@ -1,5 +1,14 @@
 //! `KeyGuardian` — aruaru-db専用のAPIキー自動ライフサイクル管理。
 //!
+//! 【2026-08-29(続き)移設】元々`aruaru-server`クレート内に実装していたが、
+//! GraphQL側(`aruaru-graphql::admin_resolvers`)から`keys`(revoke/status)
+//! 操作をREST実データへ接続するには、REST(`aruaru-server::admin::
+//! AdminState`)とGraphQL(`AdminCtx`)の両方が同一の`KeyGuardian`
+//! インスタンスを参照できる必要がある。両クレートとも依存できる
+//! `aruaru-dist`(`admin_shared.rs`の`ClusterTopology`共有と同じ理由)
+//! へ移設し、`aruaru-server`側は`aruaru_dist::keyring::KeyGuardian`を
+//! 再利用する形に変更した。ロジック自体は無変更(ファイル移動のみ)。
+//!
 //! ユーザー指示(2026-08-29、open-english経由)「aruaru-dbとの連携を
 //! 強化し、特にREST APIを不要にして。APIキーを自動管理で、自動発行・
 //! 自動承認・自動破棄・自動削除」への対応。
