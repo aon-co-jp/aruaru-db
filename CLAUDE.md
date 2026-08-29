@@ -58,6 +58,27 @@
 > ### 🔄 セッション再開用メモ(2026-08-29時点、別アカウント/別セッション
 > からでもここだけ読めば続きから着手できるようにするための要約)
 >
+> - **🚨 方針転換(2026-08-29 続き5)= 管理面の抜本再設計に移行**:
+>   「REST を1本ずつ GraphQL mutation へ移す」だけでは
+>   **アンチパターン(稼働中プロセスの生状態をフィールド単位で
+>   ライブ書き換え)の移送にすぎない**、というユーザー指摘を受け、
+>   WunderGraph Cosmo の一次資料を再調査。**正本の設計文書を新設した:
+>   [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md)**。
+>   以後、管理面に触れる者はまずこの文書を読むこと。要点:
+>   (1) データプレーン(`aruaru-server`)の HTTP は `/graphql`・
+>   `/health*`・`/metrics`・`/v1/keys/self-issue`・内部`/raft/*`のみ、
+>   **`/admin/*` は全廃**、(2) 運用設定は**宣言的ドキュメント
+>   `aruaru.yaml` + ホットリロード**(実行時ミューテーション廃止)、
+>   (3) 一度きりのアクションのみ GraphQL Mutation、(4) 観測は
+>   GraphQL Query + Prometheus、(5) コントロールプレーンは RPoem 側
+>   (`open-runo-schema-registry` 等)。フェーズは文書 §8(P0=済、
+>   **次は P1=宣言的設定基盤 `aruaru-server::config`**)。
+>   ユーザー選択: 「全バケツを一気に再設計・再実装(複数セッション)」。
+> - **`parallel_config` の扱い(旧「保留」を解消)**: ユーザー判断で
+>   「GraphQL の4フィールド(enabled/max_workers/chunk_size/strategy)を
+>   正とし REST 側をそこへ寄せる」に決定。再設計では B1(宣言的設定)
+>   として `aruaru.yaml: query.parallel` へ移す(P2)。もう保留ではない。
+> - 以下は続き3/4までの経緯(再設計の P2〜P4 に吸収される):
 > - **直近の到達点**(`git log --oneline`で確認可): `backupSchedule`/
 >   `federatedSources`/`keyStatus`/`revokeKeys` をREST実データへ接続
 >   (第1〜3歩)。**第4歩(2026-08-29 続き3)= `object-table` を
@@ -85,29 +106,22 @@
 >   クライアントをGraphQLへ移す必要がある(この移行はユーザーに規模を
 >   共有してから着手)。`federation` も round-trip テスト済みだが
 >   Tauri アプリが `/admin/federation*` を使用。
-> - **今すぐ着手できる次の一手**: `multi-raft`(split/merge/
->   scatter-query)・`sharded-store`・`closed-timestamp`・
->   `wal-service`・`ephemeral-query` のうち1つを選び、**`object-table`
->   と同じ手順**——(a) GraphQL query/mutation を新設しREST版と
->   同じバリデーション・戻り値にする、(b) `AdminCtx` へ既存の
->   `Arc<..>` を注入(`*_handle()` アクセサを足す)、(c) grep で
->   Tauri/Android/web クライアントが該当RESTを使っていないことを確認、
->   (d) `admin.rs` から該当RESTルート・ハンドラ・リクエスト構造体を
->   削除、(e) `cargo test -p aruaru-graphql -p aruaru-server`。
->   ——**着手前に必ず「これはaruaru-db+RPoem SETとしての価値
->   (SCIM/SSO相当・APIキー自動管理・VersionlessAPI互換)を強化
->   するか」を自問すること**(闇雲な代替を避けるため)。
-> - **意図的に保留中(着手不要)**: `parallel_config`はREST実体
->   (`max_parallelism`等7フィールド)とGraphQLスキーマ
->   (`enabled`/`max_workers`等4フィールド)が非互換なため、
->   スキーマ自体の破壊的変更をユーザーへ確認するまで着手しないこと。
+>   これらは既に「REST完全撤廃済み」で、再設計後もそのまま
+>   (`object-table`=B2/B3、`keys`=B2/B3 相当)。
+> - **今すぐ着手できる次の一手 = P1(宣言的設定基盤)**:
+>   [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md) §5〜§8。
+>   `crates/aruaru-server/src/config/`(`mod.rs`=`AruaruConfig` serde +
+>   `load()` + `${VAR}`展開、`watch.rs`=`notify` + `SIGHUP`〈`cfg(unix)`〉、
+>   `reconcile.rs`=動的セクションの差分を `AdminState` の各
+>   `Arc<Mutex<..>>` へ適用)を新設し、`--config <path>` フラグを追加。
+>   既存の CLI フラグは互換維持(config 未指定なら従来どおり)。
+>   新規依存: `notify`(ファイル監視)、YAML パーサ(`serde_yml` か
+>   `serde_norway`。`serde_yaml` は非推奨なので使わない)。
 > - **既に完了済み(「未着手」と誤解しないこと)**: `registry`の
 >   `crawlRegistry`/`testRegistryConnection`はGraphQL側で既に実データ
->   接続済み。
-> - 詳細な実装内容・検証ログは本ファイル内「HANDOFF追記(2026-08-29
->   〜続き4)」の5エントリを参照(続き3=`object-table`の初のREST
->   ルート完全撤廃、続き4=`keys`のREST撤廃+撤廃可否のクライアント
->   調査)。
+>   接続済み(再設計では B2/B3)。
+> - 続き3/4 の詳細は本ファイル内「HANDOFF追記(2026-08-29〜続き5)」を
+>   参照。再設計そのものの正本は `docs/CONTROL_PLANE_REDESIGN.md`。
 
 > **📌 2026-08-26追記: Windows用インストーラー`aruaru-db-installer.exe`を
 > 新設(命名規則統一)**: ユーザー指示「パワーシェルでインストールする
@@ -4542,3 +4556,43 @@ Tauri/Android/webクライアントをGraphQLへ移行してから行う必要�
   5手順で撤廃、(2) Tauri/Android/webクライアントのGraphQL移行計画を
   ユーザーへ提示(これが済めば`cluster`/`backup/schedule`/`federation`も
   撤廃可能)、(3) `parallel_config`はスキーマ非互換のため引き続き保留。
+
+## HANDOFF追記(2026-08-29続き5) 方針転換: 管理面の抜本再設計へ
+
+**経緯**: 続き3(`object-table`)・続き4(`keys`)で「REST ルート完全撤廃」の
+雛形を作ったが、ユーザーから「削るだけ／GraphQL mutation に置換するだけでは
+抜本的解決になっていない。設計思想・設計哲学から一から再設計・再開発して」
+との指示。WunderGraph Cosmo の一次資料(router configuration / overview /
+enterprise)を再調査した結果:
+
+- Cosmo のデータプレーン(Router)が公開する HTTP は `/graphql`・`/health*`・
+  `/metrics`・Playground のみ。**管理用 REST は存在しない**。
+- 運用設定 = 静的 YAML 1枚 + 動的 execution config(CDN/コントロールプレーン
+  からポーリング取得)+ ホットリロード(SIGHUP / watch_config)。
+- 管理アクションは別コンポーネント(Control Plane / Platform API)を
+  `wgc` CLI・Studio が叩く。データプレーンには載せない。
+
+→ aruaru-db の `/admin/*`(約40本)を「実行時ミューテーションで設定管理」
+している構造そのものがアンチパターン。プロトコルを REST→GraphQL に
+変えても本質は変わらない。
+
+**成果物**: 正本の設計文書 **`docs/CONTROL_PLANE_REDESIGN.md`** を新設。
+設計哲学(8原則)・目標 HTTP 面・`/admin/*` 全エンドポイントの 4バケツ
+仕分け(B1 宣言的設定 / B2 一度きりのアクション / B3 観測リード /
+B4 ノード間RPC)・`aruaru.yaml` スキーマ案・ホットリロード機構・
+クライアント(Tauri/Android/web)移行計画・フェーズ P0〜P6・
+影響リポジトリ・却下案 を記載。
+
+**ユーザー選択**: 「全バケツを一気に再設計・再実装(複数セッション)」。
+**P0(設計確定)は完了**。次は **P1 = 宣言的設定基盤**
+(`crates/aruaru-server/src/config/`: load + watch + reconcile、
+`--config` フラグ、新規依存 `notify` + YAML パーサ)。
+
+**parallel_config**: 旧「保留」を解消。ユーザー判断で「GraphQL の4
+フィールド(enabled/max_workers/chunk_size/strategy)を正とし REST を
+そこへ寄せる」に決定 → 再設計では B1 として `aruaru.yaml: query.parallel`
+へ(P2)。
+
+**この回のコード変更**: 無し(設計文書 + CLAUDE.md のみ)。続き5の
+着手途中で作った `aruaru-dist::admin_shared::ParallelConfigState` 等の
+編集は、再設計の方向と合わないため `git checkout` で破棄済み。
