@@ -44,6 +44,16 @@
 >   `keyStatus`/`revokeKeys`が実データへ接続済み、詳細は下記HANDOFF
 >   参照)。**次に何か実装する前に、まずこの3点(SET連携・Cosmo
 >   本体はOSS・闇雲な代替を避ける)を再確認すること。**
+> - **【2026-08-29ユーザー補足・今後の見直し予定】open-cuda/open-directx
+>   は現時点ではこのSET連携方針の対象外(HTTP面を持たないため)だが、
+>   これは恒久的な結論ではなく今この瞬間だけの暫定判断である**——
+>   今後open-directxのDirectX互換実装・開発が進み、**OSレベルから
+>   アプリへ直接命令する、あるいはアプリがハードウェアアクセラレーター
+>   (open-directx/open-cpu)経由で動作した方がメリットが大きくなる場面
+>   が増えていく**という予測がある。そうなれば「aruaru-db+RPoem」の
+>   SETに、open-cuda・aruaru-llm・open-web-serverを含めた連携強化の
+>   検討が実際に必要になる可能性が高い(open-cuda/open-directx/
+>   README-English.md・CLAUDE.md/CLAUDE-English.mdに同内容を記録済み)。
 >
 > ### 🔄 セッション再開用メモ(2026-08-29時点、別アカウント/別セッション
 > からでもここだけ読めば続きから着手できるようにするための要約)

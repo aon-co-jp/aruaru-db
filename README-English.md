@@ -19,6 +19,12 @@
 > unconnected: their GraphQL schema shape doesn't match the REST
 > `ParallelConfig` fields at all, and a lossy/misleading mapping was
 > avoided on purpose. See `CLAUDE.md`'s HANDOFF entries for that date.
+> Also note: `open-cuda`/`open-directx` are currently out of scope for
+> this SET policy (no HTTP surface), but this is a provisional call
+> for right now, not permanent — if `open-directx`'s DirectX
+> compatibility work matures and OS-level/hardware-accelerator
+> execution paths (`open-directx`/`open-cpu`) become more advantageous
+> for apps, re-evaluate whether they should join this SET.
 
 > 📌 Pending task (2026-08-06): a plan exists to incorporate Toshiba SBM / DeepSeek techniques. See [CLAUDE.md](CLAUDE.md) for details.
 
