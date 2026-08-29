@@ -243,26 +243,37 @@ async fn migrate_instance(
 }
 
 // ── ③ 分散並列化 ───────────────────────────────────────────────
+//
+// 【2026-08-29 再設計 P2 / docs/CONTROL_PLANE_REDESIGN.md】並列設定は
+// サーバ側の宣言的 `aruaru.yaml: query.parallel`(ホットリロード)が正本に
+// なった。REST `GET/POST /admin/parallel` は撤廃。
+// - 参照(`get_parallel_config`)は GraphQL `parallelConfig` query へ。
+// - 書き込み(`set_parallel_config`)はクライアントからは行わない
+//   (サーバの `aruaru.yaml` を編集 → ホットリロード)。この command は
+//   フロントの後方互換のために残し、その旨を返す。
 
+/// GraphQL と同じ4フィールド(旧7フィールドから簡素化)。
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ParallelConfig {
-    pub max_parallelism: u32,         // クエリあたり最大並列度
-    pub worker_threads_per_node: u32, // ノードあたりワーカースレッド
-    pub enable_parallel_scan: bool,
-    pub enable_parallel_aggregate: bool,
-    pub enable_shuffle_join: bool,
-    pub shuffle_partitions: u32,      // シャッフル分割数
-    pub broadcast_threshold_mb: u32,  // これ以下は broadcast join
+    pub enabled: bool,
+    pub max_workers: u32,
+    pub chunk_size: u32,
+    pub strategy: String, // "hash" | "range"
 }
 
 #[tauri::command]
 async fn get_parallel_config(base_url: String) -> Result<Value, String> {
-    admin_get(&base_url, "/admin/parallel").await
+    let q = r#"query { parallelConfig { enabled maxWorkers chunkSize strategy } }"#;
+    let r = graphql_query(q.to_string(), None, format!("{base_url}/graphql")).await?;
+    Ok(r["data"]["parallelConfig"].clone())
 }
 
 #[tauri::command]
-async fn set_parallel_config(base_url: String, config: ParallelConfig) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/parallel", serde_json::to_value(config).unwrap()).await
+async fn set_parallel_config(_base_url: String, _config: ParallelConfig) -> Result<Value, String> {
+    Err("並列設定はサーバの aruaru.yaml (query.parallel) で管理します。\
+         ファイルを編集して保存すると自動的にホットリロードされます。\
+         (REST /admin/parallel は 2026-08-29 の再設計で撤廃されました)"
+        .to_string())
 }
 
 /// 分散実行プラン (どのフラグメントがどのノードで並列に走るか) を取得

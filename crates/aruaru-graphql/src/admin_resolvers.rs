@@ -45,6 +45,10 @@ pub struct AdminCtx {
     /// 共有するフェデレーションソース一覧。`federated_sources`が常に
     /// 空配列を返していたギャップの解消。
     pub federation: Option<aruaru_dist::admin_shared::SharedFederatedSources>,
+    /// 【2026-08-29 再設計 P2】`AdminState.parallel` と同一インスタンス。
+    /// `parallelConfig` query が `aruaru.yaml: query.parallel` の実効値を
+    /// 返すために使う(`setParallelConfig` は撤廃済み)。
+    pub parallel: Option<aruaru_dist::admin_shared::SharedParallelConfig>,
     /// 【2026-08-29(続き)新設】REST(`AdminState.keyring`)と同一インスタンス
     /// を共有するAPIキー自動ライフサイクル管理(`aruaru_dist::keyring::
     /// KeyGuardian`)。`keyStatus`/`revokeKeys`から実際に発行済みキー数の
@@ -163,13 +167,9 @@ pub struct ObjectBlockInput {
     pub bloom: Vec<ObjectBlockBloomInput>,
 }
 
-#[derive(InputObject)]
-pub struct ParallelConfigInput {
-    pub enabled: bool,
-    pub max_workers: i32,
-    pub chunk_size: i32,
-    pub strategy: String,
-}
+// `ParallelConfigInput` は撤廃(2026-08-29 再設計 P2)。並列設定の正本は
+// 宣言的 `aruaru.yaml: query.parallel` で、実行時ミューテーション
+// (`setParallelConfig`)は持たない。実効値の参照は `parallelConfig` query。
 
 #[derive(InputObject)]
 pub struct MigrateInput {
@@ -333,27 +333,23 @@ impl AdminQuery {
 
     // ── 並列実行 ────────────────────────────────────────────
 
-    /// 【2026-08-29時点、正直な既知の制約】REST側の実`ParallelConfig`
-    /// (`max_parallelism`/`worker_threads_per_node`/`enable_parallel_scan`
-    /// /`enable_parallel_aggregate`/`enable_shuffle_join`/
-    /// `shuffle_partitions`/`broadcast_threshold_mb`)と、この
-    /// `ParallelConfigGql`スキーマ(`enabled`/`max_workers`/`chunk_size`/
-    /// `strategy`)は**フィールド形状そのものが異なる**——`cluster_status`
-    /// や`backup_schedule`のような1:1の接続ができない。GraphQL
-    /// スキーマを変更する(破壊的変更)か、意味の薄い変換
-    /// (例: `max_workers = max_parallelism`、`chunk_size`に
-    /// `broadcast_threshold_mb`を無理に流用する等)で誤魔化すかの
-    /// 二択になるため、後者は行わず**固定値スタブのまま**にする
-    /// ことを選んだ(実データに見せかけて実は無関係な値、という状態は
-    /// 誤解を招くため)。次にこの箇所へ着手する場合は、GraphQL
-    /// スキーマ自体をREST実体に合わせて再設計すること。
+    /// 【2026-08-29 再設計 P2】固定値スタブを廃止し、`AdminState.parallel`
+    /// (= `aruaru.yaml: query.parallel` を `config::reconcile` が反映した
+    /// 4フィールド共有型)の**実効値**を返す。設定の書き込みは宣言的
+    /// `aruaru.yaml` が正本のため、対応する `setParallelConfig` mutation
+    /// は撤廃した(この query は読み取り専用の観測系)。
     async fn parallel_config(&self, ctx: &Context<'_>) -> Result<ParallelConfigGql> {
-        require_admin_token(ctx)?;
+        let a = admin(ctx)?;
+        let cur = a
+            .parallel
+            .as_ref()
+            .map(|h| h.lock().clone())
+            .unwrap_or_default();
         Ok(ParallelConfigGql {
-            enabled: false,
-            max_workers: 4,
-            chunk_size: 10_000,
-            strategy: "hash".into(),
+            enabled: cur.enabled,
+            max_workers: cur.max_workers as i32,
+            chunk_size: cur.chunk_size as i32,
+            strategy: cur.strategy,
         })
     }
 
@@ -772,20 +768,9 @@ impl AdminMutation {
     }
 
     // ── 並列実行 ────────────────────────────────────────────
-
-    async fn set_parallel_config(
-        &self,
-        ctx: &Context<'_>,
-        config: ParallelConfigInput,
-    ) -> Result<ParallelConfigGql> {
-        require_admin_token(ctx)?;
-        Ok(ParallelConfigGql {
-            enabled: config.enabled,
-            max_workers: config.max_workers,
-            chunk_size: config.chunk_size,
-            strategy: config.strategy,
-        })
-    }
+    // `setParallelConfig` mutation は撤廃(2026-08-29 再設計 P2)。並列
+    // 設定は宣言的 `aruaru.yaml: query.parallel` が正本(ホットリロード)。
+    // 実効値は `Query.parallelConfig` で参照する。
 
     async fn explain_distributed(
         &self,
@@ -1066,6 +1051,9 @@ mod cluster_propose_tests {
             ))),
             schedule: Some(Arc::new(parking_lot::Mutex::new(None))),
             federation: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
+            parallel: Some(Arc::new(parking_lot::Mutex::new(
+                aruaru_dist::admin_shared::ParallelConfigState::default(),
+            ))),
             keyring: Some(Arc::new(aruaru_dist::keyring::KeyGuardian::new())),
             object_table: Some(Arc::new(aruaru_backup::table_format::ObjectTable::new(
                 Arc::new(aruaru_backup::table_format::InMemoryObjectStore::new()),
@@ -1409,5 +1397,48 @@ mod cluster_propose_tests {
             "errors: {:?}",
             resp.errors
         );
+    }
+
+    // ── 2026-08-29 再設計 P2: parallelConfig query が AdminState.parallel
+    // (= aruaru.yaml: query.parallel の実効値)を返す。固定値スタブではない ──
+    #[tokio::test]
+    async fn parallel_config_query_returns_shared_state_not_a_stub() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let ctx = admin_ctx(engine.clone(), None);
+        let shared = ctx.parallel.clone().unwrap();
+        let schema = build_schema(engine.clone(), ctx);
+
+        // 既定値。
+        let resp = schema
+            .execute(authorized_request(
+                "query { parallelConfig { enabled maxWorkers chunkSize strategy } }",
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let d = resp.data.into_json().unwrap();
+        assert_eq!(d["parallelConfig"]["enabled"], false);
+        assert_eq!(d["parallelConfig"]["maxWorkers"], 4);
+
+        // config::reconcile 相当(共有状態を書き換え)→ query に即反映。
+        {
+            let mut cur = shared.lock();
+            cur.enabled = true;
+            cur.max_workers = 24;
+            cur.chunk_size = 2000;
+            cur.strategy = "range".into();
+        }
+        let resp = schema
+            .execute(authorized_request(
+                "query { parallelConfig { enabled maxWorkers chunkSize strategy } }",
+            ))
+            .await;
+        let d = resp.data.into_json().unwrap();
+        assert_eq!(d["parallelConfig"]["enabled"], true);
+        assert_eq!(d["parallelConfig"]["maxWorkers"], 24);
+        assert_eq!(d["parallelConfig"]["chunkSize"], 2000);
+        assert_eq!(d["parallelConfig"]["strategy"], "range");
     }
 }

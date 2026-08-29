@@ -20,7 +20,10 @@ use poem::{get, handler, post, web::Data, web::Json, Endpoint, EndpointExt, Requ
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use aruaru_dist::admin_shared::{BackupScheduleState, FederatedSourceEntry, SharedBackupSchedule, SharedFederatedSources};
+use aruaru_dist::admin_shared::{
+    BackupScheduleState, FederatedSourceEntry, ParallelConfigState, SharedBackupSchedule,
+    SharedFederatedSources, SharedParallelConfig,
+};
 use aruaru_query::parser::{self, Statement};
 use aruaru_query::{QueryEngine, QueryResponse, Value as SqlValue};
 use aruaru_registry::Registry;
@@ -37,7 +40,12 @@ pub struct AdminState {
     /// 共有型を使い、GraphQL側(`AdminCtx.schedule`)へ`schedule_handle()`
     /// 経由で同一インスタンスを渡す(`topology`と同じパターン)。
     schedule: SharedBackupSchedule,
-    parallel: Mutex<ParallelConfig>,
+    /// 【2026-08-29 再設計 P2】7フィールドの独自 `ParallelConfig` を廃し、
+    /// GraphQL と同じ4フィールドの共有型(`aruaru_dist::admin_shared::
+    /// ParallelConfigState`)へ統一。正本は `aruaru.yaml: query.parallel`
+    /// で、`config::reconcile` がここへ書き込み、GraphQL `parallelConfig`
+    /// query と `explain_distributed` がここを読む。
+    parallel: SharedParallelConfig,
     /// 【2026-08-29改修】同上、`federation_handle()`経由でGraphQL
     /// (`AdminCtx.federation`)と共有する。
     federation: SharedFederatedSources,
@@ -120,7 +128,7 @@ impl AdminState {
             registry,
             backups: Mutex::new(Vec::new()),
             schedule: Arc::new(Mutex::new(None)),
-            parallel: Mutex::new(ParallelConfig::default()),
+            parallel: Arc::new(Mutex::new(ParallelConfigState::default())),
             federation: Arc::new(Mutex::new(Vec::new())),
             topology: Arc::new(Mutex::new(aruaru_dist::ClusterTopology::single_node(1, "127.0.0.1:5432"))),
             cluster: Mutex::new(None),
@@ -201,6 +209,14 @@ impl AdminState {
     pub fn federation_handle(&self) -> SharedFederatedSources {
         self.federation.clone()
     }
+
+    /// 【2026-08-29 再設計 P2】並列実行設定(4フィールド共有型)への
+    /// アクセサ。`config::reconcile`(`aruaru.yaml: query.parallel`)と
+    /// GraphQL(`AdminCtx.parallel`)へ同一インスタンスを渡す。
+    pub fn parallel_handle(&self) -> SharedParallelConfig {
+        self.parallel.clone()
+    }
+
 
     /// 【2026-08-29(続き3)新設】GraphQL側(`AdminCtx.object_table`)へ
     /// Databend方式オブジェクトテーブル(`aruaru-backup::table_format::
@@ -316,30 +332,11 @@ struct BackupManifest {
 // へ統合済み(2026-08-29)——REST/GraphQL両方が同じ構造体・同じ
 // `Arc<Mutex<..>>`インスタンスを参照する。
 
-#[derive(Clone, Serialize, Deserialize)]
-struct ParallelConfig {
-    max_parallelism: u32,
-    worker_threads_per_node: u32,
-    enable_parallel_scan: bool,
-    enable_parallel_aggregate: bool,
-    enable_shuffle_join: bool,
-    shuffle_partitions: u32,
-    broadcast_threshold_mb: u32,
-}
-
-impl Default for ParallelConfig {
-    fn default() -> Self {
-        Self {
-            max_parallelism: 8,
-            worker_threads_per_node: 4,
-            enable_parallel_scan: true,
-            enable_parallel_aggregate: true,
-            enable_shuffle_join: true,
-            shuffle_partitions: 64,
-            broadcast_threshold_mb: 32,
-        }
-    }
-}
+// `ParallelConfig`(旧7フィールドの独自型)は
+// `aruaru_dist::admin_shared::ParallelConfigState`(GraphQL と同じ4
+// フィールド)へ統合済み(2026-08-29 再設計 P2)。正本は
+// `aruaru.yaml: query.parallel`。`GET/POST /admin/parallel` と GraphQL
+// `setParallelConfig` mutation は撤廃。
 
 // `FederatedSource`は`aruaru_dist::admin_shared::FederatedSourceEntry`
 // (共有型)へ統合済み(2026-08-29)。
@@ -424,7 +421,12 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         .at("/migrate/preview", post(migrate_preview))
         .at("/migrate/run", post(migrate_run))
         .at("/migrate/instance", post(migrate_instance))
-        .at("/parallel", get(get_parallel).post(set_parallel))
+        // 【2026-08-29 再設計 P2】`GET/POST /admin/parallel`(設定の
+        // 読み書き)は撤廃。並列設定の正本は宣言的 `aruaru.yaml:
+        // query.parallel`(ホットリロード)、実効値の参照は GraphQL
+        // `parallelConfig` query。`/parallel/explain`・`/parallel/jobs`
+        // (プランの可視化・ジョブ一覧=観測系)は GraphQL 側リゾルバを
+        // 実データ化してから撤廃する(P3)。
         .at("/parallel/explain", post(explain_distributed))
         .at("/parallel/jobs", get(list_jobs))
         .at("/federation", get(list_federation).post(register_federation))
@@ -724,21 +726,20 @@ fn migrate_instance(Json(req): Json<Value>) -> Json<Value> {
 }
 
 // ── ③ 分散並列化 ───────────────────────────────────────────────
-
-#[handler]
-fn get_parallel(state: Data<&Arc<AdminState>>) -> Json<Value> {
-    Json(serde_json::to_value(state.parallel.lock().clone()).unwrap())
-}
-
-#[handler]
-fn set_parallel(state: Data<&Arc<AdminState>>, Json(cfg): Json<ParallelConfig>) -> Json<Value> {
-    *state.parallel.lock() = cfg;
-    Json(json!({ "success": true }))
-}
+//
+// 【2026-08-29 再設計 P2】`get_parallel`/`set_parallel` は撤廃。
+// 並列設定の正本は宣言的 `aruaru.yaml: query.parallel`(`config::
+// reconcile` が `AdminState.parallel` へ反映)、実効値の参照は GraphQL
+// `parallelConfig` query。
 
 /// SQL から分散実行プラン (フラグメント列) を生成する。
 /// 集計を含めば ParallelScan→Shuffle→HashAggregate→Gather、
 /// 単純検索なら ParallelScan→Gather。並列度は設定値・行数から決める。
+///
+/// 【P2】設定は4フィールド(`enabled`/`max_workers`/`chunk_size`/
+/// `strategy`)へ簡素化された。`enabled=false` なら全段 parallelism=1、
+/// shuffle パーティション数は `max_workers*8` を既定ヒューリスティックと
+/// する(旧 `shuffle_partitions` 相当の明示設定は廃止)。
 #[handler]
 fn explain_distributed(state: Data<&Arc<AdminState>>, Json(req): Json<SqlRequest>) -> Json<Value> {
     let cfg = state.parallel.lock().clone();
@@ -754,7 +755,10 @@ fn explain_distributed(state: Data<&Arc<AdminState>>, Json(req): Json<SqlRequest
         .and_then(|t| state.engine.table_row_count(t))
         .unwrap_or(0) as u64;
     // 単一ノード。クラスタ化後に複数ノードへ分散する。
-    let scan_par = cfg.max_parallelism.min(8);
+    // 4フィールド設定へ簡素化: enabled=false なら parallelism=1。
+    let scan_par = if cfg.enabled { cfg.max_workers.min(8).max(1) } else { 1 };
+    // 旧 `shuffle_partitions` の明示設定は廃止。max_workers*8 を既定に。
+    let shuffle_partitions = if cfg.enabled { cfg.max_workers.saturating_mul(8).max(1) } else { 1 };
 
     let mut frag_id = 0u32;
     let mut next = || {
@@ -769,18 +773,18 @@ fn explain_distributed(state: Data<&Arc<AdminState>>, Json(req): Json<SqlRequest
         "node_ids": [1],
         "est_rows": rows,
         "detail": format!("{} を Range 並列スキャン{}", table.clone().unwrap_or_else(|| "(table)".into()),
-            if cfg.enable_parallel_scan { " (述語プッシュダウン)" } else { " (並列スキャン無効)" }),
+            if cfg.enabled { format!(" (述語プッシュダウン, strategy={})", cfg.strategy) } else { " (並列実行無効)".into() }),
     })];
 
     if matches!(kind, aruaru_query::QueryKind::Olap) {
         fragments.push(json!({
-            "id": next(), "op": "ShuffleExchange", "parallelism": cfg.shuffle_partitions,
+            "id": next(), "op": "ShuffleExchange", "parallelism": shuffle_partitions,
             "node_ids": [1], "est_rows": rows,
-            "detail": format!("ハッシュ再分配 ({} パーティション)", cfg.shuffle_partitions),
+            "detail": format!("ハッシュ再分配 ({} パーティション)", shuffle_partitions),
         }));
         fragments.push(json!({
             "id": next(), "op": "HashAggregate",
-            "parallelism": if cfg.enable_parallel_aggregate { scan_par } else { 1 },
+            "parallelism": scan_par,
             "node_ids": [1], "est_rows": rows / 10 + 1,
             "detail": "部分集計 → マージ (2段階集計)",
         }));

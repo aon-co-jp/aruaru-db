@@ -56,6 +56,8 @@
 
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// 論理ナノ秒タイムスタンプ
 pub type Timestamp = u64;
@@ -102,7 +104,10 @@ impl ReadPlan {
 /// follower 側では `receive_update` で leaseholder からの通知を取り込む。
 pub struct ClosedTimestampTracker {
     closed: RwLock<Timestamp>,
-    target_lag_nanos: u64,
+    /// 目標ラグ(ナノ秒)。`aruaru.yaml: follower_read.target_lag_ms` の
+    /// ホットリロードで実行時に変更できるよう、コーディネータと**同一の
+    /// `Arc<AtomicU64>` を共有**する(2026-08-29 再設計 P2)。
+    target_lag_nanos: Arc<AtomicU64>,
     /// 進行中の書き込み: 書き込み時刻 → その時刻の未確定書き込み数。
     /// closed timestamp はこの最小値を**跨げない**——跨いだ瞬間に
     /// 「closed 以下に新しい書き込みは現れない」という保証が破れる。
@@ -110,7 +115,13 @@ pub struct ClosedTimestampTracker {
 }
 
 impl ClosedTimestampTracker {
+    /// 単独の目標ラグで作る(テスト・単体利用向け)。
     pub fn new(target_lag_nanos: u64) -> Self {
+        Self::with_shared_lag(Arc::new(AtomicU64::new(target_lag_nanos)))
+    }
+
+    /// コーディネータと目標ラグ(`Arc<AtomicU64>`)を共有して作る。
+    pub fn with_shared_lag(target_lag_nanos: Arc<AtomicU64>) -> Self {
         Self {
             closed: RwLock::new(0),
             target_lag_nanos,
@@ -123,7 +134,7 @@ impl ClosedTimestampTracker {
     }
 
     pub fn target_lag_nanos(&self) -> u64 {
-        self.target_lag_nanos
+        self.target_lag_nanos.load(Ordering::Relaxed)
     }
 
     pub fn closed_timestamp(&self) -> Timestamp {
@@ -155,7 +166,7 @@ impl ClosedTimestampTracker {
     /// ただし進行中書き込みの最小時刻を跨がない。単調増加のみ (後退しない)。
     /// 戻り値は前進後の closed timestamp。
     pub fn advance_to(&self, now: Timestamp) -> Timestamp {
-        let target = now.saturating_sub(self.target_lag_nanos);
+        let target = now.saturating_sub(self.target_lag_nanos.load(Ordering::Relaxed));
         let bound = match self.lowest_in_flight() {
             // 進行中書き込みと同時刻は閉じられない (その時刻の直前まで)
             Some(low) => target.min(low.saturating_sub(1)),
@@ -190,24 +201,46 @@ impl ClosedTimestampTracker {
 /// 複数 Range の closed timestamp を束ね、Range 横断の読み取り時刻交渉と
 /// side transport による follower への配布を行うコーディネータ。
 pub struct ClosedTimestampCoordinator {
-    target_lag_nanos: u64,
+    /// 全 tracker と共有する目標ラグ。`set_target_lag_nanos` で実行時に
+    /// 変更でき、既存・新規どちらの tracker にも即座に効く
+    /// (2026-08-29 再設計 P2: `aruaru.yaml` ホットリロード対応)。
+    target_lag_nanos: Arc<AtomicU64>,
     trackers: RwLock<HashMap<u64, std::sync::Arc<ClosedTimestampTracker>>>,
 }
 
 impl ClosedTimestampCoordinator {
     pub fn new(target_lag_nanos: u64) -> Self {
-        Self { target_lag_nanos, trackers: RwLock::new(HashMap::new()) }
+        Self {
+            target_lag_nanos: Arc::new(AtomicU64::new(target_lag_nanos)),
+            trackers: RwLock::new(HashMap::new()),
+        }
     }
 
     pub fn with_default_lag() -> Self {
         Self::new(DEFAULT_TARGET_LAG_NANOS)
     }
 
+    /// 現在の目標ラグ(ナノ秒)。
+    pub fn target_lag_nanos(&self) -> u64 {
+        self.target_lag_nanos.load(Ordering::Relaxed)
+    }
+
+    /// 目標ラグを実行時に更新する。登録済みの全 tracker は同一の
+    /// `Arc<AtomicU64>` を共有しているため、この一回の store で即座に
+    /// 反映される。
+    pub fn set_target_lag_nanos(&self, nanos: u64) {
+        self.target_lag_nanos.store(nanos, Ordering::Relaxed);
+    }
+
     /// Range を登録する (既にあれば既存のものを返す)。
     pub fn register_range(&self, range_id: u64) -> std::sync::Arc<ClosedTimestampTracker> {
         let mut t = self.trackers.write();
         t.entry(range_id)
-            .or_insert_with(|| std::sync::Arc::new(ClosedTimestampTracker::new(self.target_lag_nanos)))
+            .or_insert_with(|| {
+                std::sync::Arc::new(ClosedTimestampTracker::with_shared_lag(
+                    self.target_lag_nanos.clone(),
+                ))
+            })
             .clone()
     }
 

@@ -375,6 +375,10 @@ async fn main() -> anyhow::Result<()> {
         // オブジェクトテーブル(時間旅行=VersionlessAPIの実体)も同一
         // インスタンスをGraphQL `objectTable`へ共有(2026-08-29(続き3))。
         let object_table_for_graphql = admin_state.object_table_handle();
+        // 【2026-08-29 再設計 P2】並列設定(4フィールド共有型)。GraphQL
+        // `parallelConfig` query が `aruaru.yaml: query.parallel` の実効値を
+        // 返すために同一インスタンスを共有する。
+        let parallel_for_graphql = admin_state.parallel_handle();
 
         // Federation SDL を返すエンドポイント (wgc subgraph publish 用)
         #[handler]
@@ -437,6 +441,7 @@ async fn main() -> anyhow::Result<()> {
                     topology: Some(topology_for_graphql.clone()),
                     schedule: Some(schedule_for_graphql.clone()),
                     federation: Some(federation_for_graphql.clone()),
+                    parallel: Some(parallel_for_graphql.clone()),
                     keyring: Some(keyring_for_graphql.clone()),
                     object_table: Some(object_table_for_graphql.clone()),
                 },
