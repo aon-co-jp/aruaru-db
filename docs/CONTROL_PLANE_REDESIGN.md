@@ -497,3 +497,56 @@ GitHub 調査した結果。
 の配信内容**(どのテーブルを列レプリカ化するか等)として管理面に載るため、
 P5(コントロールプレーン)で接点を持つ。`docs/HYBRID_NETWORK_ARCHITECTURE.md`・
 `README-English.md` の HTAP 記述とも整合を取ること。
+
+---
+
+## 付録 B. 「REST 完全撤廃」を可能にしている WunderGraph Cosmo の技術（2026-08-29 再調査）
+
+ユーザー指摘: 「REST API を撤廃したのは WunderGraph Cosmo の技術あってこそ。
+分かっているか」。英日・多言語で Google / GitHub を再調査した結論を、
+**どの機構が何を代替するか**の形で整理する。RPoem はこれらを OSS で
+自前実装する（Cosmo 本体 Apache 2.0、有料は SSO+SCIM+専有クラウドのみ）。
+
+### B.1 4つの中核機構
+
+| Cosmo の機構 | 何をするか | これが無い場合に必要になる REST | RPoem 側の受け皿 |
+|---|---|---|---|
+| **GraphQL Federation / Open Federation**（Apollo v1/v2 互換。`@key` / `_entities` によるエンティティ解決、`wgc router compose` が execution config を生成、Router がクエリプランニング・バッチング・フィールド解決）| 多数のサービスを**1 つの GraphQL エンドポイント**に合成。クライアントは supergraph だけを見る | サービスごとの REST エンドポイント群 | `open-runo-federation`（合成）、`aruaru-server` は既にネイティブ async-graphql サブグラフ |
+| **Cosmo Connect / Protocol-Agnostic Federation**（`wgc router plugin generate` が GraphQL SDL → protobuf。**router plugin バイナリ**〈Router がプロセス内管理〉または **standalone gRPC service** として実行。既存の REST/SOAP/SDK バックエンドは RPC 実装の**内側にラップ**。Router が gRPC を直接呼ぶ）| GraphQL サーバを書かずに**非 GraphQL バックエンドをサブグラフ化**。「作り直さず、今あるものを繋ぐ」 | レガシー REST をそのまま外部公開し続ける | RPoem の `open-runo-router` レガシー REST ハンドラ（`handlers_hyper.rs` 等）は、GraphQL 化が重いものは Connect 型（gRPC サブグラフ / プラグイン）で federate。`open-runo-poem-compat` の考え方と整合 |
+| **Persisted Operations / Trusted Documents**（`wgc operations push` → 制御プレーンが SHA-256 を採番 → **CDN 配信**。enforcement: 未登録を log / safelist 一致のみ allow / 全ブロック。`graphql-client-name` ヘッダでクライアント別オペレーション集合）| 旧 REST エンドポイント 1 本 = **名前付き・許可リスト済みオペレーション 1 個**。クライアントはハッシュだけ送る。帯域減 + 攻撃面減 | 「固定エンドポイント」というセキュリティ/キャッシュ境界 | **`open-runo-persisted-queries`（実装済み）** — `sha256Hash` / `query`、`extensions.persistedQuery` 対応。Cosmo が有料に制限する trusted documents を OSS で |
+| **Schema Registry + Composition Checks + CDN 配信**（`wgc` が制御プレーンへ、Router は **完全ステートレス**で高可用 CDN から execution config を取得。§1 参照）| 宣言的な設定/スキーマの配布パイプライン | 設定を叩き込む管理 REST | `open-runo-schema-registry`（= Cosmo の Control Plane + CDN 相当）、`aruaru-server` は取得側（§2 原則 2） |
+
+### B.2 補助機構
+
+- **EDFS / Cosmo Streams**（NATS / Kafka / Redis を「仮想サブグラフ」として
+  Router が直結。サブグラフ側にステートフル接続〈WebSocket〉不要、
+  epoll/kqueue で数万サブスクリプション、同一トピックのサブスクリプションを
+  Router 内で重複排除）→ **Webhook / SSE / ロングポーリングの REST パターンを
+  置換**。aruaru-db の変更フィード（closed timestamp の伝播、object-table の
+  コミット通知など）はこの形へ。ノード間 side transport のバイナリ化（§3 P4）
+  とは層が別（こちらはクライアント向けリアルタイム）。
+- **Router plugins（Go）**: Router 自体を自前コードで拡張。Router は
+  ステートレスで、依存は「高稼働率 CDN から config を読む」ことだけ
+  → §2 原則 1「データプレーンはコントロールプレーンが落ちても動く」の根拠。
+
+### B.3 だから aruaru-db + RPoem では
+
+1. **aruaru-db** はネイティブ async-graphql サブグラフのまま
+   （`/admin/*` → B2/B3 リゾルバ + B1 は `aruaru.yaml`）。
+2. **RPoem のレガシー REST** は、GraphQL 化が軽いものは素直に移植、
+   重いものは **Cosmo Connect 型（gRPC サブグラフ / router plugin）** で
+   federate（書き直さず繋ぐ）。
+3. **旧 REST エンドポイント 1 本ごとに Persisted Operation を 1 個**採番
+   （`open-runo-persisted-queries`）。クライアントはハッシュ送信。
+   enforcement は safelist。→ 「固定エンドポイント」が持っていた
+   キャッシュ境界・攻撃面の縮小・契約の安定性を GraphQL 上で回復する。
+4. **execution config / persisted operations / feature flags の配信**は
+   `open-runo-schema-registry` が CDN 役（Router = `aruaru-server` /
+   `open-runo-router` は取得側・ステートレス）。
+5. **リアルタイム**は EDFS 型（イベントソース直結）へ。ポーリング REST を残さない。
+
+**要するに「REST を消せる」のは、Federation がサービスを 1 グラフに畳み、
+Connect が非 GraphQL バックエンドを書き直さず federate でき、Persisted
+Operations が固定エンドポイントの利点を GraphQL 上で再現し、Schema
+Registry + CDN が設定を宣言的に配れるから。** この 4 つが揃って初めて
+「REST 完全撤廃」が実務的に成立する。
