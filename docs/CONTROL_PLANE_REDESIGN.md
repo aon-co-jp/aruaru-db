@@ -79,10 +79,12 @@ GraphQL ＋ health ＋ metrics だけ」。
 
 **A. プレーン分離**
 
-1. **データプレーンは GraphQL に徹する。**
-   `aruaru-server` が公開する HTTP は
-   `/graphql`・`/graphql/sdl`・`/health*`・`/metrics`・`/v1/keys/self-issue`・
-   内部 `/raft/*` のみ。**`/admin/*` は 1 本も残さない。**
+1. **データプレーンは GraphQL に徹する。REST API は例外なく完全撤廃。**
+   最終形で `aruaru-server` が公開する HTTP は `/graphql`・`/graphql/sdl` と、
+   ops 面の `/health*`・`/metrics`（k8s・Prometheus 規約であって CRUD の
+   REST API ではない、という明示的 carve-out）だけ。
+   `/admin/*` は 1 本も残さない。`/v1/keys/self-issue` も GraphQL mutation へ
+   移す。ノード間 `/raft/*`・side transport はバイナリ化する（§3）。
    データプレーンは「可用性最優先で、コントロールプレーンが落ちても
    動き続ける」（Cosmo Router と同じ立場）。
 
@@ -93,9 +95,11 @@ GraphQL ＋ health ＋ metrics だけ」。
    Enterprise 相当を OSS で）。`aruaru-server` はここから設定を
    **取得する側**。クライアントはコントロールプレーンに直接触れない。
 
-3. **ノード間 RPC は管理面でも設定面でもない。**
+3. **ノード間 RPC は管理面でも設定面でもない。GraphQL 化せず、バイナリ化する。**
    `/raft/append`・`/raft/vote`・`/closed-timestamp/receive|publish` は
-   クラスタ内部トランスポート。GraphQL 化しない（将来バイナリ化は別トピック）。
+   クラスタ内部トランスポート。GraphQL には載せない。ただし HTTP のままにも
+   しない——`crates/aruaru-dist/src/raft/binary_transport.rs` へ寄せるのが
+   確定ゴール（REST 完全撤廃の一部。P4 以降の必須項目）。
 
 **B. 宣言と reconciliation（設定）**
 
@@ -176,18 +180,39 @@ GraphQL ＋ health ＋ metrics だけ」。
 
 ## 3. 目標 HTTP 面（再設計後）
 
-### `aruaru-server`（データプレーン）
+> **REST API 完全撤廃の厳命（2026-08-29、ユーザーが「肝に命じて」と明言）**:
+> SET（aruaru-db + RPoem）の**全体から REST API を例外なく完全撤廃**する。
+> 下表で「維持」に見えるものも、CRUD の REST API ではないことを毎回明示的に
+> 述べられる場合のみ残す（health / metrics = k8s・Prometheus 標準の ops 面）。
+> それ以外はすべて GraphQL かバイナリトランスポートへ寄せる。
+
+### `aruaru-server`（データプレーン）— 最終形
+
 ```
 /graphql              GraphQL（query = 観測 / mutation = アクション / subscription = 将来）
 /graphql/sdl          Federation SDL（wgc / RPoem federation が取得）
-/health               liveness（200）
-/health/ready         readiness（200 / 503）
-/health/live          liveness probe
-/metrics              Prometheus（別リスナ 127.0.0.1:9090 想定）
-/v1/keys/self-issue   認証不要の自己発行（GraphQL 等価なし・維持）
-/raft/append /raft/vote   ノード間 RPC（内部）
+/health /health/ready /health/live   ← ops 面。k8s プローブ規約。REST API ではない（明示的 carve-out）
+/metrics              ← ops 面。Prometheus 規約。別リスナ 127.0.0.1:9090。REST API ではない（明示的 carve-out）
 ```
-**`/admin/*` は存在しない。**
+
+**撤廃対象（現状は HTTP、最終形では消える）**:
+- `/admin/*`（約40本）… §4 の 4 バケツで GraphQL / 宣言的設定へ（P2〜P4）。
+- `/v1/keys/self-issue` … **GraphQL mutation `selfIssueKey`（認証ガード無し）へ移す**。
+  「認証不要で即発行できること自体が承認手続き」という性質は mutation でも保てる（P3）。
+- `/raft/append`・`/raft/vote`・`/closed-timestamp/receive|publish` …
+  ノード間 RPC。**バイナリトランスポート化が確定ゴール**（「いつか」ではなく
+  P4 以降の必須項目）。`crates/aruaru-dist/src/raft/binary_transport.rs` が既にある。
+
+### RPoem（コントロールプレーン）
+```
+execution-config の配信（ポーリング or push）      ← open-runo-schema-registry
+feature フラグの配信                               ← open-runo-feature-flags
+subgraph 合成（Federation composition）            ← open-runo-federation
+SCIM 2.0 / SSO(OIDC)（Cosmo Enterprise 相当・OSS） ← open-runo-scim / open-runo-security
+APIキー・ライフサイクル（KeyGuardian）             ← open-runo-router::keyring（aruaru-db と設計共有）
+```
+RPoem 側も同じ厳命。`open-runo-router` の REST ハンドラ（`handlers_hyper.rs`・
+`openapi.rs` 等）は GraphQL / 宣言的設定へ寄せる（別途 RPoem 側 CLAUDE.md で追跡）。
 
 ### RPoem（コントロールプレーン）
 ```
@@ -242,10 +267,12 @@ APIキー・ライフサイクル（KeyGuardian）             ← open-runo-rou
 | `GET /admin/registry`, `/registry/summary`, `/registry/test` | **B3** | `Query.registry` / `registrySummary` / `testRegistryConnection`（実装済み） |
 | `POST /admin/migrate/test`, `/migrate/preview` | **B3** | `Query.testSourceConnection` / `previewSource`（実装済み） |
 | `POST /admin/disaster-email-backup/verify` | **B2** | `Mutation.verifyDisasterBackup`（新規） |
-| `/raft/append`, `/raft/vote` | **B4** | 対象外 |
-| `/closed-timestamp/receive`, `/publish` | **B4** | 対象外 |
+| `POST /v1/keys/self-issue` | **B2** | `Mutation.selfIssueKey`（認証ガード無し・P3。「即発行＝承認」を mutation で保つ） |
+| `/raft/append`, `/raft/vote` | **B4** | バイナリトランスポート化（`raft/binary_transport.rs`、P4 以降の必須） |
+| `/closed-timestamp/receive`, `/publish` | **B4** | 同上（side transport のバイナリ化） |
 
-**すでに撤廃済み**: `object-table`（B2/B3）、`keys/status`・`keys/revoke`（B3/B2）。
+**すでに撤廃済み**: `object-table`（B2/B3）、`keys/status`・`keys/revoke`（B3/B2）、
+`GET/POST /admin/parallel`（B1 → `aruaru.yaml: query.parallel`、P2）。
 
 ---
 
@@ -385,9 +412,14 @@ config/
     `aruaru.yaml` 編集 UI に。
 - **P3 B2/B3 の残り** ephemeral-query / multi-raft / sharded-store put/get /
   closed-timestamp / wal-service を GraphQL query/mutation 化。対応 `/admin`
-  ルート削除。Tauri/Android/web を GraphQL クライアントへ。
-- **P4 `/admin` ルーター自体を削除** `admin::admin_routes` を撤去。
-  `admin.rs` を「GraphQL リゾルバが使うヘルパー」だけに縮小 or 解体。
+  ルート削除。**`/v1/keys/self-issue` を `Mutation.selfIssueKey`（認証ガード
+  無し）へ移す。** Tauri/Android/web を GraphQL クライアントへ。
+- **P4 `/admin` ルーター＋残る非 GraphQL HTTP を撤去**
+  `admin::admin_routes` を撤去、`admin.rs` を GraphQL リゾルバのヘルパーだけに。
+  **ノード間 `/raft/*`・side transport（`/closed-timestamp/receive|publish`）を
+  `raft/binary_transport.rs` のバイナリ経路へ寄せ、HTTP リスナから外す。**
+  → データプレーンの HTTP は `/graphql`・`/graphql/sdl`・`/health*`・`/metrics`
+  だけになる（REST 完全撤廃の到達点）。
 - **P5 コントロールプレーン** RPoem に execution-config 配信
   （`open-runo-schema-registry`）、feature フラグ配信、aruaru-server 側の
   ポーリング取得を実装。Cosmo の CDN/Control Plane 相当を OSS で。
