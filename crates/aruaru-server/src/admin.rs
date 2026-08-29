@@ -100,12 +100,13 @@ pub struct AdminState {
     /// `/admin/object-table/*`として公開。ObjectStoreの実体は依然として
     /// インメモリ(`InMemoryObjectStore`)であり、S3へは未接続。
     object_table: Arc<aruaru_backup::table_format::ObjectTable>,
-    /// 【2026-08-29新設】APIキー自動ライフサイクル管理(`crate::keyring::
+    /// 【2026-08-29新設】APIキー自動ライフサイクル管理(`aruaru_dist::keyring::
     /// KeyGuardian`)。既存の`ARUARU_DB_ADMIN_TOKEN`静的トークンを置き
     /// 換えるのではなく併存させる(後方互換)——`check_admin_auth`は
     /// まず静的トークンとの一致を試み、不一致ならこのキーレジストリを
-    /// 検証する。詳細は`crate::keyring`モジュールdoc参照。
-    pub keyring: Arc<crate::keyring::KeyGuardian>,
+    /// 検証する。詳細は`aruaru_dist::keyring`モジュールdoc参照
+    /// (2026-08-29(続き)、GraphQL側と共有できるよう`aruaru-dist`へ移設)。
+    pub keyring: Arc<aruaru_dist::keyring::KeyGuardian>,
 }
 
 impl AdminState {
@@ -139,7 +140,7 @@ impl AdminState {
                 1,
                 1,
             )),
-            keyring: Arc::new(crate::keyring::KeyGuardian::new()),
+            keyring: Arc::new(aruaru_dist::keyring::KeyGuardian::new()),
         })
     }
 
@@ -239,7 +240,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 /// 【2026-08-29改修】静的トークン(`ARUARU_DB_ADMIN_TOKEN`)に加え、
-/// `crate::keyring::KeyGuardian`が自動発行したキーも受理するよう拡張した。
+/// `aruaru_dist::keyring::KeyGuardian`が自動発行したキーも受理するよう拡張した。
 /// 判定順序: (1) 静的トークンが設定されておりヘッダーと一致すれば即通過、
 /// (2) 一致しなければキーレジストリで検証、`Ok`なら通過、(3) どちらも
 /// 失敗すれば拒否。**静的トークンが未設定の場合でも、キーレジストリに
@@ -249,7 +250,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 /// 完全に後方互換のまま)。
 fn check_admin_auth(
     req: &Request,
-    keyring: &crate::keyring::KeyGuardian,
+    keyring: &aruaru_dist::keyring::KeyGuardian,
 ) -> Result<(), (poem::http::StatusCode, &'static str)> {
     let provided = req
         .headers()
@@ -265,7 +266,7 @@ fn check_admin_auth(
     }
 
     if !provided.is_empty() {
-        if let crate::keyring::KeyDecision::Ok { .. } = keyring.verify(provided) {
+        if let aruaru_dist::keyring::KeyDecision::Ok { .. } = keyring.verify(provided) {
             return Ok(());
         }
     }

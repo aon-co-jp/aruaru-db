@@ -1,5 +1,50 @@
 # 設計思想・開発方針・開発環境ルール(全リポジトリ共通ヘッダー、2026-07-15追記)
 
+> ## 🎯 最重要・最優先で常に念頭に置くこと(2026-08-29、ユーザー指示により
+> ファイル冒頭へ移動——「REST APIの代替えをただ闇雲に作っても意味が無い」
+> という戒めと共に、以降このファイルを読む・編集する誰もが最初に目に
+> する位置に固定する)
+>
+> **aruaru-db は単独では完結しない。RPoemとSET(対)で使うことで初めて
+> 「REST API不要・WunderGraph Cosmo有料版(Enterprise)互換」という
+> 価値が成立する設計である。この特徴を絶対に忘れないこと。**
+>
+> - **aruaru-db(このリポジトリ)の役割**: Git-on-SQLバージョン管理+
+>   Raft強整合+HTAP(行/列ハイブリッド)を備えたPure Rust分散データ
+>   ベース。VersionlessAPI/GraphQL Federationという**コンセプト**は
+>   RPoem・WunderGraph Cosmoから参考にしているが、Cosmo自体(パッケージ)
+>   への直接依存は無い。
+> - **RPoem(SETで対になる相方)の役割**: Poem/Tauri/WunderGraph Cosmoを
+>   パッケージとして直接依存させず、機能・API形状の互換性だけをRust
+>   標準+tokio/hyperで自前実装する「第二のTomcat」的アプリケーション
+>   サーバー層。GraphQL Federation合成(`open-runo-federation`)・
+>   SCIM 2.0(`open-runo-scim`、**Cosmo自体はEnterprise限定でのみ
+>   提供する機能をOSSで実装**)・VersionlessAPI(`open-runo-
+>   versionless-api`)・APIキー自動ライフサイクル管理(`KeyGuardian`)
+>   を持つ。
+> - **【2026-08-29再調査で判明した重要な訂正】WunderGraph Cosmo
+>   **本体**(Router・Schema Registry・Studio・CLI)は実はApache 2.0の
+>   OSSであり、セルフホストも自由——**有料(Enterprise)部分は
+>   SSO(OpenID Connect)+SCIM・専有クラウド(Dedicated Cloud)に限定
+>   される**([Cosmo Enterprise公式](https://cosmo-docs.wundergraph.com/enterprise))。
+>   つまり「Cosmo有料版と互換」というこのSETの価値の実体は、**RPoemが
+>   独自に再実装したSCIM/SSO相当の機能**にある——ここを見失って
+>   「REST APIを無くすこと自体」を目的化すると、本来の価値(Enterprise
+>   限定機能をOSSで持つこと・APIキー管理を人間の手作業から解放すること)
+>   を見失った、**ただ闇雲な代替品作り**になってしまう。何かをREST→
+>   GraphQL/バイナリへ移行する提案・実装をする前に、必ず「これは
+>   RPoemとのSETとしての価値(SCIM/SSO相当・APIキー自動管理・
+>   VersionlessAPI互換)を強化するものか」を自問すること。
+> - **連携強化の具体的な実装状況**: APIキー自動ライフサイクル管理
+>   (`crates/aruaru-dist/src/keyring.rs`、RPoemの`KeyGuardian`と同じ
+>   設計を独立実装、Cargo依存は結合しない既存方針を踏襲)、Raft/WAL
+>   ノード間通信の完全バイナリ化(`crates/aruaru-dist/src/raft/
+>   binary_transport.rs`)、`/admin/*`のREST→GraphQL段階移行
+>   (`clusterStatus`・`backupSchedule`・`federatedSources`・
+>   `keyStatus`/`revokeKeys`が実データへ接続済み、詳細は下記HANDOFF
+>   参照)。**次に何か実装する前に、まずこの3点(SET連携・Cosmo
+>   本体はOSS・闇雲な代替を避ける)を再確認すること。**
+
 > **📌 2026-08-26追記: Windows用インストーラー`aruaru-db-installer.exe`を
 > 新設(命名規則統一)**: ユーザー指示「パワーシェルでインストールする
 > 関連リポジトリは全て、リポジトリ名-installer.exeに統一して」への対応
@@ -4295,3 +4340,51 @@ max_parallelism`のような意味の薄い変換を当てはめると、「実�
   open-raid-zのCLAUDE.mdにある「Cosmo有料版機能の再実装」という記述の
   精度向上(「Cosmo本体はOSS、再実装対象はEnterprise限定のSCIM/SSOの
   み」への訂正)を横展開するか検討。
+
+## HANDOFF追記(2026-08-29続き2) REST→GraphQL段階移行の第三歩
+(`keys`=`keyStatus`/`revokeKeys`を実データへ接続)+最重要事項を
+ファイル冒頭へ固定
+
+**実装**: APIキー自動ライフサイクル管理(`KeyGuardian`、2026-08-29に
+`aruaru-server`内で新設)を、REST(`AdminState`)とGraphQL(`AdminCtx`)
+両方が同一インスタンスを共有できるよう、両クレートが依存できる
+`aruaru-dist`へ`git mv`で移設した(`admin_shared.rs`/`ClusterTopology`と
+同じ理由・同じパターン)。`aruaru-server`側は`aruaru_dist::keyring::
+KeyGuardian`をそのまま再利用するよう全参照を書き換え(ロジック自体は
+無変更)。GraphQL側に新規`keyStatus`クエリ・`revokeKeys`ミューテーション
+を追加し、REST `GET /admin/keys/status`・`POST /admin/keys/revoke`・
+`POST /v1/keys/self-issue`と**同一の`KeyGuardian`インスタンス**を
+参照するよう`main.rs`で配線した(従来GraphQL側にはこの操作自体が
+存在しなかった)。
+
+**検証(実測)**: `cargo build --workspace`成功(既存の`build_cluster`/
+`propose_commit`未使用警告2件のみ、無関係)。`cargo test --workspace`
+全19テストバイナリで`test result: ok`、失敗0件
+(`aruaru-graphql`: 6→9テスト、`key_status_and_revoke_keys_operate_on_
+the_shared_key_guardian`——発行前0件→REST側と同じ`KeyGuardian`へ直接
+`issue`して2件→`revokeKeys`で1件失効→失効後も`count()`は2のまま
+〈REST側`keyring_status`と同じ「失効フラグのみ、レコード削除ではない」
+挙動〉を実データで確認。`aruaru-dist`: keyring.rs移設分5テスト追加、
+`aruaru-server`: keyring.rs移設によりテスト数が8→3〈self_update系のみ〉
+に変化〈リグレッションではなく移設先での実行に切り替わっただけ〉)。
+
+**最重要事項をファイル冒頭へ固定(ユーザー指示)**: 「aruaru-dbは
+RPoemとSET(対)で使うことで初めてREST API不要・WunderGraph Cosmo
+有料版互換という価値が成立する」「REST APIの代替をただ闇雲に作っても
+意味が無い」という戒めを、本ファイルの一番上(冒頭バナー群のさらに前)
+へ固定した。あわせてRPoem側`CLAUDE.md`にも同内容の同期エントリを
+ファイル冒頭へ追加した(正本はこちら、RPoem側は参照エントリ)。
+以後、何かをREST→GraphQL/バイナリへ移行する提案・実装をする前に、
+必ずこの冒頭エントリを再確認すること。
+
+- 次にすべきこと: (1) `multi-raft`(split/merge/scatter-query)・
+  `sharded-store`・`closed-timestamp`・`wal-service`・`object-table`・
+  `ephemeral-query`・`registry`(crawl/test-connection、**注意**:
+  `crawl_registry`/`test_registry_connection`はGraphQL側に既に実装
+  済みで実データ接続もされている——「未着手」と誤解しないこと、
+  今回の再確認で判明)のうち、まだGraphQL側に対応するresolver自体が
+  無いもの(`multi-raft`/`sharded-store`/`closed-timestamp`/
+  `wal-service`/`object-table`/`ephemeral-query`)を1つずつ、必ず
+  「これはaruaru-db+RPoem SETとしての価値を強化するか」を自問した
+  上で着手すること、(2) `parallel_config`のスキーマ再設計の是非を
+  ユーザーへ確認、(3) RPoem/open-raid-zのCosmo記述精度向上の横展開。

@@ -15,7 +15,6 @@ use tracing_subscriber::EnvFilter;
 mod admin;
 mod cluster;
 mod ephemeral_pod;
-mod keyring;
 mod self_update;
 
 /// aruaru-DB server
@@ -332,6 +331,9 @@ async fn main() -> anyhow::Result<()> {
         // で消費(move)されるため、自己発行エンドポイント用にキー
         // レジストリだけ先に複製しておく。
         let keyring_for_self_issue = admin_state.keyring.clone();
+        // GraphQL `keyStatus`/`revokeKeys`がREST `/admin/keys/*`と同じ
+        // KeyGuardianを参照するための共有ハンドル(2026-08-29(続き)新設)。
+        let keyring_for_graphql = admin_state.keyring.clone();
         // GraphQL `clusterStatus`がREST `/admin/cluster`と同じトポロジを
         // 参照するための共有ハンドル(2026-08-29新設)。
         let topology_for_graphql = admin_state.topology_handle();
@@ -363,17 +365,17 @@ async fn main() -> anyhow::Result<()> {
         // 渡さない設計にした。
         #[handler]
         fn self_issue_key(
-            keyring: Data<&std::sync::Arc<crate::keyring::KeyGuardian>>,
+            keyring: Data<&std::sync::Arc<aruaru_dist::keyring::KeyGuardian>>,
         ) -> poem::web::Json<serde_json::Value> {
             let key = keyring.issue(
                 "self-issued",
                 "viewer",
-                Some(chrono::Duration::hours(crate::keyring::DEFAULT_SELF_ISSUE_TTL_HOURS)),
+                Some(chrono::Duration::hours(aruaru_dist::keyring::DEFAULT_SELF_ISSUE_TTL_HOURS)),
             );
             poem::web::Json(serde_json::json!({
                 "key": key,
                 "role": "viewer",
-                "expires_in_hours": crate::keyring::DEFAULT_SELF_ISSUE_TTL_HOURS,
+                "expires_in_hours": aruaru_dist::keyring::DEFAULT_SELF_ISSUE_TTL_HOURS,
                 "note_ja": "このキーはviewerロール・24時間限定です。より強い権限が\
                     必要な操作は、引き続きARUARU_DB_ADMIN_TOKENを使うか、\
                     信頼できる管理者がPOST /admin/keys/revokeで既存キーを\
@@ -402,6 +404,7 @@ async fn main() -> anyhow::Result<()> {
                     topology: Some(topology_for_graphql.clone()),
                     schedule: Some(schedule_for_graphql.clone()),
                     federation: Some(federation_for_graphql.clone()),
+                    keyring: Some(keyring_for_graphql.clone()),
                 },
             ))
             .at("/graphql/sdl", get(subgraph_sdl))

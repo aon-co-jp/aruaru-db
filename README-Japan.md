@@ -1,13 +1,17 @@
 # aruaru-DB 🦀
 
-> **2026-08-29 更新**: APIキーを人間が手動発行・管理する必要をゼロにする
-> 自動ライフサイクル管理(自動発行・自動承認・自動破棄・自動削除、
-> RPoem `KeyGuardian`と同じ設計を独立実装)、Raft/WALノード間通信の
-> REST完全撤廃(バイナリフレーム化)、GraphQL管理APIのスタブを実データへ
-> 段階的に接続(`clusterStatus`・`backupSchedule`・`federatedSources`)を
-> 実施。2026年時点の実務(Shopify・国内事例)を調査した結果、REST廃止は
-> 「即時全廃」ではなく段階移行が標準パターンと判断——詳細・残る作業は
-> `CLAUDE.md`のHANDOFF参照。
+> **2026-08-29 更新**: aruaru-dbは**RPoemとSET(対)で使うことで初めて
+> 「REST API不要・WunderGraph Cosmo有料版(Enterprise)互換」という
+> 価値が成立する**設計(詳細は`CLAUDE.md`冒頭の最重要事項を参照)。
+> APIキーを人間が手動発行・管理する必要をゼロにする自動ライフサイクル
+> 管理(自動発行・自動承認・自動破棄・自動削除、RPoem `KeyGuardian`と
+> 同じ設計を独立実装)、Raft/WALノード間通信のREST完全撤廃(バイナリ
+> フレーム化)、GraphQL管理APIのスタブを実データへ段階的に接続
+> (`clusterStatus`・`backupSchedule`・`federatedSources`・`keyStatus`/
+> `revokeKeys`)を実施。2026年時点の実務(Shopify・国内資産運用サービス
+> 「マネイロ」の事例)を調査した結果、REST廃止は「即時全廃」ではなく
+> 段階移行が標準パターンと判断——詳細・残る作業は`CLAUDE.md`の
+> HANDOFF参照。
 >
 > **2026-07-25 更新**: 開発方針ファイル(`CLAUDE.md`)の見出しを
 > 「開発方針＆開発環境ルール」から「設計思想＆開発方針＆開発環境ルール」

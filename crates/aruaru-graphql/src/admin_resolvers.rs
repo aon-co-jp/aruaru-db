@@ -45,6 +45,12 @@ pub struct AdminCtx {
     /// 共有するフェデレーションソース一覧。`federated_sources`が常に
     /// 空配列を返していたギャップの解消。
     pub federation: Option<aruaru_dist::admin_shared::SharedFederatedSources>,
+    /// 【2026-08-29(続き)新設】REST(`AdminState.keyring`)と同一インスタンス
+    /// を共有するAPIキー自動ライフサイクル管理(`aruaru_dist::keyring::
+    /// KeyGuardian`)。`keyStatus`/`revokeKeys`から実際に発行済みキー数の
+    /// 参照・特定オーナーのキー破棄ができる(従来GraphQL側にこの操作自体が
+    /// 存在しなかった)。
+    pub keyring: Option<Arc<aruaru_dist::keyring::KeyGuardian>>,
 }
 
 /// `x-admin-token`ヘッダーを検証する(2026-08-01追加、実バグ修正)。
@@ -328,6 +334,17 @@ impl AdminQuery {
                 tables: s.table_count.unwrap_or(0) as i32,
             })
             .collect())
+    }
+
+    // ── APIキー自動ライフサイクル管理 ────────────────────────
+
+    /// 【2026-08-29(続き)新設】REST `GET /admin/keys/status`と同一の
+    /// `KeyGuardian`から実際の発行済みキー数を返す(従来GraphQL側には
+    /// この操作自体が存在しなかった)。
+    async fn key_status(&self, ctx: &Context<'_>) -> Result<KeyStatusGql> {
+        let a = admin(ctx)?;
+        let count = a.keyring.as_ref().map(|k| k.count()).unwrap_or(0);
+        Ok(KeyStatusGql { issued_key_count: count as i32 })
     }
 
     // ── マイグレーション: スキーマプレビュー ────────────────
@@ -651,6 +668,16 @@ impl AdminMutation {
         Ok(crate::response_to_gql(resp))
     }
 
+    // ── APIキー自動ライフサイクル管理 ────────────────────────
+
+    /// 【2026-08-29(続き)新設】REST `POST /admin/keys/revoke`と同一の
+    /// `KeyGuardian`へ実際に委譲する(自動破棄=auto-revoke)。
+    async fn revoke_keys(&self, ctx: &Context<'_>, owner: String) -> Result<KeyRevokeResultGql> {
+        let a = admin(ctx)?;
+        let revoked = a.keyring.as_ref().map(|k| k.revoke_owner(&owner)).unwrap_or(0);
+        Ok(KeyRevokeResultGql { revoked_count: revoked as i32 })
+    }
+
     // ── マイグレーション ────────────────────────────────────
 
     async fn test_source_connection(
@@ -838,6 +865,7 @@ mod cluster_propose_tests {
             ))),
             schedule: Some(Arc::new(parking_lot::Mutex::new(None))),
             federation: Some(Arc::new(parking_lot::Mutex::new(Vec::new()))),
+            keyring: Some(Arc::new(aruaru_dist::keyring::KeyGuardian::new())),
         }
     }
 
@@ -1041,5 +1069,45 @@ mod cluster_propose_tests {
             .await;
         assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
         assert_eq!(shared_federation.lock().len(), 0, "削除後は共有状態からも消えているはず");
+    }
+
+    // ── 2026-08-29(続き)追加: keyStatus / revokeKeys がREST側と同一の
+    // KeyGuardianを実際に参照・操作することの検証。
+
+    #[tokio::test]
+    async fn key_status_and_revoke_keys_operate_on_the_shared_key_guardian() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let ctx = admin_ctx(engine.clone(), None);
+        let shared_keyring = ctx.keyring.clone().unwrap();
+        let schema = build_schema(engine.clone(), ctx);
+
+        // 発行前は0件。
+        let resp = schema.execute(authorized_request("query { keyStatus { issuedKeyCount } }")).await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        assert_eq!(resp.data.into_json().unwrap()["keyStatus"]["issuedKeyCount"], 0);
+
+        // REST側の自己発行経路(POST /v1/keys/self-issue)と同じKeyGuardian
+        // インスタンスへ、ここでは直接issueして「REST側で発行されたキー」を
+        // 模擬する(共有状態であることの傍証)。
+        shared_keyring.issue("alice", "viewer", None);
+        shared_keyring.issue("bob", "viewer", None);
+
+        let resp = schema.execute(authorized_request("query { keyStatus { issuedKeyCount } }")).await;
+        assert_eq!(resp.data.into_json().unwrap()["keyStatus"]["issuedKeyCount"], 2);
+
+        let resp = schema
+            .execute(authorized_request(r#"mutation { revokeKeys(owner: "alice") { revokedCount } }"#))
+            .await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        assert_eq!(resp.data.into_json().unwrap()["revokeKeys"]["revokedCount"], 1);
+
+        // 失効させても発行済みレコード自体は残る(REST側`keyring_status`の
+        // count()と同じ挙動——revokedフラグが立つだけで削除ではない)ため
+        // 件数は2のまま。
+        let resp = schema.execute(authorized_request("query { keyStatus { issuedKeyCount } }")).await;
+        assert_eq!(resp.data.into_json().unwrap()["keyStatus"]["issuedKeyCount"], 2);
     }
 }

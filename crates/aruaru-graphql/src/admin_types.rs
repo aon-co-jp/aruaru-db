@@ -163,6 +163,18 @@ pub struct ParallelJobGql {
     pub started_at: String,
 }
 
+// ── APIキー自動ライフサイクル管理(2026-08-29(続き)新設) ────────
+
+#[derive(SimpleObject, Clone)]
+pub struct KeyStatusGql {
+    pub issued_key_count: i32,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct KeyRevokeResultGql {
+    pub revoked_count: i32,
+}
+
 // ── フェデレーション ───────────────────────────────────────────
 
 #[derive(SimpleObject, Clone)]
