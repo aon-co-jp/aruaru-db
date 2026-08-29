@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aruaru_dist::{Command, CommandResponse, HttpTransport, RaftDriver, RaftNode};
+use aruaru_dist::{BinaryTcpTransport, Command, CommandResponse, RaftDriver, RaftNode};
 use aruaru_query::{QueryEngine, QueryResponse};
 
 /// Raft commit を QueryEngine へ適用する状態機械
@@ -44,7 +44,34 @@ impl aruaru_dist::Applier for EngineApplier {
 
 /// 同期マーカー (型エイリアス簡略化用)
 pub type ClusterNode = RaftNode<EngineApplier>;
-pub type ClusterDriver = RaftDriver<EngineApplier, HttpTransport>;
+/// 【2026-08-29改修】ノード間RPCを`HttpTransport`(REST/JSON-over-HTTP)
+/// から`BinaryTcpTransport`(生TCP上の長さプレフィックス付きバイナリ
+/// フレーム、`aruaru_dist::raft::binary_transport`参照)へ切り替えた。
+/// ユーザー指示「Raft/WALプロトコル系は一切REST APIを使用しないように」
+/// への対応——理由・調査結果は`binary_transport.rs`モジュールdoc参照。
+pub type ClusterDriver = RaftDriver<EngineApplier, BinaryTcpTransport>;
+
+/// バイナリRaft/WALプロトコル用の待受ポートを、既存の`--gql-port`
+/// (HTTP管理API)からの固定オフセットとして導出する
+/// (`gql_port + BINARY_RAFT_PORT_OFFSET`)。新しいCLIフラグを増やさず、
+/// 既存の`--peers`/`--learner-peers`(`id@host:gql_port`形式)を
+/// そのまま流用できるようにするための約束事——両ノードとも同じ
+/// オフセットを使う前提。
+pub const BINARY_RAFT_PORT_OFFSET: u16 = 100;
+
+/// `id@host:port`(`http://`スキーム有無どちらでも可)形式のピア文字列
+/// から、バイナリRaftトランスポート用の`SocketAddr`(ポートは
+/// `BINARY_RAFT_PORT_OFFSET`だけずらしたもの)を解決する。
+fn to_binary_peer_addr(url_or_addr: &str) -> anyhow::Result<std::net::SocketAddr> {
+    let stripped = url_or_addr
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let mut addr: std::net::SocketAddr = stripped
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid peer address '{url_or_addr}': {e}"))?;
+    addr.set_port(addr.port() + BINARY_RAFT_PORT_OFFSET);
+    Ok(addr)
+}
 
 /// クラスタを構築する。peers が空なら単一ノード(即Leader)。
 /// 戻り値: (node, driver)。driver は呼び出し側で spawn する。
@@ -99,7 +126,11 @@ pub fn build_cluster_with_learners(
 
     let mut peer_map: HashMap<u64, String> = peers.iter().cloned().collect();
     peer_map.extend(learner_peers.iter().cloned());
-    let transport = Arc::new(HttpTransport::new(peer_map)?);
+    let mut binary_peer_map: HashMap<u64, std::net::SocketAddr> = HashMap::new();
+    for (id, addr) in &peer_map {
+        binary_peer_map.insert(*id, to_binary_peer_addr(addr)?);
+    }
+    let transport = Arc::new(BinaryTcpTransport::new(binary_peer_map));
     let driver = RaftDriver::new(node.clone(), transport);
     Ok((node, driver))
 }

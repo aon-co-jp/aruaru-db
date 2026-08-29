@@ -36,7 +36,12 @@ pub struct AdminState {
     parallel: Mutex<ParallelConfig>,
     federation: Mutex<Vec<FederatedSource>>,
     /// クラスタトポロジ (Range 配置 + ノード)
-    topology: Mutex<aruaru_dist::ClusterTopology>,
+    /// 【2026-08-29改修】`Arc<Mutex<..>>`化——GraphQL側(`aruaru_graphql::
+    /// AdminCtx`)へ`topology_handle()`経由で同一インスタンスを共有し、
+    /// REST `/admin/cluster`とGraphQL `clusterStatus`が同じトポロジを
+    /// 参照するようにするため(従来はGraphQL側が固定値スタブを返して
+    /// おり実態を反映していなかった)。
+    topology: Arc<Mutex<aruaru_dist::ClusterTopology>>,
     /// Raft ノード (クラスタモード時のみ Some)
     cluster: Mutex<Option<Arc<ClusterNode>>>,
     /// スタンドアロンのメール・ディザスタバックアップ(`disaster_email_backup`
@@ -89,6 +94,12 @@ pub struct AdminState {
     /// `/admin/object-table/*`として公開。ObjectStoreの実体は依然として
     /// インメモリ(`InMemoryObjectStore`)であり、S3へは未接続。
     object_table: Arc<aruaru_backup::table_format::ObjectTable>,
+    /// 【2026-08-29新設】APIキー自動ライフサイクル管理(`crate::keyring::
+    /// KeyGuardian`)。既存の`ARUARU_DB_ADMIN_TOKEN`静的トークンを置き
+    /// 換えるのではなく併存させる(後方互換)——`check_admin_auth`は
+    /// まず静的トークンとの一致を試み、不一致ならこのキーレジストリを
+    /// 検証する。詳細は`crate::keyring`モジュールdoc参照。
+    pub keyring: Arc<crate::keyring::KeyGuardian>,
 }
 
 impl AdminState {
@@ -100,7 +111,7 @@ impl AdminState {
             schedule: Mutex::new(None),
             parallel: Mutex::new(ParallelConfig::default()),
             federation: Mutex::new(Vec::new()),
-            topology: Mutex::new(aruaru_dist::ClusterTopology::single_node(1, "127.0.0.1:5432")),
+            topology: Arc::new(Mutex::new(aruaru_dist::ClusterTopology::single_node(1, "127.0.0.1:5432"))),
             cluster: Mutex::new(None),
             #[cfg(feature = "disaster_email_backup")]
             disaster_email_backup: Mutex::new(None),
@@ -122,6 +133,7 @@ impl AdminState {
                 1,
                 1,
             )),
+            keyring: Arc::new(crate::keyring::KeyGuardian::new()),
         })
     }
 
@@ -151,6 +163,19 @@ impl AdminState {
 
     pub fn replicator(&self) -> Option<Arc<dyn aruaru_dist::ReplicatedWriter>> {
         self.replicator.lock().clone()
+    }
+
+    /// 【2026-08-29新設】バイナリRaft/WALリスナー(`main.rs`)がclosed
+    /// timestampのside transportを受信側で取り込めるようにするための
+    /// アクセサ。
+    pub fn closed_ts_coordinator(&self) -> Arc<aruaru_dist::ClosedTimestampCoordinator> {
+        self.closed_ts.clone()
+    }
+
+    /// 【2026-08-29新設】GraphQL側(`aruaru_graphql::AdminCtx`)へ同一の
+    /// トポロジインスタンスを共有するためのアクセサ。
+    pub fn topology_handle(&self) -> Arc<Mutex<aruaru_dist::ClusterTopology>> {
+        self.topology.clone()
     }
 }
 
@@ -194,22 +219,45 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-fn check_admin_auth(req: &Request) -> Result<(), (poem::http::StatusCode, &'static str)> {
-    let Ok(expected) = std::env::var(ADMIN_TOKEN_ENV) else {
-        return Err((
-            poem::http::StatusCode::SERVICE_UNAVAILABLE,
-            "admin API is not configured (ARUARU_DB_ADMIN_TOKEN is not set)",
-        ));
-    };
+/// 【2026-08-29改修】静的トークン(`ARUARU_DB_ADMIN_TOKEN`)に加え、
+/// `crate::keyring::KeyGuardian`が自動発行したキーも受理するよう拡張した。
+/// 判定順序: (1) 静的トークンが設定されておりヘッダーと一致すれば即通過、
+/// (2) 一致しなければキーレジストリで検証、`Ok`なら通過、(3) どちらも
+/// 失敗すれば拒否。**静的トークンが未設定の場合でも、キーレジストリに
+/// 1件でも発行済みキーがあれば認証を受け付ける**——「管理APIを使うために
+/// 必ず環境変数の事前設定が要る」という既存の要件を、自己発行キーでも
+/// 満たせるようにするための変更(既存の`ARUARU_DB_ADMIN_TOKEN`運用は
+/// 完全に後方互換のまま)。
+fn check_admin_auth(
+    req: &Request,
+    keyring: &crate::keyring::KeyGuardian,
+) -> Result<(), (poem::http::StatusCode, &'static str)> {
     let provided = req
         .headers()
         .get("x-admin-token")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if provided.is_empty() || !constant_time_eq(provided, &expected) {
-        return Err((poem::http::StatusCode::UNAUTHORIZED, "invalid or missing x-admin-token header"));
+
+    let static_token = std::env::var(ADMIN_TOKEN_ENV).ok();
+    if let Some(expected) = &static_token {
+        if !provided.is_empty() && constant_time_eq(provided, expected) {
+            return Ok(());
+        }
     }
-    Ok(())
+
+    if !provided.is_empty() {
+        if let crate::keyring::KeyDecision::Ok { .. } = keyring.verify(provided) {
+            return Ok(());
+        }
+    }
+
+    if static_token.is_none() && keyring.count() == 0 {
+        return Err((
+            poem::http::StatusCode::SERVICE_UNAVAILABLE,
+            "admin API is not configured (set ARUARU_DB_ADMIN_TOKEN, or self-issue a key via POST /v1/keys/self-issue)",
+        ));
+    }
+    Err((poem::http::StatusCode::UNAUTHORIZED, "invalid or missing x-admin-token header"))
 }
 
 fn now() -> String {
@@ -404,13 +452,44 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         // Raft ノード間 RPC 受信エンドポイント
         .at("/raft/append", post(raft_append))
         .at("/raft/vote", post(raft_vote))
-        .data(state)
-        .around(|ep, req| async move {
-            if let Err((status, msg)) = check_admin_auth(&req) {
-                return Ok(poem::Response::builder().status(status).body(msg));
+        // 【2026-08-29新設】APIキー自動ライフサイクル管理。自己発行
+        // (`self_issue_key`)は認証不要のためこの`/admin/*`配下ではなく
+        // `main.rs`のトップレベルルート(`/v1/keys/self-issue`)に置く
+        // ——ここ(`/admin/keys/revoke`)は「発行済みキーの自動破棄」の
+        // みを扱うため、既存の`/admin/*`共通認証(静的トークンまたは
+        // 有効な発行済みキー)をそのまま要求してよい。
+        .at("/keys/revoke", post(revoke_key))
+        .at("/keys/status", get(keyring_status))
+        .data(state.clone())
+        .around(move |ep, req| {
+            let state = state.clone();
+            async move {
+                if let Err((status, msg)) = check_admin_auth(&req, &state.keyring) {
+                    return Ok(poem::Response::builder().status(status).body(msg));
+                }
+                ep.call(req).await.map(poem::IntoResponse::into_response)
             }
-            ep.call(req).await.map(poem::IntoResponse::into_response)
         })
+}
+
+// ── APIキー自動ライフサイクル管理(2026-08-29新設) ──────────────
+
+#[derive(Deserialize)]
+struct RevokeKeyRequest {
+    owner: String,
+}
+
+/// 自動破棄: 指定オーナーが持つ全キーを即座に失効させる。
+#[handler]
+fn revoke_key(state: Data<&Arc<AdminState>>, Json(req): Json<RevokeKeyRequest>) -> Json<Value> {
+    let revoked = state.keyring.revoke_owner(&req.owner);
+    Json(json!({ "owner": req.owner, "revoked_count": revoked }))
+}
+
+/// 監視用: 現在登録されているキー件数(失効済み含む)。
+#[handler]
+fn keyring_status(state: Data<&Arc<AdminState>>) -> Json<Value> {
+    Json(json!({ "issued_key_count": state.keyring.count() }))
 }
 
 // ── ① バックアップ ─────────────────────────────────────────────
@@ -788,55 +867,49 @@ async fn federated_query(state: Data<&Arc<AdminState>>, Json(req): Json<SqlReque
 
 // ── クラスタ (分散基盤) ────────────────────────────────────────
 
+/// 【2026-08-29改修】計算本体を`aruaru_dist::ClusterTopology::
+/// status_snapshot`(REST・GraphQL共通)へ切り出した。ここでは
+/// REST固有の追加フィールド(`total_disk_gb`・`raft_term`・
+/// `ranges_needing_split`)だけをスナップショットへ足して従来と
+/// 同じJSON形状を維持する(既存クライアントへの後方互換)。
 #[handler]
 fn cluster_status(state: Data<&Arc<AdminState>>) -> Json<Value> {
     let commit_count = state.engine.version().log(1_000_000).len() as u64;
     let total_rows = state.engine.total_rows() as u64;
-    let table_count = state.engine.table_names().len() as u64;
+    let table_count = state.engine.table_names().len();
 
     let topo = state.topology.lock();
-    let alive = topo.alive_nodes();
+    let snapshot = topo.status_snapshot(commit_count, total_rows, table_count);
+    let ranges_needing_split = topo.ranges_needing_split();
 
-    // ノード一覧 (トポロジ由来)。Leader 判定は Range のリーダーに含まれるかで近似。
-    let nodes: Vec<Value> = topo
+    let nodes: Vec<Value> = snapshot
         .nodes
         .iter()
         .map(|n| {
-            let is_leader = topo.ranges.iter().any(|r| r.leader == n.node_id);
-            let range_cnt = topo.ranges.iter().filter(|r| r.replicas.contains(&n.node_id)).count();
             json!({
-                "node_id": n.node_id, "addr": n.addr,
-                "role": if is_leader { "Leader" } else { "Follower" },
-                "alive": n.alive,
-                "term": 0, "commit_index": commit_count, "applied_index": commit_count,
-                "ranges": range_cnt,
-                "disk_used_gb": (total_rows as f64 * 64.0) / 1e9,
+                "node_id": n.node_id, "addr": n.addr, "role": n.role, "alive": n.alive,
+                "term": 0, "commit_index": n.commit_index, "applied_index": n.applied_index,
+                "ranges": n.ranges, "disk_used_gb": n.disk_used_gb,
                 "cpu_pct": 0, "last_heartbeat_ms": 0
             })
         })
         .collect();
-
-    let ranges: Vec<Value> = topo
+    let ranges: Vec<Value> = snapshot
         .ranges
         .iter()
-        .map(|r| {
-            json!({
-                "range_id": r.range_id,
-                "start_key": r.start_key.as_ref().map(|k| String::from_utf8_lossy(k).to_string()).unwrap_or_else(|| "(min)".into()),
-                "end_key": r.end_key.as_ref().map(|k| String::from_utf8_lossy(k).to_string()).unwrap_or_else(|| "(max)".into()),
-                "leader_node": r.leader, "replicas": r.replicas,
-                "size_mb": (r.size_bytes as f64) / 1e6,
-            })
-        })
+        .map(|r| json!({
+            "range_id": r.range_id, "start_key": r.start_key, "end_key": r.end_key,
+            "leader_node": r.leader_node, "replicas": r.replicas, "size_mb": r.size_mb,
+        }))
         .collect();
-
     let stats = json!({
-        "total_nodes": topo.nodes.len(), "healthy_nodes": alive.len(),
-        "total_ranges": topo.range_count(),
-        "total_rows": total_rows, "total_disk_gb": (total_rows as f64 * 64.0) / 1e9,
-        "raft_term": 0, "replication_factor": topo.replication_factor, "table_count": table_count,
-        "under_replicated": topo.under_replicated(),
-        "ranges_needing_split": topo.ranges_needing_split(),
+        "total_nodes": snapshot.total_nodes, "healthy_nodes": snapshot.healthy_nodes,
+        "total_ranges": snapshot.total_ranges,
+        "total_rows": snapshot.total_rows, "total_disk_gb": (total_rows as f64 * 64.0) / 1e9,
+        "raft_term": 0, "replication_factor": snapshot.replication_factor,
+        "table_count": snapshot.table_count,
+        "under_replicated": snapshot.under_replicated,
+        "ranges_needing_split": ranges_needing_split,
     });
 
     Json(json!({ "stats": stats, "nodes": nodes, "ranges": ranges }))
@@ -1502,10 +1575,18 @@ struct ClosedTsPublishRequest {
 }
 
 /// `POST /admin/closed-timestamp/publish` — side transport の送信側
-/// (2026-08-24新設・タスク2)。このノード(leaseholder想定)が保持する
-/// closed timestampを、実際に`HttpSideTransport`(`raft/transport.rs`、
-/// `HttpTransport`のAppendEntries送信と同じHTTP+`x-admin-token`パターン)
-/// 経由で指定したfollowerノードへネットワーク越しに配布する。
+/// (2026-08-24新設・タスク2、2026-08-29改修)。このノード(leaseholder
+/// 想定)が保持するclosed timestampを、`BinaryTcpSideTransport`
+/// (`raft/binary_transport.rs`、生TCP上の長さプレフィックス付き
+/// バイナリフレーム)経由で指定したfollowerノードへネットワーク越しに
+/// 配布する。**この管理操作自体(=いつ・誰に配布するかを人間/運用
+/// ツールが指示すること)はREST管理APIのままでよい**——ユーザー指示
+/// 「Raft/WALプロトコル系は一切REST APIを使用しないように」が対象と
+/// するのは、この指示を受けて実際に発生するノード間の生データ転送
+/// (旧`HttpSideTransport`)であり、そちらを今回REST/JSONから切り離した。
+/// `peer_url`は旧来の`http://host:port`ではなく、相手ノードの
+/// バイナリRaft/WALリスナーの`host:port`(`--gql-port` +
+/// `cluster::BINARY_RAFT_PORT_OFFSET`)を指定する。
 #[handler]
 async fn closed_ts_publish(
     state: Data<&Arc<AdminState>>,
@@ -1516,12 +1597,23 @@ async fn closed_ts_publish(
         let allow: std::collections::HashSet<u64> = ids.iter().copied().collect();
         snapshot.retain(|(id, _)| allow.contains(id));
     }
-    let mut peers = HashMap::new();
-    peers.insert(req.peer_id, req.peer_url.clone());
-    let transport = match aruaru_dist::raft::transport::HttpSideTransport::new(peers) {
-        Ok(t) => t,
-        Err(e) => return Json(json!({ "success": false, "error": format!("failed to build transport: {e}") })),
+    let peer_addr: std::net::SocketAddr = match req
+        .peer_url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .parse()
+    {
+        Ok(addr) => addr,
+        Err(e) => {
+            return Json(json!({
+                "success": false,
+                "error": format!("invalid peer_url '{}' (expected host:port of the peer's binary Raft/WAL listener): {e}", req.peer_url),
+            }))
+        }
     };
+    let mut peers = HashMap::new();
+    peers.insert(req.peer_id, peer_addr);
+    let transport = aruaru_dist::raft::binary_transport::BinaryTcpSideTransport::new(peers);
     match transport.publish_to(req.peer_id, snapshot.clone()).await {
         Ok(advanced) => Json(json!({
             "success": true,

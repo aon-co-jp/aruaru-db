@@ -21,6 +21,10 @@ anyhow.workspace           = true
 tracing.workspace          = true
 hex.workspace              = true
 chrono.workspace           = true
+# クラスタトポロジ共有(2026-08-29新設)。REST(`aruaru-server::admin`)と
+# 同一の`Arc<Mutex<ClusterTopology>>`を参照するため、同じMutex実装
+# (parking_lot)を使う必要がある。
+parking_lot.workspace      = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

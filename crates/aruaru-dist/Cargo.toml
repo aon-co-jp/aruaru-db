@@ -22,6 +22,10 @@ reqwest.workspace = true
 futures.workspace = true
 sha2.workspace = true
 hex.workspace = true
+# バイナリRaft RPCトランスポート(2026-08-29新設、raft/binary_transport.rs
+# 参照)。ノード間通信をREST/JSONから完全に切り離すための長さ
+# プレフィックス付きバイナリフレーム(生TCP)のシリアライズに使用。
+bincode.workspace = true
 # DUAL DATABASE構成(aruaru-db x PostgreSQL、`open-web-server/CLAUDE.md`
 # 拡張要件(4)「DB書き込みの四重化」の②。open-web-server-ledgerの
 # postgres_wal.rs(①)と同じ`sqlx`postgres featureを使う。

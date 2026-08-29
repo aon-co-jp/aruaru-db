@@ -28,6 +28,15 @@ pub struct AdminCtx {
     pub registry: Arc<Registry>,
     pub backup: Arc<BackupEngine>,
     pub replicator: Option<Arc<dyn aruaru_dist::ReplicatedWriter>>,
+    /// 【2026-08-29新設】REST(`aruaru-server::admin::AdminState`)と
+    /// **同一インスタンス**を共有するクラスタトポロジ(`AdminState::
+    /// topology_handle()`経由)。これにより`clusterStatus`が固定値の
+    /// スタブではなく、REST `/admin/cluster`と全く同じ実データを返す
+    /// ようになる(ユーザー指示「/admin/*の運用系REST操作のうちデータ
+    /// 寄りのものをGraphQLへ移し、RESTの必要性を実際に減らす」への
+    /// 対応)。`None`の場合(将来サーバー構成が変わった場合の保険)は
+    /// 従来通り単一ノード相当のフォールバック値を返す。
+    pub topology: Option<Arc<parking_lot::Mutex<aruaru_dist::ClusterTopology>>>,
 }
 
 /// `x-admin-token`ヘッダーを検証する(2026-08-01追加、実バグ修正)。
@@ -178,40 +187,70 @@ impl AdminQuery {
 
     // ── クラスタ ────────────────────────────────────────────
 
+    /// 【2026-08-29改修】固定値スタブを廃止し、REST `/admin/cluster`と
+    /// 同一の`ClusterTopology`(`AdminCtx.topology`、`AdminState`と共有)
+    /// から`status_snapshot`(`aruaru-dist`共通実装)経由で実データを
+    /// 返すよう変更した。`topology`が渡されていない構成(将来の互換性
+    /// 保険)の場合のみ、従来通りの単一ノード近似値へフォールバックする
+    /// ——このフォールバック自体は正直にコメントで明示し、本番構成で
+    /// 常に`Some`が渡っていることをテストで確認する。
     async fn cluster_status(&self, ctx: &Context<'_>) -> Result<ClusterStatusGql> {
         let a = admin(ctx)?;
-        let commit_count = a.engine.version().log(1_000_000).len() as i64;
-        let total_rows = a.engine.total_rows() as i64;
-        let table_count = a.engine.table_names().len() as i32;
+        let total_rows = a.engine.total_rows() as u64;
+
+        let snapshot = match &a.topology {
+            Some(topology) => {
+                let commit_count = a.engine.version().log(1_000_000).len() as u64;
+                let table_count = a.engine.table_names().len();
+                topology.lock().status_snapshot(commit_count, total_rows, table_count)
+            }
+            None => {
+                // フォールバック(topology未配線時のみ、正直な近似値)。
+                let commit_count = a.engine.version().log(1_000_000).len() as u64;
+                aruaru_dist::ClusterTopology::single_node(1, "127.0.0.1:5432").status_snapshot(
+                    commit_count,
+                    total_rows,
+                    a.engine.table_names().len(),
+                )
+            }
+        };
 
         Ok(ClusterStatusGql {
             stats: ClusterStatsGql {
-                total_nodes: 1,
-                healthy_nodes: 1,
-                total_ranges: 1,
-                total_rows,
-                table_count,
-                replication_factor: 1,
-                under_replicated: vec![],
+                total_nodes: snapshot.total_nodes as i32,
+                healthy_nodes: snapshot.healthy_nodes as i32,
+                total_ranges: snapshot.total_ranges as i32,
+                total_rows: snapshot.total_rows as i64,
+                table_count: snapshot.table_count as i32,
+                replication_factor: snapshot.replication_factor as i32,
+                under_replicated: snapshot.under_replicated.iter().map(|&id| id as i64).collect(),
             },
-            nodes: vec![NodeStatusGql {
-                node_id: 1,
-                addr: "127.0.0.1:5432".into(),
-                role: "Leader".into(),
-                alive: true,
-                commit_index: commit_count,
-                applied_index: commit_count,
-                ranges: 1,
-                disk_used_gb: (total_rows as f64 * 64.0) / 1e9,
-            }],
-            ranges: vec![RangeGql {
-                range_id: 1,
-                start_key: "(min)".into(),
-                end_key: "(max)".into(),
-                leader_node: 1,
-                replicas: vec![1],
-                size_mb: (total_rows as f64 * 64.0) / 1e6,
-            }],
+            nodes: snapshot
+                .nodes
+                .into_iter()
+                .map(|n| NodeStatusGql {
+                    node_id: n.node_id as i64,
+                    addr: n.addr,
+                    role: n.role,
+                    alive: n.alive,
+                    commit_index: n.commit_index as i64,
+                    applied_index: n.applied_index as i64,
+                    ranges: n.ranges as i32,
+                    disk_used_gb: n.disk_used_gb,
+                })
+                .collect(),
+            ranges: snapshot
+                .ranges
+                .into_iter()
+                .map(|r| RangeGql {
+                    range_id: r.range_id as i64,
+                    start_key: r.start_key,
+                    end_key: r.end_key,
+                    leader_node: r.leader_node as i64,
+                    replicas: r.replicas.iter().map(|&id| id as i64).collect(),
+                    size_mb: r.size_mb,
+                })
+                .collect(),
         })
     }
 
@@ -699,6 +738,9 @@ mod cluster_propose_tests {
             registry: aruaru_registry::Registry::new(),
             backup: test_backup_engine(engine),
             replicator,
+            topology: Some(Arc::new(parking_lot::Mutex::new(
+                aruaru_dist::ClusterTopology::single_node(1, "127.0.0.1:5432"),
+            ))),
         }
     }
 

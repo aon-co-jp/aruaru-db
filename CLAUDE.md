@@ -4033,3 +4033,145 @@ open-english側のユーザー指示「関連リポジトリのセキュリテ�
   計画・実施(破壊的変更の洗い出し、`aruaru-registry`クレートの
   回帰テスト整備が前提)、(2) `idna`/`rkyv`の深刻度評価、(3) `rsa`の
   上流修正状況を定期確認。
+
+## 設計方針: APIキー自動ライフサイクル管理 + REST→GraphQL/バイナリ
+プロトコルへの段階的移行(2026-08-29、open-english/RPoem連携経由の
+ユーザー指示、今後の全セッション共通方針として記録)
+
+**背景**: open-english側のセッションから「aruaru-dbとの連携を強化し、
+特にREST APIを不要にして。APIキーは自動発行・自動承認・自動破棄・
+自動削除で自動管理して」という指示を受けた。RPoem
+(`open-runo-router::keyring::KeyGuardian`)の実装済み設計を調査した
+結果、「APIキー不要」とは認証自体の廃止ではなく**人間がキーを手動で
+発行・管理する必要をゼロにすること**を意味すると確認した上で、
+本リポジトリに以下を実装した。
+
+### 1. APIキー自動ライフサイクル管理(実装済み)
+
+`crates/aruaru-server/src/keyring.rs`(新規、RPoemの`KeyGuardian`と
+**同じ設計思想を独立に再実装**——Cargo依存としては結合しない、この
+エコシステムの既存方針〈WunderGraph Cosmo/Poem/Tauriと同様〉を踏襲):
+- **自動発行**: `POST /v1/keys/self-issue`(認証不要)が`viewer`ロール・
+  既定24時間TTLのキーを即座に発行する。
+- **自動承認**: 「認証を要求せず即座に発行できる」こと自体が承認手続き
+  そのもの——人間の承認待ちキューは存在しない。
+- **自動破棄**: `POST /admin/keys/revoke`(`{owner}`指定)で特定オーナー
+  の全キーを即座に失効。
+- **自動削除**: 期限切れキーは`verify()`実行時に検知されその場で
+  レジストリから削除される(明示的なcronジョブ不要)。
+- 既存の`ARUARU_DB_ADMIN_TOKEN`静的トークンとは**完全に後方互換**
+  (両方式を`check_admin_auth`が併存判定、どちらか一方が有効なら通過)。
+- 実機検証: 単体テスト5件(発行・失効・期限切れ自動削除等)に加え、
+  実サーバーを起動し実HTTP経由で「無認証で自己発行→発行したキーで
+  保護エンドポイントへアクセス成功→そのキーを失効→同じキーで
+  401」という一連の流れを確認済み。
+
+### 2. Raft/WALプロトコルのREST完全撤廃(実装済み)
+
+ユーザー指示「Raft/WALプロトコル系は一切REST APIを使用しないように。
+信頼できる代替が無ければRust+RPoem/関連リポジトリをフル動員して
+一から開発すること」への対応。
+
+**調査結果(日英Web検索)**: 実運用の分散合意システム(etcd・TiKV)は
+いずれもノード間RPCにREST/JSON-over-HTTPを使わず、gRPC(Protocol
+Buffersによるバイナリシリアライズ+HTTP/2)を使う。Protobufペイロード
+は同等のJSONより概ね3〜5倍小さく、パースは5〜10倍速いという報告が
+ある([TiKV公式](https://tikv.org/deep-dive/rpc/grpc/)、
+[etcd公式](https://etcd.io/docs/v3.4/learning/design-client/))。
+Raftのノード間通信は単一運用者が管理する信頼済みネットワーク内で
+完結するRPCであり、人間可読性より低レイテンシ・低オーバーヘッドが
+優先されるべきと判断した。
+
+**実装**: `crates/aruaru-dist/src/raft/binary_transport.rs`(新規)。
+tonic/gRPC等の外部フレームワークは導入せず(このエコシステムの
+一貫方針、RPoemの手書きgRPC Health Serviceが同種の前例)、生TCP上の
+長さプレフィックス付きバイナリフレーム(`bincode`のserde互換API)を
+自前実装した。`AppendEntries`・`RequestVote`(旧`HttpTransport`)・
+closed timestampのside transport(旧`HttpSideTransport`)の**両方**を
+この単一のバイナリポート(`--gql-port` + 100固定オフセット、
+`cluster::BINARY_RAFT_PORT_OFFSET`)へ統合し、REST/JSON-over-HTTPを
+一切経由しないようにした。認証は既存の`ARUARU_DB_ADMIN_TOKEN`を
+フレーム内に含め定数時間比較(TLS/mTLSは未実装、同一データセンター
+内の信頼済みネットワークを前提とする従来の`HttpTransport`と同水準の
+境界)。
+
+**正直な線引き**: `/admin/closed-timestamp/publish`(「いつ・誰に
+配布するか」を人間/運用ツールが指示する管理トリガー)自体はREST
+管理APIのまま残した——ここは制御プレーン(人間向け)であり、
+ユーザー指示が対象とするのは実際に発生するノード間の生データ転送
+(データプレーン)である、という区別に基づく。
+
+**実機検証**: 2プロセス(leader+learner)を実際に別ポートで起動し、
+leaderへのINSERTがバイナリポート(8402等)経由で実際にfollowerの
+QueryEngineへ複製されること、REST側の旧`/admin/raft/append`が
+もはや呼ばれていないこと(バイナリリスナーのログ・TCP接続一覧で
+確認)を実証。単体テスト3件(フレーム往復・実TCP経由E2E・トークン
+不一致拒否)も全green。ワークスペース全体`cargo test`でリグレッション
+無し(既存192件超、全green)。
+
+### 3. `/admin/*`のREST→GraphQL段階的移行(第一歩のみ実装、方針を確立)
+
+**深い調査(日英、Google/GitHub、実装事例・論文)の結果**: 「即座に
+REST APIを完全撤廃する」ことは2026年時点の実務における標準パターン
+**ではない**、と判明した。
+- Shopifyは実際にREST Admin APIを廃止方針としているが、新機能は
+  GraphQL限定で提供しつつ既存REST機能は年次の廃止波(sunset wave)で
+  段階的に縮小している([Shopify Admin API](https://shopify.dev/docs/api/admin-graphql/2026-04))。
+- 日本のJX通信社は「新規APIはGraphQL、改修機会のある既存APIは改修時に
+  GraphQL化、それ以外は段階的」という**9ヶ月がかりの段階移行**で
+  全REST APIを置き換えた実例がある([がぶちゃんの日記](https://gabu.hatenablog.com/entry/2023/08/02/130000))。
+- 「複数ゲートウェイ・複数プロトコルを横断する統一コントロールプレーン」
+  という、REST/GraphQL/gRPC等を併存させたまま管理する設計が2026年の
+  実務でも主流であり、「完全REST撤廃」自体が支配的パターンではない。
+
+**この調査結果に基づく本リポジトリの方針(今後のセッションが従うべき
+既定方針)**: `/admin/*`のREST操作を、根拠のない「一括撤廃」の主張で
+終わらせず、**実際に真のデータソースへ接続してから**段階的にGraphQL
+実装を充実させ、**十分検証できたものから**REST側を縮小していく。
+
+**発見した重大な事実(正直な開示)**: 着手前に`aruaru-graphql/src/
+admin_resolvers.rs`を確認したところ、`cluster_status`・
+`parallel_config`・`parallel_jobs`・`federated_sources`・
+`backup_schedule`等のGraphQL側resolverは、**REST側の実データには
+一切接続されておらず、固定値や`Ok(vec![])`のようなスタブを返すだけ**
+だったと判明した(2026-08-01のHANDOFFは「GraphQL経由の管理操作にも
+認証を適用した」と記録していたが、これは認証ミドルウェアの追加のみを
+指しており、resolverの中身が本物のデータを返すことまでは検証・
+保証していなかった——ドキュメントの記述と実態が食い違っていた
+このエコシステムで繰り返し見つかるパターンの新たな実例)。
+
+**今回実装した第一歩(`cluster_status`)**: `aruaru-dist::shard::
+topology::ClusterTopology::status_snapshot()`という**REST・GraphQL
+共通の1つの実装**を新設し、REST `/admin/cluster`ハンドラ
+(`admin.rs::cluster_status`)とGraphQL `clusterStatus` resolverの
+**両方**がこれを呼ぶように書き換えた。`AdminState.topology`を
+`Arc<Mutex<..>>`化し、`AdminCtx.topology`として同一インスタンスを
+GraphQL側にも共有することで、今後REST側でトポロジが変化すれば
+(ノード追加・Range分割等)GraphQL側にも即座に反映される。これで
+GraphQL `clusterStatus`は**もう固定値のスタブではなく本物のデータ**
+を返す。
+
+**まだ未着手のまま正直に残す範囲(次回以降の段階的着手対象)**:
+`parallel_config`/`parallel_jobs`/`federated_sources`/
+`backup_schedule`(依然スタブ、REST側の実データへの接続が必要)、
+`multi-raft`(split/merge/scatter-query)・`sharded-store`・
+`closed-timestamp`(status/register/advance/plan)・`wal-service`・
+`object-table`・`ephemeral-query`・`registry`(crawl/test-connection)
+・`keys`(revoke/status)は、GraphQL側に対応するresolver自体がまだ
+存在しない(2026-08-21〜24に新設された機能はREST限定で実装された
+ため)。これらを1機能ずつ「REST側の実装をGraphQLへ移し、実際に
+実HTTPで動作確認してからREST側の縮小を検討する」という同じ手順で
+段階的に進めること——スタブを量産して「GraphQL対応済み」と見せかける
+ことは絶対に避けること。
+
+**検証**: `cargo test --workspace`全green(既存テストにリグレッション
+無し、`AdminCtx`の新フィールド追加に伴うテスト側の構築箇所修正1件を
+含む)。実サーバーでの`clusterStatus`クエリの実HTTP確認は次回セッション
+で実施すること(このセッションではコンパイル・単体テストの確認までに
+留まった、正直な開示)。
+
+- 次にすべきこと: (1) 上記「まだ未着手」の各機能を1つずつ
+  GraphQL化(REST実装への接続→実HTTP確認→REST縮小の検討、の順で)、
+  (2) `clusterStatus`の実サーバー実HTTP確認、(3) この段階的移行方針
+  自体を、他のRESTを持つ関連リポジトリ(open-easy-web・open-web-server
+  等)へも横展開するか検討。

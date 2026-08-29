@@ -7,6 +7,47 @@ use serde::{Deserialize, Serialize};
 
 use super::Range;
 
+/// 【2026-08-29新設】クラスタ状態の要約(REST `/admin/cluster`とGraphQL
+/// `clusterStatus`の**両方**がこの1つの関数を呼ぶことで、見せかけの
+/// GraphQL側実装(固定値`total_nodes: 1`等を返すだけのスタブ)を
+/// 解消し、実際のトポロジを単一の実装から正しく反映するようにした
+/// (ユーザー指示「/admin/*の運用系REST操作のうちデータ寄りのものを
+/// GraphQLへ移し、RESTの必要性を実際に減らす」への対応の第一歩)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterStatusSnapshot {
+    pub total_nodes: usize,
+    pub healthy_nodes: usize,
+    pub total_ranges: usize,
+    pub total_rows: u64,
+    pub table_count: usize,
+    pub replication_factor: usize,
+    pub under_replicated: Vec<u64>,
+    pub nodes: Vec<NodeStatusSnapshot>,
+    pub ranges: Vec<RangeStatusSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStatusSnapshot {
+    pub node_id: u64,
+    pub addr: String,
+    pub role: String,
+    pub alive: bool,
+    pub commit_index: u64,
+    pub applied_index: u64,
+    pub ranges: usize,
+    pub disk_used_gb: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RangeStatusSnapshot {
+    pub range_id: u64,
+    pub start_key: String,
+    pub end_key: String,
+    pub leader_node: u64,
+    pub replicas: Vec<u64>,
+    pub size_mb: f64,
+}
+
 /// クラスタ内のノード情報
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
@@ -146,6 +187,69 @@ impl ClusterTopology {
 
     pub fn range_count(&self) -> usize {
         self.ranges.len()
+    }
+
+    /// クラスタ状態の要約を組み立てる(REST `/admin/cluster`・GraphQL
+    /// `clusterStatus`共通)。`commit_count`/`total_rows`/`table_count`
+    /// (`QueryEngine`から取得、このクレートは`aruaru-query`に依存しない
+    /// ため呼び出し側が渡す)以外は、すべてこのトポロジ自身が持つ情報
+    /// から導出する。
+    pub fn status_snapshot(
+        &self,
+        commit_count: u64,
+        total_rows: u64,
+        table_count: usize,
+    ) -> ClusterStatusSnapshot {
+        let alive = self.alive_nodes();
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|n| {
+                let is_leader = self.ranges.iter().any(|r| r.leader == n.node_id);
+                let range_cnt = self.ranges.iter().filter(|r| r.replicas.contains(&n.node_id)).count();
+                NodeStatusSnapshot {
+                    node_id: n.node_id,
+                    addr: n.addr.clone(),
+                    role: if is_leader { "Leader".to_string() } else { "Follower".to_string() },
+                    alive: n.alive,
+                    commit_index: commit_count,
+                    applied_index: commit_count,
+                    ranges: range_cnt,
+                    disk_used_gb: (total_rows as f64 * 64.0) / 1e9,
+                }
+            })
+            .collect();
+        let ranges = self
+            .ranges
+            .iter()
+            .map(|r| RangeStatusSnapshot {
+                range_id: r.range_id,
+                start_key: r
+                    .start_key
+                    .as_ref()
+                    .map(|k| String::from_utf8_lossy(k).to_string())
+                    .unwrap_or_else(|| "(min)".into()),
+                end_key: r
+                    .end_key
+                    .as_ref()
+                    .map(|k| String::from_utf8_lossy(k).to_string())
+                    .unwrap_or_else(|| "(max)".into()),
+                leader_node: r.leader,
+                replicas: r.replicas.clone(),
+                size_mb: (r.size_bytes as f64) / 1e6,
+            })
+            .collect();
+        ClusterStatusSnapshot {
+            total_nodes: self.nodes.len(),
+            healthy_nodes: alive.len(),
+            total_ranges: self.ranges.len(),
+            total_rows,
+            table_count,
+            replication_factor: self.replication_factor,
+            under_replicated: self.under_replicated(),
+            nodes,
+            ranges,
+        }
     }
 
     /// 【2026-08-21新設・Vitess再検証で発見した実欠落への対応】隣接する2つの

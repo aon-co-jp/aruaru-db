@@ -27,6 +27,11 @@ serde.workspace       = true
 serde_json.workspace  = true
 parking_lot.workspace = true
 chrono.workspace      = true
+# APIキー自動ライフサイクル管理(2026-08-29新設、src/keyring.rs参照)。
+# RPoemの`KeyGuardian`と同じ最小依存構成(SHA-256ハッシュ化+UUID発行)。
+sha2.workspace        = true
+hex.workspace         = true
+uuid.workspace        = true
 # DUAL DATABASE構成(`DUAL_DATABASE_URL`)向け。aruaru-dist/aruaru-wireと
 # 同じsqlx postgres featureセット。
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
