@@ -44,6 +44,35 @@
 >   `keyStatus`/`revokeKeys`が実データへ接続済み、詳細は下記HANDOFF
 >   参照)。**次に何か実装する前に、まずこの3点(SET連携・Cosmo
 >   本体はOSS・闇雲な代替を避ける)を再確認すること。**
+>
+> ### 🔄 セッション再開用メモ(2026-08-29時点、別アカウント/別セッション
+> からでもここだけ読めば続きから着手できるようにするための要約)
+>
+> - **直近3コミット**(`git log --oneline -3`で確認可): (1)
+>   `backupSchedule`/`federatedSources`をREST実データへ接続、(2)
+>   `keyStatus`/`revokeKeys`を新設しREST `/admin/keys/*`と同一の
+>   `KeyGuardian`(`crates/aruaru-dist/src/keyring.rs`)を共有、(3)
+>   本セクション(最重要事項)をファイル冒頭へ固定。いずれも
+>   `cargo build --workspace`/`cargo test --workspace`(19テスト
+>   バイナリ、失敗0件)で検証済み・pushまで完了。
+> - **今すぐ着手できる次の一手**: GraphQL側にresolver自体がまだ無い
+>   `multi-raft`(split/merge/scatter-query)・`sharded-store`・
+>   `closed-timestamp`・`wal-service`・`object-table`・
+>   `ephemeral-query`のうち1つを選び、`admin_shared.rs`/`keyring.rs`と
+>   同じ「REST(`AdminState`)とGraphQL(`AdminCtx`)が`aruaru-dist`
+>   経由で同一の`Arc<Mutex<..>>`を共有する」パターンで接続する
+>   ——**着手前に必ず「これはaruaru-db+RPoem SETとしての価値
+>   (SCIM/SSO相当・APIキー自動管理・VersionlessAPI互換)を強化
+>   するか」を自問すること**(闇雲な代替を避けるため)。
+> - **意図的に保留中(着手不要)**: `parallel_config`はREST実体
+>   (`max_parallelism`等7フィールド)とGraphQLスキーマ
+>   (`enabled`/`max_workers`等4フィールド)が非互換なため、
+>   スキーマ自体の破壊的変更をユーザーへ確認するまで着手しないこと。
+> - **既に完了済み(「未着手」と誤解しないこと)**: `registry`の
+>   `crawlRegistry`/`testRegistryConnection`はGraphQL側で既に実データ
+>   接続済み。
+> - 詳細な実装内容・検証ログは本ファイル内「HANDOFF追記(2026-08-29
+>   〜続き2)」の3エントリを参照。
 
 > **📌 2026-08-26追記: Windows用インストーラー`aruaru-db-installer.exe`を
 > 新設(命名規則統一)**: ユーザー指示「パワーシェルでインストールする
