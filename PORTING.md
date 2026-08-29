@@ -269,14 +269,23 @@ cargo run -p aruaru-backup --bin backup-cli -- restore --path ./backups/<manifes
 
 ## 7. REST/SQL/GraphQL サーフェス早見表
 
+> **⚠️ 2026-08-29 抜本再設計中**: 管理面(`/admin/*` の REST)は**全撤廃**の
+> 方針へ転換した。正本は [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md)。
+> 最終形の `aruaru-server` の HTTP は `/graphql`・`/graphql/sdl`・
+> `/health*`・`/metrics` のみ。運用設定は宣言的 `aruaru.yaml` +
+> ホットリロード(`aruaru-server::config`、`--config <path>`)。以下の表の
+> `admin/`(Tauri)行と `/admin/*` は移行途上——最新状況は
+> `CLAUDE.md` 冒頭「🔄 セッション再開用メモ」参照。
+
 | インターフェース | 用途 |
 |------|------|
 | `psql -h <host> -p 5432` | PostgreSQL ワイヤ互換(pgwire) |
-| `POST /graphql`(`GET /graphql` で GraphiQL) | Versionless GraphQL |
+| `POST /graphql`(`GET /graphql` で GraphiQL) | Versionless GraphQL(query=観測 / mutation=アクション) |
+| `--config aruaru.yaml`(ホットリロード) | 宣言的な運用設定(旧 `/admin/*` 設定系の移行先) |
 | `SELECT aruaru_branch/commit/diff/merge/log(...)` | Git-on-SQL バージョン管理 |
 | `cargo run -p aruaru-migrate` | 他エンジンからの移行 CLI |
 | `cargo run -p aruaru-backup` | バックアップ・リストア CLI |
-| `admin/`(Tauri) | 管理 GUI(クラスタ状態・スキーマ・バックアップ操作) |
+| `admin/`(Tauri) | 管理 GUI(GraphQL クライアント化へ移行中) |
 
 移設先で pgwire/GraphQL のどちらかしか要らない場合は、対応するクレート
 (`aruaru-wire` または `aruaru-graphql`)だけを依存に加えれば足りる
@@ -293,23 +302,35 @@ cargo run -p aruaru-backup --bin backup-cli -- restore --path ./backups/<manifes
 **本体**(Router等)は実はApache 2.0のOSSであり、有料(Enterprise)
 部分はSSO+SCIM・専有クラウドに限定される点も忘れないこと。
 
-**REST→GraphQL段階移行の状況(2026-08-29時点)**: `/admin/*`のREST
-エンドポイントのうち、`clusterStatus`・`backupSchedule`・
-`federatedSources`(および対応するmutation)・`keyStatus`/`revokeKeys`
-はGraphQL側が`crates/aruaru-dist/src/admin_shared.rs`(topology/
-schedule/federation)・`crates/aruaru-dist/src/keyring.rs`
-(`KeyGuardian`)の共有型経由でREST側と**同一の状態インスタンス**を
-参照するよう接続済み——移植先で新しいREST/GraphQL両対応の管理データを
-追加する場合は、この`Arc<parking_lot::Mutex<..>>`(または
-`Arc<KeyGuardian>`)共有パターンを踏襲すること(`AdminState::
-topology_handle()`/`schedule_handle()`/`federation_handle()`/
-`keyring`フィールドが実例)。`parallel_config`(REST実体とGraphQL
-スキーマの形状が非互換なため意図的に未接続、無理な変換をしないこと)・
-`multi-raft`・`sharded-store`・`closed-timestamp`・`wal-service`・
-`object-table`・`ephemeral-query`はGraphQL側が未接続のまま
-(詳細・理由は`CLAUDE.md`のHANDOFF参照)。**注意**: `registry`の
-crawl/test-connection(`crawlRegistry`/`testRegistryConnection`)は
-既にGraphQL側で実データ接続済み——「未着手」と誤解しないこと。
+**REST→GraphQL の状況(2026-08-29、抜本再設計へ移行後)**: 当初は
+`/admin/*` を 1 本ずつ「GraphQL + 共有 `Arc<Mutex<..>>`」へ移していたが、
+それは *稼働中プロセスの生状態をフィールド単位でライブ書き換えする
+アンチパターン* の移送にすぎない、との指摘を受けて方針転換。
+正本 [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md)
+に基づき、**設定系(B1)は宣言的 `aruaru.yaml` + reconcile へ、
+アクション系(B2)は GraphQL Mutation、観測系(B3)は GraphQL Query、
+ノード間 RPC(B4)はバイナリトランスポート**、と 4 バケツに仕分けて
+`/admin/*` を全撤廃していく。移植先で管理系機能を足す場合は、まず
+「その項目は望ましい状態(宣言)か、一度きりの副作用(RPC)か」を
+§2.2 の判断フローで分類すること。
+- **撤廃済み**: `object-table`(`objectTable`/`objectTableCommit`/
+  `objectTablePrune`)、`keys`(`keyStatus`/`revokeKeys`)、
+  `/admin/parallel*`(設定は `aruaru.yaml: query.parallel`、
+  実効値/プラン/ジョブは `parallelConfig`/`explainDistributed`/
+  `parallelJobs` query)、`/v1/keys/self-issue`(`selfIssueKey` mutation、
+  認証ガード無し)。
+- **設定へ移行済み**: `backup.schedule`・`federation.sources`・
+  `query.parallel`・`follower_read.target_lag_ms`(`aruaru-server::config`
+  の `reconcile` がホットリロード反映)。`wal`・`sharded_store` は
+  構築時固定のため静的扱い(`restart_required`)。
+- **未着手(P3 本体)**: `ephemeral-query`・`multi-raft`・`sharded-store`
+  (put/get/stats)・`closed-timestamp`・`wal-service`。
+  `closed-timestamp`/`wal-service`/`sharded-store` は状態が
+  `aruaru-dist`/`aruaru-query` 型なので `AdminCtx` 注入で素直に GraphQL 化
+  できる。`ephemeral-query`(`current_exe` で自プロセス再起動)・
+  `multi-raft`(server-local ジェネリック)は trait 注入のリファクタが要る。
+- **注意**: `registry`(`crawlRegistry`/`testRegistryConnection`)は
+  既に GraphQL 側で実データ接続済み——「未着手」と誤解しないこと。
 
 ## 8. 移植・拡張時の注意
 

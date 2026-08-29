@@ -1,5 +1,16 @@
 # aruaru-DB 🦀
 
+> **2026-08-29 更新(管理面の抜本再設計)**: `/admin/*` の REST を GraphQL
+> へ 1 本ずつ移す手法は *アンチパターンの移送* にすぎない、との指摘を受け、
+> 正本の設計文書 **[`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md)**
+> を新設して抜本再設計へ移行。新・設計哲学: **すべてを「望ましい状態の宣言」+
+> reconciliation で表し、データプレーンに命令的 RPC を置かない**
+> (K8s/GitOps・WunderGraph Cosmo・TiDB/TiFlash・SPIFFE の共通解)。
+> `aruaru-server` の HTTP は最終的に `/graphql`・`/graphql/sdl`・`/health*`・
+> `/metrics` のみとし、**`/admin/*` を含む REST を全撤廃**。運用設定は
+> 宣言的 `aruaru.yaml` + ホットリロード。詳細・進捗・復活用メッセージは
+> [`CLAUDE.md`](CLAUDE.md) 冒頭「🔄 セッション再開用メモ」。
+
 > 📌 保留タスク(2026-08-06): 東芝SBM・DeepSeek技術の組み込み構想あり。詳細は[CLAUDE.md](CLAUDE.md)参照。
 
 > **The hybrid distributed database that speaks Git.**  

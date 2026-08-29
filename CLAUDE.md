@@ -158,12 +158,60 @@
 > - **既に完了済み(「未着手」と誤解しないこと)**: `registry`の
 >   `crawlRegistry`/`testRegistryConnection`はGraphQL側で既に実データ
 >   接続済み(再設計では B2/B3)。
-> - 続き3〜8 の詳細は本ファイル内「HANDOFF追記(2026-08-29〜続き8)」を
+> - 続き3〜9 の詳細は本ファイル内「HANDOFF追記(2026-08-29〜続き9)」を
 >   参照。再設計そのものの正本は `docs/CONTROL_PLANE_REDESIGN.md`
 >   (§2 新・設計哲学12か条、§3 REST 完全撤廃の厳命、付録 A に
 >   CockroachDB×Snowflake ハイブリッド変種=TiDB/TiFlash 等の調査、
 >   付録 B に「REST 撤廃を可能にする Cosmo の技術」= Federation /
 >   Connect / Persisted Operations / Schema Registry+CDN)。
+>
+> ### 🛑 復活用メッセージ(次回セッション・別アカウントはまずこれを読む)
+>
+> **現在地**: aruaru-db の管理面(`/admin/*` REST)を**完全撤廃**する
+> 抜本再設計の途中。正本は [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md)。
+> フェーズ P0(設計)/P1(宣言的設定基盤)/P2(parallel・follower_read)/
+> P3 の一部(`/admin/parallel*`・`/v1/keys/self-issue` 撤廃)まで完了・
+> push 済み。`git log --oneline -20` で `再設計 P1〜P3` のコミット群を確認。
+>
+> **ユーザーの不変の要求(肝に銘じること)**:
+> 1. **REST API は SET(RPoem + aruaru-db)全体から例外なく完全撤廃**。
+>    「削るだけ」「1本ずつ GraphQL mutation へ」の中途半端は禁止
+>    (「投げやり・その場しのぎ禁止」の原則。着手したスライスは
+>    難所も含めて最後まで通す。半分繋がった足場を成果と呼ばない)。
+> 2. RPoem は WunderGraph Cosmo 互換で REST 不要。APIキーは完全自動
+>    ライフサイクル(自動発行・自動承認・自動破棄・自動削除)。
+> 3. aruaru-db は「CockroachDB × Snowflake の良い所取りハイブリッドの
+>    特殊な変種の実在DB」の実装理論・技術を取り込む(付録 A の TiDB/
+>    TiFlash 等。Raft-Learner 列レプリカ・SI 読み取り検証・DeltaTree 型
+>    delta 層が未取り込み候補)。
+> 4. 必要なら英日・多言語で Google/GitHub を再調査し、RPoem↔aruaru-db
+>    連携強化のため再設計・再実装・再テストを**実用的になるまで数回
+>    繰り返す**。
+>
+> **次にやること(P3 本体、優先順)**:
+> 1. `closed-timestamp`(`GET /admin/closed-timestamp`=status →
+>    `Query.closedTimestamp`、`/range`・`/advance` → `Mutation`、`/plan`
+>    → `Query.planFollowerRead`。`/receive`・`/publish` は B4 で P4
+>    バイナリ化)。`AdminState.closed_ts_coordinator()` が既にあるので
+>    `AdminCtx.closed_ts` を足して注入する(`object_table`/`keyring` と
+>    同じパターン)。Timestamp は u64 なので GraphQL では String 表現。
+> 2. `wal-service`(`Arc<DisaggregatedStorage>`)・`sharded-store`
+>    (`ShardedRowStore<String>`)も同じ AdminCtx 注入で。
+> 3. `ephemeral-query`・`multi-raft` は trait 注入のリファクタが要る
+>    (`aruaru-graphql` は `aruaru-server` の `mod` を参照できない。
+>    `AdminCtx` に `Arc<dyn EphemeralRunner>` 等を注入し server 側で実装)。
+> 4. `disaster_backup.email` の reconcile(`feature = "disaster_email_backup"`
+>    ゲート。config スキーマは 7 フィールドへ拡張済み)。
+> 5. Tauri(`admin/src-tauri`、ワークスペース外・この環境ではビルド不可)
+>    の残りコマンドを GraphQL へ。設定タブは `aruaru.yaml` 編集 UI に。
+> 6. P4: `admin::admin_routes` 撤去、`/raft/*`・side transport をバイナリ化。
+>    P5: RPoem を execution-config / persisted operations / feature flags の
+>    CDN(コントロールプレーン)役に。P6: 各言語 README・PORTING 整合。
+>
+> **毎回の作法**: スライス完了ごとに `cargo test -p <対象クレート>` 失敗0を
+> 確認 → CLAUDE.md のこのメモと HANDOFF を更新 → commit → push
+> (リミット接近前に必ず)。
+> ビルドは 1 回 30分超のことがあるので background + Monitor で回す。
 
 > **📌 2026-08-26追記: Windows用インストーラー`aruaru-db-installer.exe`を
 > 新設(命名規則統一)**: ユーザー指示「パワーシェルでインストールする
@@ -4789,3 +4837,40 @@ GraphQL 実データ化 → REST 撤廃、Tauri 設定タブの aruaru.yaml 編�
 `closed-timestamp`/`wal-service` の GraphQL 化 → `/admin/*` 該当ルート削除。
 `disaster_backup` reconcile(feature ゲート)。着手前に grep で
 Tauri/Android/web の該当 REST 参照確認。
+
+## HANDOFF追記(2026-08-29続き9) セッション終了チェックポイント + ドキュメント整合
+
+ユーザー指示: 「上記メモを開発途中記録として記録して、README/CLAUDE/PORTING を
+日本語と英語で編集して push・commit して停止、次回別アカウントでも復活できる
+よう復活用メッセージも書いて停止」。
+
+**このセッションの成果(全て push 済み)**:
+- P0: `docs/CONTROL_PLANE_REDESIGN.md` 新設(設計哲学12か条・4バケツ仕分け・
+  目標 HTTP 面・aruaru.yaml スキーマ・フェーズ P0〜P6・付録 A/B)。
+- P1: `crates/aruaru-server/src/config/{mod,reconcile,watch}.rs` 新設。
+  `AruaruConfig` ロード + `${VAR}` 展開 + mtime ポーリング/SIGHUP ホット
+  リロード + 冪等 reconcile。`--config <path>` フラグ。`aruaru.example.yaml`。
+- P2: `query.parallel` 7→4 フィールド統一(`admin_shared::ParallelConfigState`、
+  reconcile 接続、GraphQL `parallelConfig` 実データ化、`setParallelConfig` 撤廃、
+  REST `GET/POST /admin/parallel` 削除)。`follower_read.target_lag_ms` を
+  `ClosedTimestampCoordinator`/`Tracker` の `Arc<AtomicU64>` 共有化で完全
+  ホットリロード。`wal`/`sharded_store` は静的扱い確定。
+- P3 一部: `/admin/parallel/explain`・`/admin/parallel/jobs` 撤廃 → GraphQL
+  `explainDistributed`(実ロジック移植・AdminQuery へ)・`parallelJobs`。
+  `/v1/keys/self-issue` 撤廃 → `selfIssueKey` mutation(認証ガード無し)。
+  `disaster_backup.email` config スキーマを 7 フィールドへ拡張(reconcile は
+  feature ゲート付きの別スライスで保留)。
+- 調査: WunderGraph Cosmo(router config / overview / Connect / Persisted
+  Operations / EDFS)、TiDB/TiKV+TiFlash(VLDB 2020)、K8s/GitOps
+  reconciliation、SPIFFE/SPIRE を英日・多言語で。→ §2 哲学、付録 A/B。
+
+**検証**: 各スライスで `cargo test -p aruaru-dist -p aruaru-graphql
+-p aruaru-server` 失敗0(config 7 + reconcile 3 + GraphQL 4 の新規テスト)。
+`cargo build -p aruaru-server` 既存2警告のみ。Tauri(`admin/src-tauri`、
+ワークスペース外)はソース編集のみ・この環境でビルド未検証。
+
+**次回の起点**: 本ファイル冒頭「🛑 復活用メッセージ」を読む。P3 本体は
+`closed-timestamp` の GraphQL 化から(`AdminCtx.closed_ts` 注入)。
+
+**README 整合**: `README.md`・`README-Japan.md`・`README-English.md` の冒頭
+更新ノート、`PORTING.md` §7 を本再設計に合わせて日英で更新済み(続き9)。
