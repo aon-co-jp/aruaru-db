@@ -1,6 +1,7 @@
 //! aruaru-dist: 分散レイヤー (openraft + Range シャーディング)
 pub mod admin_shared;
 pub mod closed_ts;
+pub mod columnar_applier;
 pub mod engine_applier;
 pub mod ephemeral;
 pub mod hlc;
@@ -43,6 +44,7 @@ pub use shard::{
 };
 pub use multi_raft::MultiRaftCluster;
 pub use engine_applier::EngineApplier;
+pub use columnar_applier::ColumnarApplier;
 pub use hlc::{Hlc, HlcTimestamp};
 pub use closed_ts::{
     ClosedTimestampCoordinator, ClosedTimestampTracker, ReadPlan, Timestamp,

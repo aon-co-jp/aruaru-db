@@ -5239,3 +5239,68 @@ failed**(壁時計前進時の`pt`更新・論理カウンタのインクリメ�
 または今回実装したHLCを`closed_ts`/`wal_service`/`multi_raft`の
 タイムスタンプ源へ実際に配線する作業。`aruaru.yaml: htap`セクション
 (§5・A.7)の実装も未着手のまま。
+
+## HANDOFF追記(2026-08-31続き15) A.6-2 `ColumnarApplier`(本命)実装完了
+
+**位置づけ**: 続き14(HLC)に続き、要求③実装トラックの本命である
+A.6-2「Raft-Learner上の行→列非同期変換レプリカ」を実装した。
+`docs/CONTROL_PLANE_REDESIGN.md`付録A.6-2が明記していた設計方針
+(「learnerノードに`ColumnarApplier`(`Applier` trait実装)を注入し、
+Raft commitごとに行→列変換して`table_format`のblockへ追記」)に沿って
+実装。
+
+**実装**: `crates/aruaru-dist/src/columnar_applier.rs`(新規)。
+- `ColumnarApplier`が`Applier` traitを実装。内部に行ストアのローカル
+  ミラー(`Arc<QueryEngine>`、`EngineApplier`と同じ意味論でSQLを適用)
+  を持ち、`apply()`で(1)行ストア側への適用、(2)成功時のみ
+  `parser::parse`で触れたテーブル名を特定し、そのテーブル全体を
+  `aruaru-backup::table_format`(Databend方式のsnapshot→segment→block、
+  2026-08-22実装済みのものをそのまま再利用)の1 blockへ列変換して
+  commit、の2段階を行う。
+- 列変換の中身: 数値列(Int/BigInt/Float)ごとのmin/max統計
+  (`BlockMeta::with_stats`)+ 主キー列のbloom filter
+  (`BlockMeta::with_bloom`、等値枝刈り用)。テーブル名→`table_id`は
+  `SHA-256(table_name)`の先頭8バイトから決定的に導出(Databendの
+  `(db_id, table_id)`キー空間をそのまま流用するため)。
+- `crates/aruaru-dist/Cargo.toml`に`aruaru-backup`依存を追加
+  (循環依存にならないことを確認済み——`aruaru-backup`は`aruaru-core`/
+  `aruaru-query`にのみ依存し`aruaru-dist`には依存しない)。
+
+**実装中に見つけた自分のミスと修正**: `Cargo.toml`への依存追加編集で
+誤って既存の`aruaru-query`依存行そのものを消してしまい、
+`aruaru_query`が全クレートで解決不能になるビルドエラーを引き起こした
+(`engine_applier.rs`/`ephemeral.rs`等、無関係な既存ファイルまで
+エラーになったため気づいた)。`aruaru-query`依存行を復元して解消。
+
+**正直な簡略化点(誇張しない、コード冒頭コメントにも明記)**:
+1. **「本物の行→列delta蓄積」ではなく「テーブル全体の都度再構築」**
+   ——TiFlashのDeltaTree(小さなdeltaを蓄積し閾値でcompaction)とは
+   異なる。`aruaru-query::olap::OlapCache`が既に明記している簡略化と
+   同じ判断(まず正しさを実証、delta蓄積はA.6-4で段階的に)。
+2. **block実体(Parquet相当)は書かない**——`table_format::BlockMeta`
+   自体が元々「メタデータ+枝刈り・コミットの正しさ」担当という設計
+   (2026-08-22実装時からの制約)をそのまま引き継ぐ。
+3. **同一プロセス内の`Applier`注入で検証**——ネットワーク越しの別
+   プロセスlearnerへの実配線(`binary_transport.rs`経由の複製自体は
+   既存、2026-08-21実装済み)と組み合わせる作業は次段階。
+4. **A.6-3(Raft index + MVCCによるSI検証)とは未接続**。
+
+**検証(実測)**: `cargo test -p aruaru-dist columnar_applier` →
+**5 passed / 0 failed**(CREATE TABLE直後から空スナップショットが
+存在すること、書き込みのたびに新しいスナップショットIDへ連鎖する
+こと〈時間旅行の基礎〉、UPDATE/DELETE後も行ストアと列レプリカの
+最終状態が一致すること、行ストア側で失敗したSQLは列レプリカを
+一切変更しないこと、SELECT/BEGIN/COMMIT等の読み取り・トランザクション
+制御文はレプリケーションを起動しないこと、`aruaru_commit`〈Git-on-SQL
+マーカー〉自体は列レプリカを再構築しないこと、を直接検証)。
+`cargo build --workspace` → 成功(既存の`build_cluster`/
+`propose_commit`未使用警告2件のみ、無関係)。`cargo test -p aruaru-dist
+-p aruaru-backup` → aruaru-dist **88 passed**・aruaru-backup
+**37 passed**、失敗0(既存テストへのリグレッション無し)。
+
+**次回の起点**: (1) `ColumnarApplier`を実際に`--raft-role learner`の
+ノードへ`Applier`として注入し、実プロセス間(2026-08-21確立済みの
+2プロセス構成)でRaft commitが列レプリカへ反映されることを実HTTP/
+実プロセスで検証、(2) A.6-4 deletion vector(delta蓄積の第一歩、
+`table_format::BlockMeta`への拡張)、(3) HLCを`closed_ts`等へ配線、
+(4) `aruaru.yaml: htap`セクション(§5・A.7)の実装。
