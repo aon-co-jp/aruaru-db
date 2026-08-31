@@ -5372,3 +5372,52 @@ delta蓄積が真の解決)。(3) `--columnar-learner`のHTTP認証は簡易実�
 `--columnar-learner`を正規の宣言的設定〈`columnar_replicas`〉経由の
 起動へ統合することも検討)、(4) `--columnar-learner`をGraphQL
 `Query.htapReplicas`として正式公開。
+
+## HANDOFF追記(2026-08-31続き17) A.6-4 段階1「deletion vector」実装完了
+
+**位置づけ**: 続き16の「次回の起点」筆頭であったA.6-4に着手。付録
+A.6-4が優先度順に挙げる2段階(1. deletion vector、2. base+deltaの
+Merge-on-Read)のうち、実装が最も軽く効果が大きいとされる**段階1
+deletion vector**を実装した。
+
+**実装**: `crates/aruaru-backup/src/table_format.rs`。
+- `BlockMeta`に`deletion_vector: BTreeSet<u64>`フィールドを追加
+  (`#[serde(default)]`で既存の永続化済みJSON〈A.6-4導入前のblock〉との
+  後方互換を保証)。
+- `with_deleted(row_position)`(ビルダー、複数回呼べる)・
+  `is_deleted(row_position) -> bool`・`live_row_count() -> u64`
+  (`row_count`から論理削除された行数を`saturating_sub`で安全に除いた
+  実効行数)を追加。
+- `SegmentMeta::live_row_count()`で複数blockにまたがる実効行数を集約。
+
+**正直な簡略化点(誇張しない、コード冒頭コメントにも明記)**:
+1. Delta Lakeの実プロトコルは32bit RoaringBitmap(圧縮ビットマップ、
+   64bit位置を上位32bit=key/下位32bitへ分割)を使うが、本実装は
+   `BTreeSet<u64>`(非圧縮の順序集合)——**意味論は同一**だが大量削除時の
+   メモリ効率はRoaringBitmapに劣る。行数がボトルネックになった時点で
+   置き換えを検討する。
+2. **`ColumnarApplier`(A.6-2)への配線はまだ無い**——A.6-2は依然として
+   テーブル全体を都度再構築する設計であり、deletion vector自体を
+   実際の書き込みパスから呼ぶ変更はしていない。今回は「単体で正しく
+   動くdeletion vector」を先に用意した段階(TiFlash DeltaTreeの
+   delta+base方式〈段階2 MoR〉へA.6-2を格上げする際の基盤)。
+3. `prune_range`/`prune_equality`(既存の枝刈りAPI)も`live_row_count`を
+   考慮するようには未接続——枝刈り結果に論理削除行が含まれたままになる
+   (次段階)。
+
+**検証(実測)**: `cargo test -p aruaru-backup table_format` →
+**15 passed / 0 failed**(新規5件: 削除マークと`is_deleted`/
+`live_row_count`の直接検証、範囲外位置での`saturating_sub`保護、
+複数blockにまたがるsegment単位の集約、JSON往復でのシリアライズ
+保持、**A.6-4導入前の`deletion_vector`フィールド無しJSONが後方互換
+でデシリアライズできること**〈`#[serde(default)]`の実証〉)。
+`cargo build --workspace` → 成功(既存の`build_cluster`/
+`propose_commit`未使用警告2件のみ、無関係)。`cargo test -p
+aruaru-backup -p aruaru-dist` → aruaru-backup **42 passed**・
+aruaru-dist **88 passed**、失敗0(既存テストへのリグレッション無し)。
+
+**次回の起点**: (1) A.6-4段階2(base+deltaのMerge-on-Read、
+`ColumnarApplier`をdelta蓄積方式へ格上げ)、(2) `prune_range`/
+`prune_equality`が`live_row_count`/`is_deleted`を考慮するようにする
+配線、(3) HLCを`closed_ts`/`wal_service`/`multi_raft`へ配線、
+(4) `aruaru.yaml: htap`セクション(§5・A.7)の実装。
