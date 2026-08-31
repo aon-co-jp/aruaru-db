@@ -759,13 +759,24 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
 
 - 現状: `closed_ts.rs` は論理ナノ秒を**呼び出し側が渡す**前提。クロック
   スキュー上限(CockroachDB `max_offset`)の管理が無い。
+- *実装方法*(論文「Logical Physical Clocks and Consistent Snapshots in
+  Globally Distributed Databases」/ `cockroach/pkg/util/hlc/hlc.go`):
+  timestamp = **物理成分 `pt`(≒ローカル wall time)+ 論理成分 `l`**。
+  - `now()`: `pt' = max(pt, wall_now())`; `pt'==pt` なら `l++` else `l=0`; 返す。
+  - `update(remote_pt, remote_l)`: `pt' = max(pt, remote_pt, wall_now())`;
+    3 者の max のどれに一致したかで `l` を更新(単調増加を保証)。
+  - **送信時**に `now()` を相乗り、**受信時**に `update()`。NTP のズレを
+    吸収しつつ単調 + 因果順序。
 - 判断: **取り込む**。CockroachDB / YugabyteDB / Spanner が全て HLC で
-  「因果順序 + 実時刻近似」を得ている。`aruaru-dist` に `hlc.rs`(physical
-  + logical のペア、`update(remote_ts)` で単調前進)を新設し、`closed_ts`・
+  「因果順序 + 実時刻近似」を得ている。`aruaru-dist` に `hlc.rs`
+  (`Hlc { pt: u64, l: u32 }`、`now()` / `update()`)を新設し、`closed_ts`・
   `wal_service`・`multi_raft` の timestamp 源を HLC へ差し替える。
+  ノード間メッセージ(`binary_transport.rs`)のフレームへ HLC を相乗り。
+  <https://github.com/cockroachdb/cockroach/blob/master/pkg/util/hlc/hlc.go>
 - スコープ注意: 真の分散クロック同期(NTP / TrueTime)は環境依存のため、
   「単一プロセス内の HLC + ノード間メッセージに HLC を相乗り」までとする
-  (正直な簡略化点として明記)。
+  (正直な簡略化点として明記)。`max_offset` による不確実性ウィンドウ
+  (CockroachDB の `commit-wait`)は次段階。
 
 #### A.6-2 Raft-Learner 上の 行→列 非同期変換レプリカ — **取り込む(本命)**
 
@@ -848,6 +859,13 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
   足りる。**実データ規模がボトルネックになった時点で**、DuckDB の
   analyze フェーズ(セグメントごとに複数方式を試算し最小を選ぶ)を
   簡易移植し、RLE → bitpacking → FSST の順で足す。ALP は数値列専用。
+- *参考モデル*(Photon SIGMOD 2022): Photon は**実行時に column batch の
+  メタデータ(NULL-ness / activeness)を組み立て、それを使ってカーネルを
+  選ぶ**「adaptive execution」。aruaru-db の `olap.rs` の適応的辞書
+  エンコード(ユニーク比率で分岐)は既にこの発想の小規模版。将来の
+  analyze フェーズも「セグメントの実データを見てから方式を選ぶ」という
+  Photon / DuckDB 共通の設計に沿わせる。
+  <https://people.eecs.berkeley.edu/~matei/papers/2022/sigmod_photon.pdf>
 
 #### A.6-6 SingleStore「1 テーブル内で行 segment と列 segment 同居」 — **A.6-4 に吸収**
 
