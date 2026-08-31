@@ -537,7 +537,7 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
 |---|---|---|---|
 | Range 単位の独立 Raft グループ(Multi-Raft) | CockroachDB / TiKV | `aruaru-dist/src/multi_raft.rs`, `shard/topology.rs` | 実装済(単一プロセス) |
 | closed timestamp + follower read + bounded staleness | CockroachDB / TiKV safe-ts / YugabyteDB | `aruaru-dist/src/closed_ts.rs` | 実装済(P2 でホットリロード化) |
-| HLC(Hybrid Logical Clock)による版付け | Spanner / CockroachDB / YugabyteDB | **未実装**(論理ナノ秒を呼び出し側が渡す) | 未取込(A.6-1) |
+| HLC(Hybrid Logical Clock)による版付け | Spanner / CockroachDB / YugabyteDB | `aruaru-dist/src/hlc.rs`(`now`/`update`、CAS実装) | 実装済(2026-08-31、既存`closed_ts`等への配線は次段階) |
 | Raft-Learner 上での 行→列 非同期変換レプリカ | TiDB/TiFlash | `--raft-role learner` はあるが**行→列変換部が無い** | 部分(A.6-2 が本命) |
 | 読み取り時の Raft index + MVCC による SI 検証 | TiDB/TiFlash | closed_ts の gate はあるが Raft index 突合は無い | 未取込(A.6-3) |
 | DeltaTree(B+木 × LSM)= 更新耐性のある列エンジン | TiDB/TiFlash | object-table は不変セグメントのみ、delta 層無し | 未取込(A.6-4) |
@@ -755,7 +755,7 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
 
 ### A.3 未取り込み技術と、取り込み判断(2026 再設計の中核)
 
-#### A.6-1 HLC(Hybrid Logical Clock)による版付け — **取り込む(P?、別トラック)**
+#### A.6-1 HLC(Hybrid Logical Clock)による版付け — **実装済(2026-08-31)**
 
 - 現状: `closed_ts.rs` は論理ナノ秒を**呼び出し側が渡す**前提。クロック
   スキュー上限(CockroachDB `max_offset`)の管理が無い。
