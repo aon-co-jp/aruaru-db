@@ -5421,3 +5421,42 @@ aruaru-dist **88 passed**、失敗0(既存テストへのリグレッション�
 `prune_equality`が`live_row_count`/`is_deleted`を考慮するようにする
 配線、(3) HLCを`closed_ts`/`wal_service`/`multi_raft`へ配線、
 (4) `aruaru.yaml: htap`セクション(§5・A.7)の実装。
+
+## HANDOFF追記(2026-08-31続き18) 続き17が残した「未配線」を即座に解消: prune_range/prune_equalityがdeletion vectorを尊重
+
+**位置づけ**: 続き17完了直後、ユーザーから「投げやり・その場しのぎ
+禁止」の原則(半分繋がった足場を成果と呼ばない)に沿って、着手した
+スライスは難所も含めて最後まで通すよう指示。deletion vectorを実装
+しただけで枝刈りAPIから使われないままでは「宣言しただけの機能」に
+なるため、即座に配線した。
+
+**実装**: `crates/aruaru-backup/src/table_format.rs`。
+- `prune_range`: 各blockのループで、`row_count > 0 &&
+  live_row_count() == 0`(全行が論理削除済み)なら、min/max統計の
+  判定を待たず即座に`skipped_blocks`へカウントして読み飛ばす
+  ——統計が古い値のままでも「実際に返す行が0件」は確定しているため
+  安全。
+- `prune_equality`: 同様に、bloom filterの判定より先に全行削除済み
+  blockを除外する。
+
+**検証(実測)**: `cargo test -p aruaru-backup table_format` →
+**18 passed / 0 failed**(続き17の15件+新規3件:
+`prune_range_skips_blocks_whose_every_row_is_logically_deleted`
+〈統計上マッチする範囲でも全行削除済みblockは返らない〉、
+`prune_equality_skips_blocks_whose_every_row_is_logically_deleted`
+〈bloom filterがマッチしても全行削除済みblockは返らない〉、
+`prune_range_still_returns_partially_deleted_blocks`〈一部だけ削除
+されたblockは引き続き通常どおり統計判定の対象になる、over-pruning
+していないことの確認〉)。`cargo build --workspace` → 成功(既存の
+`build_cluster`/`propose_commit`未使用警告2件のみ、無関係)。
+
+**まだ残る配線(誇張しない)**: `ColumnarApplier`(A.6-2)が実際の
+DELETE/UPDATE発生時に`with_deleted`を呼ぶ**書き込み側**の経路は
+まだ無い——今回完成したのは読み取り側(枝刈りが`deletion_vector`を
+正しく尊重すること)のみ。`ColumnarApplier`をテーブル全体再構築方式
+からdelta+base方式へ格上げする際に、この書き込み側を接続する。
+
+**次回の起点**: (1) A.6-4段階2(base+deltaのMerge-on-Read、
+`ColumnarApplier`の書き込み側からdeletion vectorを実際に呼ぶ配線を
+含む)、(2) HLCを`closed_ts`/`wal_service`/`multi_raft`へ配線、
+(3) `aruaru.yaml: htap`セクション(§5・A.7)の実装。
