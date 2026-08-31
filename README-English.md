@@ -48,6 +48,25 @@
 > are in `CLAUDE.md` — see the top "session resume note" and the HANDOFF
 > entries (continued 5–10).
 >
+> **2026-08-31 follow-up (P3 body complete + Requirement ③ implementation
+> track kicked off)**: **REST-complete-abolition (P3) is now done across
+> all 5 target features** — `closed-timestamp`, `wal-service`,
+> `sharded-store` (cont. 10) plus `ephemeral-query` (cont. 12) and
+> `multi-raft` (cont. 13, solved by moving `EngineApplier` into
+> `aruaru-dist` rather than a trait-object refactor) are all migrated to
+> GraphQL, their REST routes removed, and verified end-to-end against a
+> real running process. Work then moved to Requirement ③ (adopting the
+> "CockroachDB × Snowflake hybrid variant" implementation techniques):
+> **A.6-1 HLC** (Hybrid Logical Clock, lock-free CAS implementation),
+> **A.6-2 ColumnarApplier** (the flagship item — a Raft-learner row→column
+> async replica, the core of TiFlash-style HTAP; verified not just with
+> unit tests but by actually running two real processes — a leader and a
+> `--columnar-learner` — and confirming over real HTTP that Raft commits
+> propagate into the columnar replica), and **A.6-4 stage 1 deletion
+> vector** (`BlockMeta.deletion_vector`, Delta Lake-style logical
+> deletion, wired into `prune_range`/`prune_equality`). See `CLAUDE.md`'s
+> same-day HANDOFF entries (continued 13–18) for details.
+>
 > Note: `open-cuda`/`open-directx` remain out of scope for this SET
 > policy for now (no HTTP surface), but this is a provisional call, not
 > permanent — revisit if `open-directx`'s DirectX work matures and
