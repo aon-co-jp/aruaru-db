@@ -791,13 +791,28 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
   1. **deletion vector**(Delta / Photon 型): `BlockMeta` に「削除行の
      RoaringBitmap 相当」を持たせ、`prune`/読み取りで適用。即時 rewrite 無しの
      DELETE/UPDATE。実装が最も軽く効果が大きい。
+     *実装方法(Delta PROTOCOL.md より)*: DV は「data file 内の行位置の集合」を
+     RoaringBitmap 配列で表す。64bit 位置を「上位 32bit = key / 下位 32bit =
+     sub-position」に分け、key ごとに 32bit Roaring bitmap を 1 つ持つ
+     (行数が 2^32 を超えるケースへの対応)。DV ファイルはテーブルルートに
+     data file と並べて置き、1 ファイルに複数 data file 分の DV をシリアライズ。
+     <https://github.com/delta-io/delta/blob/master/PROTOCOL.md> /
+     <https://delta.io/blog/2023-07-05-deletion-vectors/>
   2. **base + delta の Merge-on-Read**(Hudi / TiFlash 型): segment に
      delta log(追記のみ)を併設し、読み取りで base+delta をマージ。
      A.6-2 の learner 列変換と同じ機構を流用できる。
+     *実装方法(TiFlash DeltaTree より)*: 新規 insert/delete/update をまず
+     **delta 空間**へ TiKV 生成順のまま追記(WAL 的、linearizability 維持)。
+     一定量たまったら小ファイルへ compaction し、最終的に **stable 空間**
+     (不変・列指向 chunk、Parquet 類似 + LZ4)へマージ。読み取りは
+     stable(base)+ delta を on-the-fly でマージ。
+     <https://github.com/pingcap/tiflash/blob/master/docs/design/0000-00-00-architecture-of-distributed-storage-and-transaction.md>
   3. **record-level index**(Hudi 型): キー → block の**肯定的**索引。
      現状の bloom(否定的枝刈り)を補完。
 - スコープ注意: RoaringBitmap の外部 crate 依存は避け、`Vec<u64>` の
-  ソート済み集合 or 単純ビットベクタで最小実装(既存方針)。
+  ソート済み集合 or 単純ビットベクタで最小実装(既存方針)。Delta の
+  「key ごとに 32bit bitmap」レイアウトは、2^32 行を超えない前提なら
+  単一ビットベクタで足りる(超えたら Delta と同じ分割へ拡張)。
 
 #### A.6-5 型認識軽量圧縮(RLE / bitpacking / FSST / ALP) — **保留(条件付き取り込み)**
 
@@ -855,6 +870,27 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
    `Query.htapReplicas`(列レプリカの遅延・行数)を新設(GraphQL、B3)。
 4. **P4 のバイナリトランスポート**は A.6-2 のネットワーク越し learner 複製の
    前提。closed timestamp side transport は既にバイナリ化済み(`binary_transport.rs`)。
+
+---
+
+### A.8 2026 年の業界の現実(誇張しないための注記)
+
+- 2026 時点でも、**単一エンジン HTAP DB は「専用 OLTP + 専用列指向 OLAP を
+  CDC で繋ぐ」構成に対して支配的なシェアを取れていない**。標準的な本番
+  パターンは依然として「2 つの専用 DB を CDC(Change Data Capture)で連結」
+  (統合レイテンシは時間 → 秒へ短縮)。
+  <https://bigdataboutique.com/blog/oltp-vs-olap-2026> /
+  <https://clickhouse.com/resources/engineering/unifying-oltp-and-olap>
+- 行 vs 列・point vs scan の I/O パターンの根本的トレードオフは消えていない。
+  TiDB(TiFlash)/ SingleStore が「1 システム HTAP」の代表だが、
+  いずれも内部では**行ストアと列ストアをレプリカとして分離**している。
+- **aruaru-db の立ち位置(2026 再確認)**: 「1 プロセスに全部入れる」こと
+  自体が目的ではない。核は (a) Git-on-SQL による厳密な版管理・time travel、
+  (b) Raft 強整合 OLTP、(c) それと**非同期**に繋がる列指向 OLAP レプリカ
+  (A.6-2)、(d) PostgreSQL との DUAL DATABASE = CDC 相当(実装済み)。
+  つまり業界標準の「専用 OLTP + 専用 OLAP + CDC」を、**単一 Pure Rust
+  バイナリで運用でき、かつコミット単位の版管理が付く**形にまとめたもの。
+  「単一エンジン HTAP が万能」という過大な主張はしない。
 
 ---
 

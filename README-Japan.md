@@ -16,16 +16,27 @@
 > ホットリロード(実行時ミューテーション廃止)。APIキーは完全自動
 > ライフサイクル(自動発行・自動承認・自動破棄・自動削除)。
 >
-> 進捗(2026-08-29 時点、P0〜P6 のうち): P0 設計確定 / P1 宣言的設定
+> 進捗(2026-08-31 時点、P0〜P6 のうち): P0 設計確定 / P1 宣言的設定
 > 基盤(`aruaru-server::config`、`--config`、ホットリロード)完了 /
 > P2 `query.parallel`(4フィールド化)・`follower_read.target_lag_ms`
-> (完全ホットリロード)完了 / P3 `/admin/parallel*`・`/v1/keys/self-issue`
-> の REST 撤廃完了(GraphQL `explainDistributed`・`parallelJobs`・
-> `selfIssueKey` へ)。付録 A に「CockroachDB×Snowflake ハイブリッド
-> 変種の実在DB(TiDB/TiFlash 等)」調査、付録 B に「REST撤廃を可能に
-> する Cosmo の技術(Federation / Connect / Persisted Operations /
-> Schema Registry+CDN)」。詳細・残作業・復活用メッセージは `CLAUDE.md`
-> 冒頭「🔄 セッション再開用メモ」と HANDOFF(続き5〜)。
+> (完全ホットリロード)完了 / **P3 本体**: `/admin/parallel*`・
+> `/v1/keys/self-issue`(続き8)に加え、**`closed-timestamp`・`wal-service`・
+> `sharded-store` の REST を全撤廃し GraphQL query/mutation へ移行**(続き10、
+> `closedTimestamp`/`planFollowerRead`/`closedTsRegisterRange`/`closedTsAdvance`、
+> `walService`/`walPage`/`walAppend`/`walCreateImageLayer`、
+> `shardedStoreGet`/`shardedStoreStats`/`shardedStorePut`)。`ephemeral-query`・
+> `multi-raft` は trait 化リファクタが要るため次スライス。
+> **付録 A を「2026 年最新設計」として大幅拡充**(英・日・独で一次論文/
+> 公式docs/GitHub を再調査): TiDB/TiFlash の DeltaTree(B+木×LSM)、
+> CockroachDB の Range/HLC/Pebble/closed timestamp、YugabyteDB の DocDB、
+> Snowflake の不変マイクロパーティション+pruning+time travel、Neon vs
+> Aurora の WAL 分離、SingleStore の Universal Storage、ClickHouse の
+> MergeTree/SharedMergeTree、Iceberg/Delta/Hudi の三種比較、Photon/DuckDB の
+> 型認識軽量圧縮(FSST/ALP)を**実装方法(アーキ・データ構造・アルゴリズム)
+> まで**整理し、Raft-Learner 行→列変換レプリカ・HLC・deletion vector の
+> 取り込みを決定(取り込まない判断は理由も明記)。付録 B に「REST撤廃を
+> 可能にする Cosmo の技術」。詳細・残作業・復活用メッセージは `CLAUDE.md`
+> 冒頭「🔄 セッション再開用メモ」と HANDOFF(続き5〜10)。
 >
 > **2026-07-25 更新**: 開発方針ファイル(`CLAUDE.md`)の見出しを
 > 「開発方針＆開発環境ルール」から「設計思想＆開発方針＆開発環境ルール」

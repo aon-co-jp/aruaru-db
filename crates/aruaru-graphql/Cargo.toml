@@ -25,6 +25,10 @@ chrono.workspace           = true
 # 同一の`Arc<Mutex<ClusterTopology>>`を参照するため、同じMutex実装
 # (parking_lot)を使う必要がある。
 parking_lot.workspace      = true
+# 【2026-08-29 再設計 P3】`shardedStore*` リゾルバが `ShardedRowStore` の
+# ブロッキング mpsc recv を `spawn_blocking` で退避するため(REST ハンドラと
+# 同じ配慮)。`aruaru-query` も同じ理由で tokio を通常依存にしている。
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

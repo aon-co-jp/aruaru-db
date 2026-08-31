@@ -375,6 +375,14 @@ async fn main() -> anyhow::Result<()> {
         // `parallelConfig` query が `aruaru.yaml: query.parallel` の実効値を
         // 返すために同一インスタンスを共有する。
         let parallel_for_graphql = admin_state.parallel_handle();
+        // 【2026-08-29 再設計 P3(続き10)】closed timestamp / WAL サービス /
+        // shard-per-core ストアも REST(`AdminState`)と同一インスタンスを
+        // GraphQL(`closedTimestamp`/`walService`/`shardedStore*` 系)へ共有。
+        // 旧 REST `/admin/closed-timestamp/{status,range,advance,plan}`・
+        // `/admin/wal-service/*`・`/admin/sharded-store*` は撤廃済み。
+        let closed_ts_for_graphql = admin_state.closed_ts_coordinator();
+        let wal_storage_for_graphql = admin_state.wal_storage_handle();
+        let sharded_store_for_graphql = admin_state.sharded_store_handle();
 
         // Federation SDL を返すエンドポイント (wgc subgraph publish 用)
         #[handler]
@@ -414,6 +422,9 @@ async fn main() -> anyhow::Result<()> {
                     parallel: Some(parallel_for_graphql.clone()),
                     keyring: Some(keyring_for_graphql.clone()),
                     object_table: Some(object_table_for_graphql.clone()),
+                    closed_ts: Some(closed_ts_for_graphql.clone()),
+                    wal_storage: Some(wal_storage_for_graphql.clone()),
+                    sharded_store: Some(sharded_store_for_graphql.clone()),
                 },
             ))
             .at("/graphql/sdl", get(subgraph_sdl))

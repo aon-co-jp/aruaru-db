@@ -63,6 +63,42 @@ pub struct AdminCtx {
     /// `/admin/object-table*` 3ルートは`admin.rs`から削除済み。`None`の
     /// 場合(将来サーバー構成が変わった場合の保険)は空の状態を返す。
     pub object_table: Option<Arc<aruaru_backup::table_format::ObjectTable>>,
+    /// 【2026-08-29 再設計 P3】REST(`AdminState.closed_ts`)と**同一**の
+    /// CockroachDB 方式 closed timestamp コーディネータ
+    /// (`closed_ts_coordinator()` 経由で注入)。旧 REST
+    /// `/admin/closed-timestamp`(status)・`/range`・`/advance`・`/plan` は
+    /// `admin.rs` から削除済みで、`closedTimestamp`/`planFollowerRead` query と
+    /// `closedTsRegisterRange`/`closedTsAdvance` mutation が唯一の経路。
+    /// ノード間 side transport(`/receive`・`/publish`)は B4 としてバイナリ
+    /// トランスポート側に残る(P4)。
+    pub closed_ts: Option<Arc<aruaru_dist::ClosedTimestampCoordinator>>,
+    /// 【2026-08-29 再設計 P3】REST(`AdminState.wal_storage`)と**同一**の
+    /// Neon 方式 safekeeper/pageserver 分離ストレージ
+    /// (`wal_storage_handle()` 経由)。旧 REST `/admin/wal-service`・
+    /// `/append`・`/page`・`/image-layer` は削除済みで、`walService`/`walPage`
+    /// query と `walAppend`/`walCreateImageLayer` mutation が唯一の経路。
+    pub wal_storage: Option<Arc<aruaru_dist::DisaggregatedStorage>>,
+    /// 【2026-08-29 再設計 P3】REST(`AdminState.sharded_store`)と**同一**の
+    /// ScyllaDB shard-per-core ストア(`sharded_store_handle()` 経由)。
+    /// 旧 REST `/admin/sharded-store*` 3ルートは削除済みで、
+    /// `shardedStoreGet`/`shardedStoreStats` query と `shardedStorePut`
+    /// mutation が唯一の経路。
+    pub sharded_store: Option<Arc<aruaru_query::sharded_store::ShardedRowStore<String>>>,
+}
+
+/// UNIX epoch からの現在時刻(論理ナノ秒)。closed timestamp の `now` 既定値。
+fn now_unix_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// GraphQL の String 引数を u64 へ(タイムスタンプ・LSN は精度保持のため
+/// String で受け渡す)。
+fn parse_u64(s: &str, field: &str) -> Result<u64> {
+    s.parse::<u64>()
+        .map_err(|_| async_graphql::Error::new(format!("{field} must be a non-negative integer (got {s:?})")))
 }
 
 /// `x-admin-token`ヘッダーを検証する(2026-08-01追加、実バグ修正)。
@@ -191,6 +227,17 @@ pub struct ClusterNodeInput {
     pub action: String, // "add" | "remove"
     pub node_id: i64,
     pub addr: String,
+}
+
+/// 【2026-08-29 再設計 P3】`walAppend` mutation の WAL レコード 1 件
+/// (旧 REST `WalAppendRecord` の等価)。`start_lsn` から +1 ずつ LSN を割る。
+#[derive(InputObject)]
+pub struct WalRecordInput {
+    pub page_key: String,
+    /// `"replace"`(既定)または `"append"`。
+    pub op: Option<String>,
+    /// ページへ書く内容(UTF-8 文字列として受け取り、バイト列へ変換)。
+    pub data: String,
 }
 
 // ── Admin Query ───────────────────────────────────────────────
@@ -505,6 +552,221 @@ impl AdminQuery {
             current,
             history_len: history.len() as i32,
             history,
+        })
+    }
+
+    // ── Closed timestamp / Follower read(2026-08-29 再設計 P3、REST完全撤廃) ──
+    //
+    // 旧 REST `GET /admin/closed-timestamp`・`POST /admin/closed-timestamp/plan`
+    // の等価(いずれも状態の読み取りなので AdminQuery)。ワンショット操作
+    // (register / advance)は AdminMutation 側。`/receive`・`/publish`
+    // (ノード間 side transport)は B4 としてバイナリトランスポート側に残る。
+
+    /// 登録済み Range ごとの closed timestamp(observability)。
+    async fn closed_timestamp(&self, ctx: &Context<'_>) -> Result<ClosedTimestampStatusGql> {
+        let a = admin(ctx)?;
+        let Some(coord) = a.closed_ts.as_ref() else {
+            return Ok(ClosedTimestampStatusGql { range_count: 0, ranges: Vec::new() });
+        };
+        let ranges: Vec<ClosedTimestampRangeGql> = coord
+            .range_ids()
+            .into_iter()
+            .filter_map(|id| {
+                coord.tracker(id).map(|t| ClosedTimestampRangeGql {
+                    range_id: id as i64,
+                    closed_timestamp: t.closed_timestamp().to_string(),
+                    lowest_in_flight: t.lowest_in_flight().map(|v| v.to_string()),
+                    target_lag_nanos: t.target_lag_nanos().to_string(),
+                })
+            })
+            .collect();
+        Ok(ClosedTimestampStatusGql { range_count: ranges.len() as i32, ranges })
+    }
+
+    /// 指定 Range 群を follower read で読めるかを判定する
+    /// (`AS OF SYSTEM TIME` 相当の判断)。`table` を渡すと、follower read が
+    /// 許可された場合に実際に `select_follower_read`(`AS OF COMMIT` と同じ
+    /// Prolly Tree 経由)でデータも読み出す。旧 REST
+    /// `POST /admin/closed-timestamp/plan` の実ロジックを移植。
+    async fn plan_follower_read(
+        &self,
+        ctx: &Context<'_>,
+        range_ids: Vec<i64>,
+        mode: Option<String>,
+        now_nanos: Option<String>,
+        staleness_nanos: Option<String>,
+        table: Option<String>,
+        filter_col: Option<String>,
+        filter_val: Option<String>,
+    ) -> Result<FollowerReadPlanGql> {
+        let a = admin(ctx)?;
+        let coord = a
+            .closed_ts
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("closed timestamp coordinator is not configured"))?;
+        let ids: Vec<u64> = range_ids.iter().map(|&x| x as u64).collect();
+        let now = match now_nanos {
+            Some(s) => parse_u64(&s, "nowNanos")?,
+            None => now_unix_nanos(),
+        };
+        let staleness = match staleness_nanos {
+            Some(s) => parse_u64(&s, "stalenessNanos")?,
+            None => aruaru_dist::DEFAULT_MAX_STALENESS_NANOS,
+        };
+        let mode = mode.unwrap_or_else(|| "bounded".to_string());
+        let plan = match mode.as_str() {
+            "exact" => coord.plan_exact_staleness_read(&ids, now, staleness),
+            _ => coord.negotiate_bounded_staleness(&ids, now, staleness),
+        };
+        let (plan_kind, reason, read_ts, stale) = match &plan {
+            aruaru_dist::ReadPlan::FollowerRead { timestamp, staleness_nanos } => (
+                "follower_read",
+                None,
+                Some(timestamp.to_string()),
+                Some(staleness_nanos.to_string()),
+            ),
+            aruaru_dist::ReadPlan::RouteToLeaseholder { reason } => {
+                ("route_to_leaseholder", Some(reason.to_string()), None, None)
+            }
+        };
+        let data = match (&plan, &table) {
+            (aruaru_dist::ReadPlan::FollowerRead { timestamp, .. }, Some(tbl)) => {
+                let filter = match (&filter_col, &filter_val) {
+                    (Some(c), Some(v)) => Some((c.clone(), v.clone())),
+                    _ => None,
+                };
+                match a.engine.select_follower_read(tbl.clone(), filter, *timestamp as i64) {
+                    Ok(resp) => Some(FollowerReadDataGql {
+                        ok: true,
+                        error: None,
+                        result: Some(crate::response_to_gql(resp)),
+                    }),
+                    Err(e) => Some(FollowerReadDataGql { ok: false, error: Some(e), result: None }),
+                }
+            }
+            _ => None,
+        };
+        Ok(FollowerReadPlanGql {
+            plan: plan_kind.to_string(),
+            is_follower_read: plan.is_follower_read(),
+            read_timestamp: read_ts,
+            staleness_nanos: stale,
+            reason,
+            data,
+        })
+    }
+
+    // ── WAL サービス(Neon 方式、2026-08-29 再設計 P3、REST完全撤廃) ──
+    //
+    // 旧 REST `GET /admin/wal-service`(status)・`POST /admin/wal-service/page`
+    // (`get_page_at_lsn` = 純粋な読み取り)の等価。append(耐久化)/
+    // image-layer(compaction)は AdminMutation 側。
+
+    /// safekeeper quorum の状態と pageserver の適用状況。
+    async fn wal_service(&self, ctx: &Context<'_>) -> Result<WalServiceStatusGql> {
+        let a = admin(ctx)?;
+        let s = a
+            .wal_storage
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("WAL service is not configured"))?;
+        // safekeeper の id は 1..=n。REST 版は `0..len` で先頭を取りこぼして
+        // いたため、ここでは `1..=n` に正した(observability の正確性優先)。
+        let safekeepers: Vec<WalSafekeeperGql> = (1..=s.wal.len() as u64)
+            .filter_map(|i| {
+                s.wal.safekeeper(i).map(|sk| WalSafekeeperGql {
+                    id: sk.id() as i64,
+                    accepted_term: sk.accepted_term().to_string(),
+                    flush_lsn: sk.flush_lsn().to_string(),
+                })
+            })
+            .collect();
+        Ok(WalServiceStatusGql {
+            term: s.term().to_string(),
+            quorum: s.wal.quorum() as i32,
+            commit_lsn: s.wal.commit_lsn().to_string(),
+            safekeepers,
+            pageserver: WalPageserverGql {
+                last_record_lsn: s.pageserver.last_record_lsn().to_string(),
+                max_replication_lag: s.pageserver.max_replication_lag().to_string(),
+                page_keys: s.pageserver.page_keys(),
+            },
+        })
+    }
+
+    /// 指定 LSN 時点のページを pageserver 上で再構成して返す
+    /// (`get_page_at_lsn`)。`AS OF COMMIT` 読み取りの土台。`lsn` 省略時は
+    /// pageserver の最終適用 LSN。
+    async fn wal_page(
+        &self,
+        ctx: &Context<'_>,
+        page_key: String,
+        lsn: Option<String>,
+    ) -> Result<WalPageGql> {
+        let a = admin(ctx)?;
+        let s = a
+            .wal_storage
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("WAL service is not configured"))?;
+        let ps = &s.pageserver;
+        let lsn = match lsn {
+            Some(v) => parse_u64(&v, "lsn")?,
+            None => ps.last_record_lsn(),
+        };
+        let bytes = ps
+            .get_page_at_lsn(&page_key, lsn)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(WalPageGql {
+            len: bytes.len() as i32,
+            data: String::from_utf8_lossy(&bytes).into_owned(),
+            image_layer_lsn: ps.image_layer_lsn(&page_key).map(|v| v.to_string()),
+            page_key,
+            lsn: lsn.to_string(),
+        })
+    }
+
+    // ── ScyllaDB shard-per-core ストア(2026-08-29 再設計 P3、REST完全撤廃) ──
+    //
+    // 旧 REST `GET /admin/sharded-store/:key`・`GET /admin/sharded-store-stats`
+    // の等価。put は AdminMutation 側。シャードスレッドとの通信は
+    // `std::sync::mpsc` のブロッキング recv なので `spawn_blocking` で退避する
+    // (REST ハンドラと同じ配慮)。
+
+    async fn sharded_store_get(
+        &self,
+        ctx: &Context<'_>,
+        key: String,
+    ) -> Result<ShardedStoreEntryGql> {
+        let a = admin(ctx)?;
+        let store = a
+            .sharded_store
+            .clone()
+            .ok_or_else(|| async_graphql::Error::new("sharded store is not configured"))?;
+        let shard_id = store.shard_for(key.as_bytes()) as i64;
+        let k = key.clone();
+        let value = tokio::task::spawn_blocking(move || store.get(k.as_bytes()))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(ShardedStoreEntryGql { key, shard_id, found: value.is_some(), value })
+    }
+
+    async fn sharded_store_stats(&self, ctx: &Context<'_>) -> Result<ShardedStoreStatsGql> {
+        let a = admin(ctx)?;
+        let store = a
+            .sharded_store
+            .clone()
+            .ok_or_else(|| async_graphql::Error::new("sharded store is not configured"))?;
+        let (shard_count, per_shard_len, total_len) = tokio::task::spawn_blocking(move || {
+            let shard_count = store.shard_count();
+            let per: Vec<i64> = (0..shard_count).map(|i| store.shard_len(i) as i64).collect();
+            let total: i64 = per.iter().sum();
+            (shard_count, per, total)
+        })
+        .await
+        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(ShardedStoreStatsGql {
+            shard_count: shard_count as i32,
+            per_shard_len,
+            total_len,
         })
     }
 
@@ -1001,6 +1263,145 @@ impl AdminMutation {
             tables: imported,
         })
     }
+
+    // ── Closed timestamp: ワンショット操作(2026-08-29 再設計 P3、REST完全撤廃) ──
+    //
+    // 旧 REST `POST /admin/closed-timestamp/range`・`/advance` の等価
+    // (冪等でない副作用 = B2)。observability(status / plan)は AdminQuery 側。
+
+    /// Range を closed timestamp の追跡対象として登録する。
+    async fn closed_ts_register_range(
+        &self,
+        ctx: &Context<'_>,
+        range_id: i64,
+    ) -> Result<ClosedTsRegisterResultGql> {
+        let a = admin(ctx)?;
+        let coord = a
+            .closed_ts
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("closed timestamp coordinator is not configured"))?;
+        let tracker = coord.register_range(range_id as u64);
+        Ok(ClosedTsRegisterResultGql {
+            range_id,
+            closed_timestamp: tracker.closed_timestamp().to_string(),
+        })
+    }
+
+    /// 全 Range の closed timestamp を前進させる(CockroachDB が定期的に
+    /// 行う操作を明示的に起こす)。`now_nanos` 省略時は現在時刻。
+    async fn closed_ts_advance(
+        &self,
+        ctx: &Context<'_>,
+        now_nanos: Option<String>,
+    ) -> Result<Vec<ClosedTsAdvanceEntryGql>> {
+        let a = admin(ctx)?;
+        let coord = a
+            .closed_ts
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("closed timestamp coordinator is not configured"))?;
+        let now = match now_nanos {
+            Some(s) => parse_u64(&s, "nowNanos")?,
+            None => now_unix_nanos(),
+        };
+        Ok(coord
+            .advance_all(now)
+            .into_iter()
+            .map(|(id, ts)| ClosedTsAdvanceEntryGql {
+                range_id: id as i64,
+                closed_timestamp: ts.to_string(),
+            })
+            .collect())
+    }
+
+    // ── WAL サービス: 副作用のあるアクション(2026-08-29 再設計 P3) ──
+    //
+    // 旧 REST `POST /admin/wal-service/append`・`/image-layer` の等価。
+    // status / page(読み取り)は AdminQuery 側。
+
+    /// WAL レコードを safekeeper quorum へ耐久化し、pageserver へ取り込ませる
+    /// (Neon の compute → safekeeper → pageserver)。`start_lsn` から
+    /// レコードごとに +1 ずつ LSN を割る。
+    async fn wal_append(
+        &self,
+        ctx: &Context<'_>,
+        start_lsn: String,
+        records: Vec<WalRecordInput>,
+    ) -> Result<WalAppendResultGql> {
+        let a = admin(ctx)?;
+        let s = a
+            .wal_storage
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("WAL service is not configured"))?;
+        let start = parse_u64(&start_lsn, "startLsn")?;
+        let mut recs = Vec::with_capacity(records.len());
+        for (i, r) in records.iter().enumerate() {
+            let lsn = start + i as u64;
+            let bytes = r.data.clone().into_bytes();
+            recs.push(match r.op.as_deref() {
+                Some("append") => aruaru_dist::WalRecord::append(lsn, r.page_key.clone(), bytes),
+                _ => aruaru_dist::WalRecord::replace(lsn, r.page_key.clone(), bytes),
+            });
+        }
+        let commit = s
+            .write(&recs)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(WalAppendResultGql {
+            commit_lsn: commit.to_string(),
+            applied_lsn: s.pageserver.last_record_lsn().to_string(),
+            record_count: recs.len() as i32,
+        })
+    }
+
+    /// 指定 LSN で image layer を作り、それより古い delta を落とす
+    /// (pageserver の compaction 相当)。`lsn` 省略時は最終適用 LSN。
+    async fn wal_create_image_layer(
+        &self,
+        ctx: &Context<'_>,
+        page_key: String,
+        lsn: Option<String>,
+    ) -> Result<WalImageLayerResultGql> {
+        let a = admin(ctx)?;
+        let s = a
+            .wal_storage
+            .as_ref()
+            .ok_or_else(|| async_graphql::Error::new("WAL service is not configured"))?;
+        let ps = &s.pageserver;
+        let lsn = match lsn {
+            Some(v) => parse_u64(&v, "lsn")?,
+            None => ps.last_record_lsn(),
+        };
+        let dropped = ps
+            .create_image_layer(&page_key, lsn)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(WalImageLayerResultGql {
+            page_key,
+            gc_cutoff_lsn: lsn.to_string(),
+            dropped_deltas: dropped as i32,
+        })
+    }
+
+    // ── ScyllaDB shard-per-core ストア: put(2026-08-29 再設計 P3) ──
+
+    /// 指定キーを担当シャードへ書き込む(キーの murmur3 ハッシュで
+    /// シャードを決定)。get / stats は AdminQuery 側。
+    async fn sharded_store_put(
+        &self,
+        ctx: &Context<'_>,
+        key: String,
+        value: String,
+    ) -> Result<ShardedStorePutResultGql> {
+        let a = admin(ctx)?;
+        let store = a
+            .sharded_store
+            .clone()
+            .ok_or_else(|| async_graphql::Error::new("sharded store is not configured"))?;
+        let shard_id = store.shard_for(key.as_bytes()) as i64;
+        let k = key.clone();
+        tokio::task::spawn_blocking(move || store.put(k.into_bytes(), value))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(ShardedStorePutResultGql { key, shard_id })
+    }
 }
 
 // ── 共通ヘルパ ────────────────────────────────────────────────
@@ -1129,6 +1530,12 @@ mod cluster_propose_tests {
                 1,
                 1,
             ))),
+            closed_ts: Some(Arc::new(aruaru_dist::ClosedTimestampCoordinator::with_default_lag())),
+            wal_storage: Some(Arc::new(aruaru_dist::DisaggregatedStorage::new(
+                3,
+                aruaru_dist::DEFAULT_MAX_REPLICATION_LAG,
+            ))),
+            sharded_store: Some(Arc::new(aruaru_query::sharded_store::ShardedRowStore::new(2))),
         }
     }
 
@@ -1591,5 +1998,182 @@ mod cluster_propose_tests {
             .find(|s| s["operation"].as_str().unwrap().contains("ParallelScan"))
             .unwrap();
         assert!(scan["operation"].as_str().unwrap().contains("par=6"), "{scan:?}");
+    }
+
+    // ── 2026-08-29 再設計 P3: closed-timestamp / wal-service / sharded-store
+    // が GraphQL だけで完結する(REST `/admin/*` 該当ルート撤廃後) ──
+
+    #[tokio::test]
+    async fn closed_timestamp_status_advance_and_follower_read_plan_are_graphql_only() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), None));
+
+        // 登録前は空。
+        let resp = schema
+            .execute(authorized_request("query { closedTimestamp { rangeCount ranges { rangeId } } }"))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(resp.data.into_json().unwrap()["closedTimestamp"]["rangeCount"], 0);
+
+        // Range を登録(旧 REST POST /admin/closed-timestamp/range の置き換え)。
+        let resp = schema
+            .execute(authorized_request(
+                "mutation { closedTsRegisterRange(rangeId: 1) { rangeId closedTimestamp } }",
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(resp.data.into_json().unwrap()["closedTsRegisterRange"]["closedTimestamp"], "0");
+
+        // advance(now=10s)→ closed = 10s - target_lag(3s) = 7s。
+        let resp = schema
+            .execute(authorized_request(
+                r#"mutation { closedTsAdvance(nowNanos: "10000000000") { rangeId closedTimestamp } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let adv = resp.data.into_json().unwrap();
+        assert_eq!(adv["closedTsAdvance"][0]["rangeId"], 1);
+        assert_eq!(adv["closedTsAdvance"][0]["closedTimestamp"], "7000000000");
+
+        // planFollowerRead(bounded, now=10s)→ closed 7s は上限内なので follower_read。
+        let resp = schema
+            .execute(authorized_request(
+                r#"query { planFollowerRead(rangeIds: [1], nowNanos: "10000000000") { plan isFollowerRead readTimestamp reason } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let p = resp.data.into_json().unwrap();
+        assert_eq!(p["planFollowerRead"]["plan"], "follower_read");
+        assert_eq!(p["planFollowerRead"]["isFollowerRead"], true);
+        assert_eq!(p["planFollowerRead"]["readTimestamp"], "7000000000");
+
+        // 未登録 Range は leaseholder へ。
+        let resp = schema
+            .execute(authorized_request(
+                r#"query { planFollowerRead(rangeIds: [99], nowNanos: "10000000000") { plan reason } }"#,
+            ))
+            .await;
+        let p = resp.data.into_json().unwrap();
+        assert_eq!(p["planFollowerRead"]["plan"], "route_to_leaseholder");
+        assert!(p["planFollowerRead"]["reason"].as_str().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn wal_service_append_page_status_and_image_layer_are_graphql_only() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), None));
+
+        // append: LSN 1..3(旧 REST POST /admin/wal-service/append の置き換え)。
+        let resp = schema
+            .execute(authorized_request(
+                r#"mutation { walAppend(startLsn: "1", records: [
+                    { pageKey: "page/a", data: "base" },
+                    { pageKey: "page/a", op: "append", data: "+d2" },
+                    { pageKey: "page/a", op: "append", data: "+d3" }
+                ]) { commitLsn appliedLsn recordCount } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let d = resp.data.into_json().unwrap();
+        assert_eq!(d["walAppend"]["commitLsn"], "3");
+        assert_eq!(d["walAppend"]["recordCount"], 3);
+
+        // status: safekeeper 3台・quorum 2・commit_lsn 3。
+        let resp = schema
+            .execute(authorized_request(
+                "query { walService { quorum commitLsn safekeepers { id flushLsn } pageserver { lastRecordLsn pageKeys } } }",
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let s = resp.data.into_json().unwrap();
+        assert_eq!(s["walService"]["quorum"], 2);
+        assert_eq!(s["walService"]["commitLsn"], "3");
+        assert_eq!(s["walService"]["safekeepers"].as_array().unwrap().len(), 3);
+        assert_eq!(s["walService"]["pageserver"]["pageKeys"][0], "page/a");
+
+        // page: LSN 2 時点で "base+d2"。
+        let resp = schema
+            .execute(authorized_request(
+                r#"query { walPage(pageKey: "page/a", lsn: "2") { data len } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(resp.data.into_json().unwrap()["walPage"]["data"], "base+d2");
+
+        // image-layer を LSN 2 で作成 → それ未満の delta が落ちる。
+        let resp = schema
+            .execute(authorized_request(
+                r#"mutation { walCreateImageLayer(pageKey: "page/a", lsn: "2") { gcCutoffLsn droppedDeltas } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(resp.data.into_json().unwrap()["walCreateImageLayer"]["gcCutoffLsn"], "2");
+
+        // GC cutoff 未満の読み取りはエラー(設計上の限界を GraphQL でも保つ)。
+        let resp = schema
+            .execute(authorized_request(
+                r#"query { walPage(pageKey: "page/a", lsn: "1") { data } }"#,
+            ))
+            .await;
+        assert!(!resp.errors.is_empty(), "LSN 1 は GC 済みで再構成できないはず");
+    }
+
+    #[tokio::test]
+    async fn sharded_store_put_get_and_stats_are_graphql_only() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), None));
+
+        // put(旧 REST POST /admin/sharded-store の置き換え)。
+        let resp = schema
+            .execute(authorized_request(
+                r#"mutation { shardedStorePut(key: "alpha", value: "apple") { key shardId } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let put = resp.data.into_json().unwrap();
+        assert_eq!(put["shardedStorePut"]["key"], "alpha");
+        // shardId はマシン非依存(admin_ctx は shard_count=2 固定)で 0 or 1。
+        assert!(matches!(put["shardedStorePut"]["shardId"].as_i64(), Some(0) | Some(1)));
+
+        // get: 書き込んだ値が読み戻せる。
+        let resp = schema
+            .execute(authorized_request(
+                r#"query { shardedStoreGet(key: "alpha") { found value shardId } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let g = resp.data.into_json().unwrap();
+        assert_eq!(g["shardedStoreGet"]["found"], true);
+        assert_eq!(g["shardedStoreGet"]["value"], "apple");
+
+        // 未知キーは found=false。
+        let resp = schema
+            .execute(authorized_request(
+                r#"query { shardedStoreGet(key: "missing") { found value } }"#,
+            ))
+            .await;
+        let g = resp.data.into_json().unwrap();
+        assert_eq!(g["shardedStoreGet"]["found"], false);
+        assert!(g["shardedStoreGet"]["value"].is_null());
+
+        // stats: shard_count=2(admin_ctx 既定)、total_len=1。
+        let resp = schema
+            .execute(authorized_request(
+                "query { shardedStoreStats { shardCount perShardLen totalLen } }",
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let st = resp.data.into_json().unwrap();
+        assert_eq!(st["shardedStoreStats"]["shardCount"], 2);
+        assert_eq!(st["shardedStoreStats"]["totalLen"], 1);
     }
 }

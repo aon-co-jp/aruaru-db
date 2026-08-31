@@ -168,10 +168,17 @@
 > ### 🛑 復活用メッセージ(次回セッション・別アカウントはまずこれを読む)
 >
 > **現在地**: aruaru-db の管理面(`/admin/*` REST)を**完全撤廃**する
-> 抜本再設計の途中。正本は [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md)。
-> フェーズ P0(設計)/P1(宣言的設定基盤)/P2(parallel・follower_read)/
-> P3 の一部(`/admin/parallel*`・`/v1/keys/self-issue` 撤廃)まで完了・
-> push 済み。`git log --oneline -20` で `再設計 P1〜P3` のコミット群を確認。
+> 抜本再設計の途中。正本は [`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md)
+> (**2026-08-31 に付録 A を「2026 年最新設計」として大幅拡充**——A.1 に
+> TiDB/CockroachDB/YugabyteDB/Snowflake/Neon vs Aurora/SingleStore/ClickHouse/
+> Iceberg・Delta・Hudi/Photon・DuckDB の**実装方法**、A.3〜A.7 に取り込み判断と
+> `aruaru.yaml: htap` 案)。フェーズ P0(設計)/P1(宣言的設定基盤)/P2
+> (parallel・follower_read)/P3 の一部(`/admin/parallel*`・`/v1/keys/self-issue`
+> 撤廃)まで完了・push 済み。**P3 本体(続き10)= `closed-timestamp`・
+> `wal-service`・`sharded-store` を GraphQL 化し該当 REST ルートを撤廃**——
+> commit 済み・push 待ち。`ephemeral-query`・`multi-raft` は trait 化リファクタ
+> 待ちで次スライスへ。`git log --oneline -25` で `再設計 P1〜P3`・`付録A` の
+> コミット群を確認。
 >
 > **ユーザーの不変の要求(肝に銘じること)**:
 > 1. **REST API は SET(RPoem + aruaru-db)全体から例外なく完全撤廃**。
@@ -188,23 +195,33 @@
 >    連携強化のため再設計・再実装・再テストを**実用的になるまで数回
 >    繰り返す**。
 >
-> **次にやること(P3 本体、優先順)**:
-> 1. `closed-timestamp`(`GET /admin/closed-timestamp`=status →
->    `Query.closedTimestamp`、`/range`・`/advance` → `Mutation`、`/plan`
->    → `Query.planFollowerRead`。`/receive`・`/publish` は B4 で P4
->    バイナリ化)。`AdminState.closed_ts_coordinator()` が既にあるので
->    `AdminCtx.closed_ts` を足して注入する(`object_table`/`keyring` と
->    同じパターン)。Timestamp は u64 なので GraphQL では String 表現。
-> 2. `wal-service`(`Arc<DisaggregatedStorage>`)・`sharded-store`
->    (`ShardedRowStore<String>`)も同じ AdminCtx 注入で。
-> 3. `ephemeral-query`・`multi-raft` は trait 注入のリファクタが要る
->    (`aruaru-graphql` は `aruaru-server` の `mod` を参照できない。
->    `AdminCtx` に `Arc<dyn EphemeralRunner>` 等を注入し server 側で実装)。
-> 4. `disaster_backup.email` の reconcile(`feature = "disaster_email_backup"`
+> **次にやること(優先順、続き10 時点)**:
+> 1. ✅(続き10 完了)`closed-timestamp`(`Query.closedTimestamp` /
+>    `Query.planFollowerRead` / `Mutation.closedTsRegisterRange` /
+>    `Mutation.closedTsAdvance`)、`wal-service`(`Query.walService` /
+>    `Query.walPage` / `Mutation.walAppend` / `Mutation.walCreateImageLayer`)、
+>    `sharded-store`(`Query.shardedStoreGet` / `Query.shardedStoreStats` /
+>    `Mutation.shardedStorePut`)を GraphQL 化し、`admin.rs` から該当 REST
+>    ルート・ハンドラ・構造体・`now_nanos()` を削除。`AdminCtx` へ
+>    `closed_ts` / `wal_storage` / `sharded_store` を注入。cargo test 失敗0。
+>    `/receive`・`/publish` は B4 で残置(P4)。
+> 2. **⏳ 次スライス**: `ephemeral-query`・`multi-raft` の GraphQL 化。
+>    trait 注入リファクタが要る(`aruaru-graphql` は `aruaru-server` の
+>    `mod` を参照できない。`ephemeral-query` は `AdminCtx` に
+>    `Arc<dyn EphemeralRunner>`、`multi-raft` は `Arc<dyn MultiRaftHandle>`
+>    または `EngineApplier` のクレート移設。理由は `docs/CONTROL_PLANE_
+>    REDESIGN.md` §8 P3 に明記)。
+> 3. **⏳ 実プロセス HTTP E2E**(続き10 未達): 実 `aruaru-server` を起動し
+>    新 GraphQL クエリ/ミューテーションを `/graphql` へ実 HTTP で叩き、旧
+>    REST パス(`/admin/closed-timestamp` 等)が 404 になることも確認。
+> 4. **⏳ 要求③の実装トラック**: 付録 A.6-2「Raft-Learner 上の 行→列 非同期
+>    変換レプリカ(`ColumnarApplier`)」が本命。A.6-1 HLC、A.6-4 deletion
+>    vector も。`aruaru.yaml: htap` セクション(§5・A.7)を先に足す。
+> 5. `disaster_backup.email` の reconcile(`feature = "disaster_email_backup"`
 >    ゲート。config スキーマは 7 フィールドへ拡張済み)。
-> 5. Tauri(`admin/src-tauri`、ワークスペース外・この環境ではビルド不可)
+> 6. Tauri(`admin/src-tauri`、ワークスペース外・この環境ではビルド不可)
 >    の残りコマンドを GraphQL へ。設定タブは `aruaru.yaml` 編集 UI に。
-> 6. P4: `admin::admin_routes` 撤去、`/raft/*`・side transport をバイナリ化。
+> 7. P4: `admin::admin_routes` 撤去、`/raft/*`・side transport をバイナリ化。
 >    P5: RPoem を execution-config / persisted operations / feature flags の
 >    CDN(コントロールプレーン)役に。P6: 各言語 README・PORTING 整合。
 >
@@ -4874,3 +4891,94 @@ Tauri/Android/web の該当 REST 参照確認。
 
 **README 整合**: `README.md`・`README-Japan.md`・`README-English.md` の冒頭
 更新ノート、`PORTING.md` §7 を本再設計に合わせて日英で更新済み(続き9)。
+
+## HANDOFF追記(2026-08-31続き10) 再設計 付録A を 2026 最新設計へ大幅拡充 + P3 本体(closed-timestamp / wal-service / sharded-store の GraphQL 化・REST 撤廃)
+
+**依頼(要求③の深掘り + P3 本体)**: 「CockroachDB × Snowflake ハイブリッド
+変種の技術を、TiDB だけに限らず**関連する全て**を世界中の言語で Google /
+GitHub 調査し、**実装方法(アーキテクチャ・データ構造・アルゴリズム)まで**
+調べ、`docs/CONTROL_PLANE_REDESIGN.md` を 2026 年最新設計として再設計。
+その後 P3 本体を実装」。
+
+### (1) 付録 A を全面再構成(コミット `6e5b3e0`、push 待ち)
+
+英・日・独で一次論文 / 公式 docs / GitHub を再調査。`docs/CONTROL_PLANE_
+REDESIGN.md` 付録 A を **59 行 → 約 400 行**へ:
+- **A.0** 「特殊な変種」を一文で定義 + 取り込む性質 13 項目の対応表(crate 明記)。
+- **A.1** 実装方法を 9 系統で詳述(出典 URL 併記):
+  TiDB/TiFlash(DeltaTree = B+木 × LSM、TiFlash proxy が FFI で apply 結果を
+  push、learner が行→列変換)、CockroachDB(Range / HLC / Pebble = RocksDB 系 /
+  closed ts / protected ts)、YugabyteDB(DocDB = カスタム RocksDB、IntentsDB に
+  provisional record)、Snowflake(不変マイクロパーティション 16MB / メタデータ
+  pruning / time travel はストレージ不変性の帰結)、Neon vs Aurora(Neon =
+  safekeeper Paxos quorum `flushLsn[n-quorum]` + pageserver materialize、
+  Aurora = モノリシック)、SingleStore(Universal Storage 5 機能 / 100 万行
+  segment / skiplist・hash index)、ClickHouse(MergeTree 不変 part + granule
+  8192 行スパース索引 + background merge、SharedMergeTree は Keeper が共有
+  メタデータの真実源で計算ステートレス)、Iceberg/Delta/Hudi 三種比較
+  (Iceberg = メタデータ木、Delta = 逐次 log + deletion vector、Hudi =
+  Merge-on-Read + record-level index)、Photon/DuckDB(FSST・ALP・型認識
+  軽量圧縮を analyze フェーズで選択)。
+- **A.2** 取り込み済みを crate 対応表で棚卸し(17 行)。
+- **A.3(A.6-x)** 未取込の取り込み判断:
+  - **取り込む**: HLC(`hlc.rs` 新設案)、**Raft-Learner 上の 行→列 非同期
+    変換レプリカ(本命、`ColumnarApplier` 案)**、Raft index + MVCC SI 検証、
+    DeltaTree / deletion vector / Merge-on-Read(段階的、deletion vector が最軽量)。
+  - **条件付き保留**: 型認識軽量圧縮(RLE/bitpack/FSST)——実データ規模が
+    ボトルネックになった時点。
+  - **取り込まない(理由明記)**: Aurora 型モノリシックストレージ(Neon 型分離の
+    方が follower read / ephemeral pod / 列レプリカと組み合わせやすい)。
+- **A.7** 本再設計への反映: `aruaru.yaml` に `htap:` セクション追加案
+  (`columnar_replicas` / `read_consistency` / `delta`)、execution-config で
+  クラスタ配布(TiDB PD / ClickHouse Keeper 相当)、`Query.htapReplicas` 新設案。
+
+### (2) P3 本体: closed-timestamp / wal-service / sharded-store を GraphQL 化 → REST 撤廃
+
+`object-table`(続き3)と同じ 5 手順(GraphQL query/mutation 新設 → `AdminCtx`
+へ `Arc` 注入 → `admin.rs` から REST ルート・ハンドラ・構造体削除 → `main.rs`
+配線 → test)を 3 群へ適用。**着手前に grep で Tauri/Android/web の該当 REST
+参照が皆無なことを確認済み**(`object-table`/`keys` と同じく安全に撤廃)。
+
+- **closed-timestamp**: `Query.closedTimestamp`(status、range ごとの closed_ts /
+  lowest_in_flight / target_lag)、`Query.planFollowerRead`(`table` 指定で
+  `select_follower_read` = `AS OF COMMIT` 経由の実データ読み出しまで)、
+  `Mutation.closedTsRegisterRange`、`Mutation.closedTsAdvance`。旧 REST
+  `GET /admin/closed-timestamp`・`/range`・`/advance`・`/plan` を削除。
+  `AdminCtx.closed_ts`(`closed_ts_coordinator()`)注入。**`/receive`・
+  `/publish` は B4** として残置(受信の実体は既に `binary_transport.rs` の
+  バイナリ経路、`/publish` は「いつ誰に配布するか」の人間向け制御トリガー、
+  P4 で再検討)。タイムスタンプ・LSN は u64 のため GraphQL では **String 表現**。
+- **wal-service**: `Query.walService`(status)、`Query.walPage`
+  (`get_page_at_lsn` = 読み取りなので Query。§4 表の B2 記載を §2.2 判断フローに
+  従い Query へ是正)、`Mutation.walAppend`、`Mutation.walCreateImageLayer`。
+  旧 REST 4 本を削除。`AdminCtx.wal_storage`(`wal_storage_handle()`)注入。
+  safekeeper 列挙を `0..n`→`1..=n` に是正(REST 版は先頭を取りこぼしていた)。
+- **sharded-store**: `Query.shardedStoreGet`、`Query.shardedStoreStats`、
+  `Mutation.shardedStorePut`。旧 REST 3 本を削除。`AdminState.sharded_store` を
+  `Arc` 化し `AdminCtx.sharded_store`(`sharded_store_handle()`)注入。
+  mpsc ブロッキング recv は `tokio::task::spawn_blocking` で退避(REST と同じ配慮、
+  `aruaru-graphql/Cargo.toml` に `tokio = { features = ["rt"] }` を通常依存追加)。
+- **ephemeral-query / multi-raft は次スライスへ(技術的理由を明記)**:
+  - `ephemeral-query`: `run_ephemeral_query` は `current_exe()` +
+    `tokio::process::Command` で自分自身を `--ephemeral-worker` 再起動する
+    `aruaru-server` バイナリ固有処理。`ephemeral_pod` は lib クレートに無く
+    `aruaru-graphql` から参照不能。`AdminCtx` へ `Arc<dyn EphemeralRunner>`
+    trait を注入し `aruaru-server` 側で実装する **trait 化リファクタが必要**。
+  - `multi-raft`: `MultiRaftCluster<crate::cluster::EngineApplier>` が
+    server-local ジェネリック。`split` は `applier: A` を要求し `AdminCtx` から
+    具体型を名指しできない。trait object 化 or `EngineApplier` のクレート移設が
+    必要。いずれも状態注入だけで済む上記 3 群とは規模が違うため分離
+    (「半端な足場を成果と呼ばない」原則、`docs/CONTROL_PLANE_REDESIGN.md`
+    §8 P3 に理由を明記)。
+
+**検証**: `cargo build -p aruaru-graphql -p aruaru-server`(debug)成功
+(既存 `build_cluster`/`propose_commit` の 2 警告のみ)。`cargo test -p
+aruaru-dist -p aruaru-graphql -p aruaru-server` **失敗 0**(aruaru-dist 72、
+aruaru-graphql 16〈新規 3: closed_timestamp / wal_service / sharded_store が
+GraphQL だけで完結〉、aruaru-server 13)。`cargo build --release` は実行中。
+**実プロセス HTTP での E2E(新 GraphQL クエリを実 `/graphql` へ叩く / 旧 REST
+パスが 404)はこのセッションでは未実施**——正直な未達事項(次スライス)。
+
+**次回の起点**: 本ファイル冒頭「🛑 復活用メッセージ」→ 次は
+`ephemeral-query` / `multi-raft` の trait 注入リファクタ、または A.6-2
+(Raft-Learner 行→列変換レプリカ)の着手。実プロセス HTTP E2E も残タスク。
