@@ -44,6 +44,9 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-r
 # GitHub Releases API問い合わせ+アセットダウンロード用HTTPクライアント。
 # 他クレート(aruaru-registry等)と同じrustls-tls構成に揃える。
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `aruaru_dist::ephemeral::EphemeralRunner` trait実装(ProcessEphemeralRunner)
+# 向け(2026-08-31新設)。aruaru-distと同じバージョンを使用。
+async-trait = "0.1"
 
 [features]
 # スタンドアロンのメール・ディザスタバックアップ(2026-07-25追記)。

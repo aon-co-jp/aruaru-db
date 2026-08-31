@@ -206,12 +206,14 @@
 >    ルート・ハンドラ・構造体・`now_nanos()` を削除。`AdminCtx` へ
 >    `closed_ts` / `wal_storage` / `sharded_store` を注入。cargo test 失敗0。
 >    `/receive`・`/publish` は B4 で残置(P4)。
-> 2. **⏳ 次スライス**: `ephemeral-query`・`multi-raft` の GraphQL 化。
->    trait 注入リファクタが要る(`aruaru-graphql` は `aruaru-server` の
->    `mod` を参照できない。`ephemeral-query` は `AdminCtx` に
->    `Arc<dyn EphemeralRunner>`、`multi-raft` は `Arc<dyn MultiRaftHandle>`
->    または `EngineApplier` のクレート移設。理由は `docs/CONTROL_PLANE_
->    REDESIGN.md` §8 P3 に明記)。
+> 2. ✅(続き12 完了)`ephemeral-query`: `aruaru_dist::ephemeral`に型・
+>    `EphemeralRunner` trait を移設、`aruaru-server::ephemeral_pod::
+>    ProcessEphemeralRunner`が実装、`AdminCtx.ephemeral`へ注入。
+>    `Mutation.ephemeralQuery`が実プロセス起動込みで実HTTP動作確認済み、
+>    旧REST `/admin/ephemeral-query`は削除・404を確認。
+>    **⏳ 残り**: `multi-raft` の GraphQL 化。`Arc<dyn MultiRaftHandle>`
+>    または `EngineApplier` のクレート移設が必要(理由は
+>    `docs/CONTROL_PLANE_REDESIGN.md` §8 P3 に明記)。
 > 3. ✅(続き11 完了)**実プロセス HTTP E2E**: 実 `aruaru-server` を起動し
 >    `closedTimestamp`/`closedTsRegisterRange`/`closedTsAdvance`・
 >    `walService`(safekeeper `1..=n` 是正の実証込み)・`shardedStorePut`/
@@ -5038,3 +5040,65 @@ aruaru-llm ASRとトラックB=aruaru-db REST撤廃のうち、直前の自分�
 (実プロセスHTTP E2E)を完了としてチェックを付ける。次は項目2
 (`ephemeral-query`/`multi-raft`のtrait注入リファクタ)または項目4
 (A.6-2 `ColumnarApplier`)に進むこと。
+
+## HANDOFF追記(2026-08-31続き12) `ephemeral-query`のtrait注入リファクタ完了(続き11の次項目2の前半)
+
+**課題(続き10が残した技術的理由)**: `run_ephemeral_query`は
+`current_exe()`+`tokio::process::Command`で自分自身を`--ephemeral-worker`
+再起動する`aruaru-server`バイナリ固有処理。`aruaru-graphql`は
+`aruaru-server`のmodを参照できない(循環依存)ため、GraphQL化には
+「型・trait定義を両者が依存できる`aruaru-dist`へ移設し、実装だけ
+`aruaru-server`に残す」という`admin_shared.rs`/`keyring.rs`と同じ
+リファクタが必要だった。
+
+**実装**:
+1. **`crates/aruaru-dist/src/ephemeral.rs`(新規)**: `EphemeralTable`/
+   `EphemeralRequest`/`EphemeralResponse`(元`aruaru-server::
+   ephemeral_pod`から移設)+`snapshot_for_tenant`(同)+新設
+   `#[async_trait] pub trait EphemeralRunner { async fn run(&self,
+   &EphemeralRequest) -> anyhow::Result<EphemeralResponse>; }`。
+   `aruaru-dist/Cargo.toml`に`aruaru-query`依存を追加(循環依存でない
+   ことを確認済み——`aruaru-query`/`aruaru-core`は`aruaru-dist`に
+   依存しない)。
+2. **`aruaru-server::ephemeral_pod`**: 型定義を`aruaru_dist::ephemeral`
+   からの再エクスポートに置き換え、`run_ephemeral_query`(実プロセス
+   起動、`aruaru-server`固有処理として残置)はそのまま。新設
+   `ProcessEphemeralRunner`(`current_exe()`を1回だけ解決して保持)が
+   `EphemeralRunner` traitを実装。
+3. **`aruaru-server::admin.rs`**: 旧REST `POST /admin/ephemeral-query`・
+   `EphemeralQueryRequest`・`ephemeral_query`ハンドラを削除(着手前に
+   `admin/`/`web/`双方でTauri/webクライアントの参照が皆無なことを
+   `grep`で確認済み)。
+4. **`aruaru-graphql`**: `AdminCtx.ephemeral: Option<Arc<dyn
+   aruaru_dist::ephemeral::EphemeralRunner>>`を追加、
+   `Mutation.ephemeralQuery(tenantId, tables: [String], sql: String) ->
+   EphemeralQueryResultGql`を新設(`snapshot_for_tenant`→
+   `runner.run()`→`response_to_gql`で結果変換、未注入時は
+   `message: "ephemeral runner is not configured"`で正直に失敗)。
+5. **`aruaru-server::main.rs`**: `ProcessEphemeralRunner::new()`を起動時
+   に1回構築し`Arc<dyn EphemeralRunner>`として`AdminCtx.ephemeral`へ
+   注入(`current_exe()`失敗時は`None`+`tracing::warn!`、既存の
+   `topology`等と同じフォールバック方針)。
+
+**検証(実測)**: `cargo build --workspace`成功(既存2警告のみ)。
+`cargo test -p aruaru-dist -p aruaru-graphql -p aruaru-server`
+**失敗0**(aruaru-dist 73、aruaru-graphql **17**〈新規2: trait自体の
+object-safety検証+resolver経由でのSQL実行検証〉、aruaru-server 13)。
+`aruaru-backup`の`s3::tests::full_key_joins_prefix_and_key_with_
+exactly_one_slash`が`cargo test --workspace`(並列)で1件failedしたが
+`--test-threads=1`で37/37 green——既知のパターン(複数テストが
+プロセスグローバルなAWS環境変数を並行して読み書きするレース、
+このセッションで新規に発生させたものではない)。
+
+**実プロセスHTTP E2E(型チェック・単体テストのみで終わらせない)**:
+実`aruaru-server.exe`を起動し、(a) `POST /admin/ephemeral-query`が
+正しいトークン付きで実際に`404`(真の削除)、(b)
+`federatedQuery`で`items`テーブルを作成・1行挿入後、
+`ephemeralQuery(tenantId: "tenantA", tables: ["items"], sql: "SELECT *
+FROM items")`が**実際に子プロセスを起動し**、`{"columns":["id","qty"],
+"rows":[["1","42"]]}`という実データを返すことを確認(モックではない
+実プロセス間通信)。サーバーログにエラー・パニック無し。
+
+**次回の起点**: 「🛑 復活用メッセージ」項目2の後半=`multi-raft`
+(`MultiRaftCluster<crate::cluster::EngineApplier>`のtrait object化 or
+`EngineApplier`のクレート移設)、または項目4(A.6-2 `ColumnarApplier`)。

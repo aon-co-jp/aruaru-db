@@ -376,3 +376,17 @@ pub struct ShardedStoreStatsGql {
     pub per_shard_len: Vec<i64>,
     pub total_len: i64,
 }
+
+// ── ephemeral SQL pod(2026-08-31、trait注入リファクタでREST撤廃) ──
+// 旧 REST `POST /admin/ephemeral-query` の等価。`Mutation.ephemeralQuery`。
+
+#[derive(SimpleObject, Clone)]
+pub struct EphemeralQueryResultGql {
+    pub success: bool,
+    pub tenant_id: String,
+    pub result: Option<QueryResultGql>,
+    pub error: Option<String>,
+    /// ワーカー起動自体が失敗した場合(current_exe解決失敗・プロセス
+    /// spawn失敗等)のメッセージ。`result`/`error`はこの場合`None`のまま。
+    pub message: Option<String>,
+}

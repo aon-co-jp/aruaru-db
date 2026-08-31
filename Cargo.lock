@@ -496,6 +496,7 @@ version = "0.5.0"
 dependencies = [
  "anyhow",
  "aruaru-core",
+ "aruaru-query",
  "async-trait",
  "bincode 2.0.1",
  "chrono",
@@ -528,6 +529,7 @@ dependencies = [
  "aruaru-registry",
  "async-graphql",
  "async-graphql-poem",
+ "async-trait",
  "chrono",
  "hex",
  "parking_lot",
@@ -611,6 +613,7 @@ dependencies = [
  "aruaru-query",
  "aruaru-registry",
  "aruaru-wire",
+ "async-trait",
  "chrono",
  "clap",
  "hex",

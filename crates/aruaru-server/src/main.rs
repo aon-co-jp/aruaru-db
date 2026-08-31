@@ -383,6 +383,20 @@ async fn main() -> anyhow::Result<()> {
         let closed_ts_for_graphql = admin_state.closed_ts_coordinator();
         let wal_storage_for_graphql = admin_state.wal_storage_handle();
         let sharded_store_for_graphql = admin_state.sharded_store_handle();
+        // 【2026-08-31 trait注入リファクタ】ephemeral SQL pod。実プロセス
+        // 起動(`current_exe()`)は`ProcessEphemeralRunner`が担い、GraphQL側
+        // へは`Arc<dyn EphemeralRunner>`として注入する。`current_exe()`
+        // 解決に失敗した場合(稀)は`None`のまま——resolver側が正直な
+        // エラーメッセージを返す設計(既存の`topology`等と同じフォール
+        // バック方針)。
+        let ephemeral_for_graphql: Option<std::sync::Arc<dyn aruaru_dist::ephemeral::EphemeralRunner>> =
+            match ephemeral_pod::ProcessEphemeralRunner::new() {
+                Ok(runner) => Some(std::sync::Arc::new(runner)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "ProcessEphemeralRunner::new() failed; ephemeralQuery will be unavailable");
+                    None
+                }
+            };
 
         // Federation SDL を返すエンドポイント (wgc subgraph publish 用)
         #[handler]
@@ -425,6 +439,7 @@ async fn main() -> anyhow::Result<()> {
                     closed_ts: Some(closed_ts_for_graphql.clone()),
                     wal_storage: Some(wal_storage_for_graphql.clone()),
                     sharded_store: Some(sharded_store_for_graphql.clone()),
+                    ephemeral: ephemeral_for_graphql.clone(),
                 },
             ))
             .at("/graphql/sdl", get(subgraph_sdl))
