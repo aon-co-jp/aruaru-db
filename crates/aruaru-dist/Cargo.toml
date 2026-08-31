@@ -15,6 +15,12 @@ aruaru-core  = { path = "../aruaru-core" }
 # 循環依存にならないことを確認済み(`aruaru-query`/`aruaru-core`は
 # `aruaru-dist`に依存しない)。
 aruaru-query = { path = "../aruaru-query" }
+# A.6-2: `ColumnarApplier`(Raft-Learner上の行→列非同期変換レプリカ)が
+# 列化した結果を Databend 方式のオブジェクトテーブル(`aruaru-backup::
+# table_format`、snapshot→segment→block の3層メタデータ)へ書くために
+# 追加(2026-08-31)。循環依存にならないことを確認済み(`aruaru-backup`は
+# `aruaru-core`/`aruaru-query`にのみ依存し、`aruaru-dist`には依存しない)。
+aruaru-backup = { path = "../aruaru-backup" }
 openraft      = { workspace = true }
 tokio.workspace = true
 serde.workspace = true

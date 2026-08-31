@@ -495,6 +495,7 @@ name = "aruaru-dist"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "aruaru-backup",
  "aruaru-core",
  "aruaru-query",
  "async-trait",
