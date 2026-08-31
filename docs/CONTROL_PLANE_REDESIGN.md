@@ -675,7 +675,7 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
   **RPoem execution-config / `table_format` MetaService(CAS)**と同型 ⇒
   §2 原則 2(コントロールプレーン分離)を裏付ける独立事例。
 
-#### A.1.8 テーブルフォーマット三種(Iceberg / Delta Lake / Hudi)
+#### A.1.8 オープンテーブルフォーマット(Iceberg / Delta Lake / Hudi / Paimon)
 
 | | メタデータ構造 | 更新方式 | 索引 |
 |---|---|---|---|
@@ -687,6 +687,20 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
 <https://risingwave.com/blog/apache-iceberg-vs-delta-lake-vs-hudi-2026/> /
 <https://hudi.apache.org/blog/2026/08/12/hudi-vs-delta-lake-for-write-heavy-workloads/>
 
+- **Apache Paimon / Fluss(2026 の新顔)**: Paimon(旧 Flink Table Store、
+  2024 TLP)は **lake format + LSM ツリー**を組み合わせ、**1 テーブルが
+  message queue(streaming 購読)と batch テーブル(分析)を兼ねる**
+  「streaming lakehouse」。primary-key テーブルは LSM level に整理され、
+  writes は sorted run に着地して下位へ継続 compaction。**merge engine**
+  (dedup / partial-update / aggregate)が「キーの最新状態」の意味を定義し、
+  CDC セマンティクスをネイティブに持つ(delete を後付けの仕掛けにしない)。
+  Fluss は sub-second の「hot」層で Paimon(「cold」層)と階層化。
+  <https://paimon.apache.org/docs/1.3/> /
+  <https://amdatalakehouse.substack.com/p/lakehouse-table-formats-in-2026-iceberg>
+  → aruaru-db の「Git-on-SQL コミット = changelog、`AS OF COMMIT` =
+  time travel」は Paimon の changelog + snapshot に発想が近い。**merge
+  engine の partial-update / aggregate** は A.6-4 の Merge-on-Read に
+  取り込む価値がある(将来。まず deletion vector)。
 - → aruaru-db `table_format.rs` は **Iceberg 型のメタデータ木 + Databend 型の
   MetaSrv CAS** を採用済み。**取り込む価値がある未実装**:
   - **deletion vector**(Delta 型): object-table の block に「削除された行の
@@ -779,8 +793,19 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
 - 現状: `closed_ts` の `can_serve_read_at` は「read_ts ≤ closed_ts」だけ。
   TiFlash はさらに「その read_ts に対応する **Raft log index** を learner が
   apply 済みか」を確認してから読む。
+- *TiFlash の実アルゴリズム*(中国語一次資料 `tech.ipalfish.com` /
+  `book.tidb.io` で確認): 読み取り要求を受けた learner は
+  (1) leader へ **read-index** リクエストを送り、(2) その時点の
+  commit index を取得、(3) ローカルの apply がその index に**追いつくまで
+  待って** Raft ログを replay、(4) 要求 timestamp で MVCC フィルタして返す。
+  <https://tech.ipalfish.com/blog/2020/09/08/tidb_htap/> /
+  <https://book.tidb.io/session1/chapter9/tiflash-architecture.html>
 - 判断: **取り込む**。`ColumnarApplier` に `applied_raft_index()` を持たせ、
-  `plan_follower_read` の判定へ `min_required_index ≤ applied_index` を追加。
+  `plan_follower_read` の判定へ「leader の commit index を取得 →
+  `commit_index ≤ applied_index` になるまで待つ(タイムアウトあり)→
+  読み取り」の read-index ステップを追加。単一プロセスでは leader/learner が
+  同居するため read-index は関数呼び出しで済む(P4 のネットワーク越し
+  learner で初めて実 RPC 化)。
 
 #### A.6-4 DeltaTree / deletion vector / MoR — **取り込む(段階的)**
 
