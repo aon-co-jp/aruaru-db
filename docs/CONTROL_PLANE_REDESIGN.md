@@ -1,6 +1,6 @@
 # 管理面の再設計 — 「REST API 不要」を抜本的に実現する
 
-> ステータス: **実装中（2026-08-29 起票）— P0 設計確定 / P1 完了 / P2 主要部完了**
+> ステータス: **実装中（2026-08-29 起票 / 2026-08-31 付録 A を 2026 最新設計として大幅拡充）— P0 設計確定 / P1 完了 / P2 主要部完了 / P3 本体着手（closed-timestamp・wal-service・sharded-store を GraphQL 化・REST 撤廃、ephemeral-query・multi-raft は設計メモを残し次スライスへ）**
 > 対象: `aruaru-db` + `RPoem`（SET）
 > 決定者: masahiro ishizuka（AON CEO）／ 起案: セッション横断作業
 > 関連: [`CLAUDE.md` 冒頭「🎯 最重要・最優先」](../CLAUDE.md) ・ [`PORTING.md`](../PORTING.md)
@@ -418,23 +418,51 @@ config/
       本体は `feature = "disaster_email_backup"` ゲート + `replicator`
       注入の要否判断 + feature ゲート付きテストが必要な**別スライス**。
     - ⏳ Tauri 設定タブ全体の `aruaru.yaml` 編集 UI 化。
-- **P3 B2/B3 の残り** ephemeral-query / multi-raft / sharded-store put/get /
-  closed-timestamp / wal-service を GraphQL query/mutation 化。対応 `/admin`
-  ルート削除。Tauri/Android/web を GraphQL クライアントへ。
-  - **クレート境界の注意（続き8 調査）**: `aruaru-graphql` のリゾルバは
-    `aruaru-server` の `mod` を参照できない。難易度で 2 群に分かれる:
-    - **AdminCtx 注入で素直に行ける**（状態が `aruaru-dist`/`aruaru-query`
-      型で、`object_table`/`keyring`/`topology` と同じパターン）:
-      `closed-timestamp`（`Arc<ClosedTimestampCoordinator>`、既に
-      `closed_ts_coordinator()` あり）、`wal-service`
-      （`Arc<DisaggregatedStorage>`）、`sharded-store`
-      （`ShardedRowStore<String>`）。→ P3 はここから着手。
-    - **リファクタが要る**: `ephemeral-query`（`current_exe()` で自分自身を
-      `--ephemeral-worker` で再起動する `aruaru-server` 固有処理。
-      `AdminCtx` に `Arc<dyn EphemeralRunner>` trait を注入して
-      `aruaru-server` 側で実装、が候補）、`multi-raft`
-      （`MultiRaftCluster<crate::cluster::EngineApplier>` が server-local
-      ジェネリック。trait object 化 or applier をクレート移動）。
+- **P3 B2/B3 の残り** — ✅ **本体着手・主要 3 群完了（2026-08-31、続き10）**:
+  - ✅ `closed-timestamp`: `Query.closedTimestamp`（status）・
+    `Query.planFollowerRead`（`table` 指定で `select_follower_read` 実データ
+    読み出しまで）、`Mutation.closedTsRegisterRange`・`Mutation.closedTsAdvance`。
+    旧 REST `GET /admin/closed-timestamp`・`/range`・`/advance`・`/plan` を
+    `admin.rs` から削除。`AdminCtx.closed_ts`（`closed_ts_coordinator()`）注入。
+    **`/receive`・`/publish` は B4**（ノード間 side transport、既に
+    `binary_transport.rs` のバイナリ経路。管理トリガーの `/publish` REST は
+    「いつ・誰に配布するか」を人間が指示する制御面のため残置、P4 で再検討）。
+  - ✅ `wal-service`: `Query.walService`（status）・`Query.walPage`
+    （`get_page_at_lsn` = 読み取りなので Query。§4 表では B2 と記載していたが
+    §2.2 判断フローに従い Query へ是正）、`Mutation.walAppend`・
+    `Mutation.walCreateImageLayer`（compaction）。旧 REST `GET /admin/wal-service`
+    ・`/append`・`/page`・`/image-layer` を削除。`AdminCtx.wal_storage` 注入。
+    status の safekeeper 列挙を `0..n`→`1..=n` に是正（REST 版は先頭を
+    取りこぼしていた）。
+  - ✅ `sharded-store`: `Query.shardedStoreGet`・`Query.shardedStoreStats`、
+    `Mutation.shardedStorePut`。旧 REST `POST /admin/sharded-store`・
+    `GET /admin/sharded-store/:key`・`GET /admin/sharded-store-stats` を削除。
+    `AdminCtx.sharded_store` 注入（`AdminState.sharded_store` を `Arc` 化）。
+    mpsc ブロッキング recv は `tokio::task::spawn_blocking` で退避（REST と同じ）。
+  - ✅ `disaster_backup.email` の config スキーマは 7 フィールド拡張済み
+    （続き8）。reconcile 本体は feature ゲート付きの別スライスで保留（変更なし）。
+  - ⏳ **`ephemeral-query` / `multi-raft` は次スライスへ（技術的理由を明記）**:
+    - `ephemeral-query`: `run_ephemeral_query` は `std::env::current_exe()` +
+      `tokio::process::Command` で自分自身を `--ephemeral-worker` 再起動する
+      **`aruaru-server` バイナリ固有処理**。`ephemeral_pod` モジュールは
+      lib クレートに無く `aruaru-graphql` から参照不能。`AdminCtx` へ
+      `Arc<dyn EphemeralRunner>` trait を注入し `aruaru-server` 側で実装する
+      **trait 化リファクタが必要**。状態注入だけで済む上記 3 群とは規模が違う
+      ため分離した（半端な足場を成果と呼ばない原則）。
+    - `multi-raft`: `MultiRaftCluster<A>` の `A` = `crate::cluster::EngineApplier`
+      が `aruaru-server` ローカル。`split` は `applier: A` を要求し、`AdminCtx`
+      から具体型を名指しできない。`Arc<dyn MultiRaftHandle>` trait object 化
+      **または** `EngineApplier` を `aruaru-dist` へ移設する必要がある。
+      同上の理由で次スライスへ。
+  - **クレート境界の注意（続き8 調査、確認済み）**: `aruaru-graphql` の
+    リゾルバは `aruaru-server` の `mod` を参照できない。状態が
+    `aruaru-dist`/`aruaru-query` 型なら `object_table`/`keyring`/`topology` と
+    同じ `AdminCtx` 注入で済む（= 上記 3 群）。`aruaru-server` 固有の
+    プロセス/ジェネリック処理は trait 注入が要る（= ephemeral / multi-raft）。
+  - **Tauri/Android/web クライアント**: 上記 3 群の旧 REST は grep で
+    Tauri/Android/web からの参照が無いことを確認済み（`object-table`/`keys` と
+    同様に安全に撤廃）。`cluster`/`backup/schedule`/`federation` の撤廃は
+    引き続きクライアント移行待ち（続き4 の記載どおり）。
 - **P4 `/admin` ルーター＋残る非 GraphQL HTTP を撤去**
   `admin::admin_routes` を撤去、`admin.rs` を GraphQL リゾルバのヘルパーだけに。
   **ノード間 `/raft/*`・side transport（`/closed-timestamp/receive|publish`）を
@@ -473,51 +501,360 @@ config/
 
 ---
 
-## 付録 A. 実在する「CockroachDB × Snowflake ハイブリッド変種」の調査(2026-08-29)
+## 付録 A. 「CockroachDB × Snowflake ハイブリッド変種」の実装技術調査
+### — 2026 年時点の最新設計として再構成(2026-08-31 大幅拡充)
 
-ユーザー指示: 「aruaru-db は CockroachDB と Snowflake の良い所取りのハイブリッドの
-特殊な変種の実在する DATABASE の実装理論や技術を取り入れて」。英日で Google /
-GitHub 調査した結果。
+ユーザー指示(要求③、2026-08-31 再強調):「aruaru-db は CockroachDB と
+Snowflake の良い所取りのハイブリッドの特殊な変種の実在する DATABASE の
+実装理論や技術を取り入れて。TiDB だけに限らず**関連する全て**を、世界中の
+言語で Google と GitHub を検索し、**実装方法(アーキテクチャ設計・データ
+構造・アルゴリズム)まで**調べ、設計文書を 2026 年時点の最新設計として
+再設計せよ」。英・日・独で Google / GitHub / 一次論文を再調査した結果を、
+**どの技術のどの部分を aruaru-db がどう取り込むか(取り込まない判断は
+その理由も)**の形で整理する。
 
-### A.1 該当する実在システムと、その要素技術
+> **この付録の位置づけ**: 本文書の主題(管理面の REST 完全撤廃・宣言的
+> コントロールプレーン)とは別トラックの「データプレーン設計の指針」だが、
+> 「どのテーブルを列レプリカ化するか」「follower read の許容ラグ」等は
+> **execution-config / `aruaru.yaml` の宣言的設定として管理面に載る**ため、
+> §2 原則 12・§5 スキーマ・P5(コントロールプレーン)と直結する。
+> `docs/HYBRID_NETWORK_ARCHITECTURE.md`・`README-English.md` の HTAP 記述
+> とも整合を取ること。
 
-| システム | Cockroach 側(強整合 OLTP) | Snowflake 側(分離・列指向 OLAP) | 橋渡しの要素技術 |
+---
+
+### A.0 「特殊な変種」を一文で定義する(2026 再設計の結論)
+
+> **aruaru-db =「Raft 強整合 OLTP(CockroachDB 系)＋ Raft-Learner 非同期
+> 列レプリカ(TiDB/TiFlash 系)＋ 不変スナップショット・オブジェクト
+> テーブル(Snowflake / Iceberg / Databend 系)＋ WAL/ページ分離
+> (Neon 系)＋ Git-on-SQL 時間旅行(独自)」を単一 Pure Rust プロセスに
+> 統合した HTAP データベース。**
+
+「良い所取り」の実体は次の対応表(2026 時点):
+
+| 取り込む性質 | 出典系統 | aruaru-db での実装(crate) | 状態 |
 |---|---|---|---|
-| **TiDB / TiKV + TiFlash**(PingCAP、VLDB 2020「TiDB: A Raft-based HTAP Database」)| TiKV = Multi-Raft、Region 単位、線形化可能 | **TiFlash** = 列指向レプリカ、独立スケール、`DeltaTree` エンジン | **Raft Learner** が行→列変換しながら非同期リプレイ。読み取り時に **Raft index + MVCC** で Snapshot Isolation を検証 |
-| **CockroachDB** 本体 | Range + closed timestamp + follower read + bounded staleness | ベクトル化実行、`Data Boost`(分離コンピュート)| closed timestamp(= aruaru-db が既に実装) |
-| **SingleStore** | 分散、行ストア | 列ストア、`Bottomless`(S3 無制限ストレージ、compute/storage 分離)| 単一エンジンで行↔列を統合(レプリカ非同期) |
-| **Neon** | Postgres 互換 | **safekeeper / pageserver 分離**(WAL サービス化)| = aruaru-db `wal_service` が既に借用 |
-| **Databend** | — | Snowflake 型、オブジェクトストレージ直結、Rust | = aruaru-db `table_format`(object-table)が既に借用 |
-| **RisingWave** | — | ストリーミング SQL、S3 ステートバックエンド、Rust | — |
+| Range 単位の独立 Raft グループ(Multi-Raft) | CockroachDB / TiKV | `aruaru-dist/src/multi_raft.rs`, `shard/topology.rs` | 実装済(単一プロセス) |
+| closed timestamp + follower read + bounded staleness | CockroachDB / TiKV safe-ts / YugabyteDB | `aruaru-dist/src/closed_ts.rs` | 実装済(P2 でホットリロード化) |
+| HLC(Hybrid Logical Clock)による版付け | Spanner / CockroachDB / YugabyteDB | **未実装**(論理ナノ秒を呼び出し側が渡す) | 未取込(A.6-1) |
+| Raft-Learner 上での 行→列 非同期変換レプリカ | TiDB/TiFlash | `--raft-role learner` はあるが**行→列変換部が無い** | 部分(A.6-2 が本命) |
+| 読み取り時の Raft index + MVCC による SI 検証 | TiDB/TiFlash | closed_ts の gate はあるが Raft index 突合は無い | 未取込(A.6-3) |
+| DeltaTree(B+木 × LSM)= 更新耐性のある列エンジン | TiDB/TiFlash | object-table は不変セグメントのみ、delta 層無し | 未取込(A.6-4) |
+| 不変マイクロパーティション + メタデータ pruning + time travel | Snowflake / Iceberg / Delta / Databend | `aruaru-backup/src/table_format.rs`(snapshot→segment→block 3層、min/max + bloom) | 実装済 |
+| WAL サービス(quorum 耐久化)と pageserver(ページ再構成)の分離 | Neon(> Aurora) | `aruaru-dist/src/wal_service.rs`(term fencing + `flushLsn[n-quorum]`) | 実装済(単一プロセス) |
+| セグメント単位のゾーンマップ / スパース索引 | ClickHouse MergeTree / DuckDB row group / SingleStore segment | `aruaru-query/src/olap.rs`(`SegmentStats`、既定 1024 行) | 実装済(min/max のみ) |
+| 型認識軽量圧縮(辞書 / RLE / FSST / ALP / bitpack) | DuckDB / Parquet / TiFlash(LZ4) | `olap.rs` の適応的辞書エンコード(カーディナリティ閾値 0.7) | 部分(辞書のみ) |
+| ステートレス計算ノード + 共有メタデータ(Keeper 相当) | ClickHouse SharedMergeTree / Snowflake / TiDB Serverless | `ephemeral_pod.rs`(使い捨てプロセス)、`table_format` MetaService(CAS) | 部分 |
+| shard-per-core(shared-nothing、メッセージパッシング) | ScyllaDB / Seastar | `aruaru-query/src/sharded_store.rs`(murmur3 ルーティング) | 実装済(独立ストア) |
+| 決定的シミュレーションテスト(DST) | FoundationDB | `aruaru-dist/src/raft/sim.rs` | 実装済 |
 
-**「特殊な変種」の代表格は TiDB**(Raft 強整合 OLTP + 列指向 Raft-Learner レプリカで
-1 システム HTAP)。CockroachDB の「Raft・follower read」と Snowflake の
-「独立スケールする列指向解析ストア」を一体化している。
+---
 
-### A.2 aruaru-db が既に取り込んでいるもの
+### A.1 各システムの実装方法(アーキテクチャ・データ構造・アルゴリズム)
 
-- CockroachDB: closed timestamp / follower read / bounded staleness
-  (`crates/aruaru-dist/src/closed_ts.rs`)、Multi-Raft(`multi_raft.rs`)、
-  Serverless の ephemeral SQL pod(`crates/aruaru-server/src/ephemeral_pod.rs`)
-- Snowflake 系: Neon 型 disaggregated storage(`wal_service`)、Databend 型
-  object-table(`table_format`)、ScyllaDB shard-per-core(`sharded_store`)
+#### A.1.1 TiDB / TiKV + TiFlash — Raft-based HTAP(**本命の参照実装**)
 
-### A.3 未取り込みで、取り入れる価値があるもの(将来フェーズ)
+- **論文**: VLDB 2020「TiDB: A Raft-based HTAP Database」
+  <https://www.vldb.org/pvldb/vol13/p3072-huang.pdf> /
+  <https://dl.acm.org/doi/10.14778/3415478.3415535>
+- **TiFlash の 2 コンポーネント構成**: (a) 列指向ストレージ本体、(b) TiFlash
+  proxy(TiKV ベースの Multi-Raft フレームワークを FFI で export する
+  Cライブラリ)。proxy が apply 結果(region meta 含む)を FFI 経由で
+  TiFlash へ渡し RSM(Replicated State Machine)を直接維持させる**プッシュ型**。
+  <https://docs.pingcap.com/tidbcloud/tiflash-overview/>
+- **Learner ロール**: TiFlash は Raft グループの **learner(非投票)** として
+  参加。DML は TiFlash の ack を待たない(書き込みレイテンシに影響しない)。
+  列レプリカは Raft Learner consensus で非同期複製され、**読み取り時に
+  Raft index + MVCC で Snapshot Isolation を検証**する。
+- **DeltaTree エンジン**: 「B+木 と LSM木 のハイブリッド」。2 空間:
+  - **stable 空間**: パーティションデータを chunk として列ごとに格納
+    (Parquet 類似フォーマット、LZ4 圧縮)。読み出し最適化。
+  - **delta 空間**: TiKV が生成した順序のまま追記(linearizability 維持)。
+    書き込み最適化。後でバッチ変換して stable へマージ(compaction)。
+  <http://muratbuffalo.blogspot.com/2023/10/tidb-raft-based-htap-database.html>
+- **宣言的配置**: `ALTER TABLE ... SET TIFLASH REPLICA n` で「どのテーブルに
+  列レプリカを何個持つか」を宣言 → aruaru-db では execution-config へ
+  (§5・P5、A.7)。
 
-1. **Raft-Learner 列指向レプリカ**(TiFlash 型)。`--raft-role learner` は既に
-   あるが、Learner 上で **行→列変換**して独立の解析ストアを作る部分が無い。
-   → RPoem 配信の execution-config で「どのテーブルに列レプリカを何個持つか」
-   を宣言(TiDB の `ALTER TABLE ... SET TIFLASH REPLICA n` 相当)。P5〜。
-2. **読み取り時の Raft index + MVCC による Snapshot Isolation 検証**。
-   今の closed timestamp(P2 でホットリロード化済み)と組み合わせ、Learner
-   レプリカからの一貫読み取りの根拠を厳密化する。
-3. **DeltaTree 型の更新耐性のある列エンジン**(頻繁な更新 + 高速スキャン両立)。
-   現状の object-table(不変セグメント + 時間旅行)に delta 層を足す方向。
+#### A.1.2 CockroachDB — 分散 SQL の強整合 OLTP 基盤
 
-これらは本再設計(管理面の GraphQL 一本化)とは別トラックだが、**execution-config
-の配信内容**(どのテーブルを列レプリカ化するか等)として管理面に載るため、
-P5(コントロールプレーン)で接点を持つ。`docs/HYBRID_NETWORK_ARCHITECTURE.md`・
-`README-English.md` の HTAP 記述とも整合を取ること。
+- **Storage Layer**: <https://www.cockroachlabs.com/docs/stable/architecture/storage-layer>
+- **Range**: キー空間を ~64MiB の連続チャンク(range)へ分割。各 range が
+  独立した **Raft グループ**、3 or 5 レプリカ。負荷で自動 split/merge。
+- **MVCC**: **HLC タイムスタンプ**で版を区別。更新は上書きせず高タイム
+  スタンプの新版を作る。GC 期限も HLC で管理。
+- **Pebble**(Go 製 KV エンジン、RocksDB 由来を CockroachDB のアクセス
+  パターンへ最適化)。MVCC range tombstone を **Pebble range key** として
+  格納し、Raft range 境界で fragmentation(物理 or 論理)。
+- **closed timestamp / follower read / bounded staleness**: この時刻以下に
+  新規書き込みは現れない保証を leaseholder が前進させ side transport で
+  follower へ配布 → follower がローカルで一貫読み取り。
+  = aruaru-db `closed_ts.rs` が実装済み。
+- **protected timestamp**: GC より前の時刻を「保護」してバックアップ/
+  CDC の読み取り基点を保証。<https://www.cockroachlabs.com/blog/protected-timestamps-for-less-garbage/>
+  → aruaru-db の Git-on-SQL コミットが実質同じ役割(コミットが指す
+  root_hash 配下の Prolly ノードは参照が切れるまで生存)。
+
+#### A.1.3 YugabyteDB — DocDB(RocksDB + Raft + HLC)
+
+- **DocDB**: 高度カスタマイズした RocksDB の上に **クラスタ全体の MVCC** を
+  HLC で構築。<https://docs.yugabyte.com/stable/architecture/transactions/>
+- **書き込みパス**: leader が batch を Raft ログへ append → **HLC で
+  timestamp を選ぶ** → Raft 複製 → callback 後にローカル DocDB へ apply。
+- **分散トランザクション**: 対象タブレット群へ **provisional record** を
+  別 RocksDB インスタンス(`IntentsDB`)に書き、commit まで読者に不可視。
+  → aruaru-db は現状シングルプロセス 2PC 無しのため直接は取り込まないが、
+  「intent を別ストアに隔離する」発想は将来のマルチテナント書き込みで参考。
+
+#### A.1.4 Snowflake — ストレージ/コンピュート分離の元祖
+
+- **3 層**: (a) storage(クラウドオブジェクトストレージ上の**不変
+  マイクロパーティション**)、(b) compute(virtual warehouse)、(c) cloud
+  services(認証・最適化・メタデータ)。各層が独立スケール。
+- **マイクロパーティション**: 1 テーブルの行を 50–500MB(圧縮後 ~16MB)の
+  列指向不変ファイルへ。**その場更新は無い**——DML は新パーティションを
+  書き旧を stale マーク。
+- **pruning**: クエリ述語にメタデータ範囲がマッチするパーティションだけを
+  スキャン。cloud services 層がメタデータで枝刈り。
+- **time travel / zero-copy clone**: ストレージ不変性の**直接の帰結**
+  (別機能を上に足したのではない)。
+  <https://medium.com/@krthiak/the-architecture-of-speed-how-snowflakes-micro-partitions-and-pruning-drive-query-performance-7ab5ccb087c3>
+- → aruaru-db `table_format.rs`(snapshot→segment→block、min/max + bloom、
+  `prev_snapshot_id` 連鎖で time travel)が既にこのモデル。Git-on-SQL
+  コミットが zero-copy clone(`aruaru_branch_from`)を提供。
+
+#### A.1.5 Neon vs Aurora — WAL 中心のストレージ分離
+
+- **Aurora**:「log is the database」。WAL とページ処理を**単一のストレージ
+  サービス**が担う(モノリシックなストレージ tier)。
+- **Neon**: WAL と page service を**さらに分離**。
+  - **safekeeper 群**: WAL の耐久複製だけを担当。**Paxos(Raft ではない)**
+    の quorum ack で commit 確定。
+    <https://jack-vanlightly.com/blog/2025/2/19/log-replication-disaggregation-survey-neon-and-multipaxos>
+  - **pageserver**: WAL と data page の間に位置し、base page + committed WAL
+    から**任意 LSN のページを materialize**(`get_page_at_lsn`)。
+  <https://neon.com/blog/architecture-decisions-in-neon>
+- → aruaru-db `wal_service.rs` が Neon 型(`Safekeeper`/`Pageserver`/
+  `DisaggregatedStorage`、term fencing + `commitLSN = flushLsn[n-quorum]` +
+  `get_page_at_lsn` + image layer GC cutoff)を実装済み。**Aurora 型の
+  モノリシック統合は選ばない**(分離の方が follower read / ephemeral pod と
+  組み合わせやすい)。
+
+#### A.1.6 SingleStore — 単一エンジンで行 ↔ 列(Universal Storage)
+
+- **Universal Storage(= columnstore)**: columnstore で OLTP も効率化する
+  5 機能: (1) columnstore 上の **hash index**(一意制約も可)、(2) **subsegment
+  access**(列ストア内の 1 行への高速アクセス)、(3) **row-level locking**、
+  (4) 高選択 filter を伴う join、(5) upsert。
+  <https://docs.singlestore.com/cloud/create-a-database/columnstore/universal-storage/>
+- **segment**: テーブルを 100 万行チャンク(segment)へ分割。columnstore の
+  各パーティションは**インメモリ rowstore segment**(直近の更新/挿入分)を
+  持つ。= TiFlash の delta 空間 / ClickHouse の in-memory part と同型。
+- **skiplist**(rowstore のみ)/ **hash table**(sparse bucket 配列)。
+- → aruaru-db は「object-table(不変・列)」と「QueryEngine::tables
+  (行・可変)」が別。SingleStore の「1 テーブル内で行 segment と列 segment
+  が同居」は**未取込**(A.6-4 の delta 層と合わせて検討)。
+
+#### A.1.7 ClickHouse — MergeTree / SharedMergeTree
+
+- **MergeTree**: INSERT ごとに**不変 part**(ディレクトリ、ORDER BY キーで
+  ソート済み)を作り、バックグラウンドで **merge**(小 part → 大 part)。
+  <https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree>
+- **スパース主索引**: 行ごとではなく **granule**(既定 8192 行)ごとに
+  1 mark。索引が小さく RAM に載る。merge 時に索引も merge。
+  <https://clickhouse.com/docs/guides/best-practices/sparse-primary-indexes>
+- **SharedMergeTree**(ClickHouse Cloud): データ + メタデータをサーバから
+  完全分離、**ClickHouse Keeper** 経由で共有メタデータを read/write。
+  新ノードは data part を転送せず Keeper からメタデータだけ同期 →
+  2→10 ノードのスケールがほぼ即時。各サーバはメタデータのローカル
+  キャッシュ + subscription で変更通知。
+  <https://clickhouse.com/blog/clickhouse-cloud-boosts-performance-with-sharedmergetree-and-lightweight-updates>
+- → aruaru-db `olap.rs` の `SegmentStats`(既定 1024 行)= granule 相当。
+  SharedMergeTree の「Keeper = 共有メタデータの真実源、計算はステートレス」は
+  **RPoem execution-config / `table_format` MetaService(CAS)**と同型 ⇒
+  §2 原則 2(コントロールプレーン分離)を裏付ける独立事例。
+
+#### A.1.8 テーブルフォーマット三種(Iceberg / Delta Lake / Hudi)
+
+| | メタデータ構造 | 更新方式 | 索引 |
+|---|---|---|---|
+| **Iceberg** | metadata file → manifest list(snapshot 単位)→ manifest(Avro、data/delete file 一覧 + partition tuple + metrics)。ディレクトリ列挙をメタデータ木で置換。**hidden partitioning**(transform で partition 値を導出)。v4 で相対パス化(再配置可) | snapshot ベース、schema evolution は列 ID | manifest レベルの file 統計 |
+| **Delta Lake** | `_delta_log/` の**逐次トランザクションログ**(JSON、追記のみ、add/remove file 列挙) | **Copy-on-Write + deletion vector**(Parquet 内の行を削除マーク、即時 rewrite を回避) | per-file min/max のみ(record-level index 無し) |
+| **Hudi** | timeline(1.0 で **LSM ツリー**化、long-term retention と planning 高速化) | **Merge-on-Read**(変更列のみ Avro delta log、write 増幅最小、読み取りで base+delta マージ)/ Copy-on-Write | **record-level index**(キー → file group の決定的ルックアップ、upsert 効率) |
+
+出典: <https://iceberg.apache.org/spec/> /
+<https://risingwave.com/blog/apache-iceberg-vs-delta-lake-vs-hudi-2026/> /
+<https://hudi.apache.org/blog/2026/08/12/hudi-vs-delta-lake-for-write-heavy-workloads/>
+
+- → aruaru-db `table_format.rs` は **Iceberg 型のメタデータ木 + Databend 型の
+  MetaSrv CAS** を採用済み。**取り込む価値がある未実装**:
+  - **deletion vector**(Delta 型): object-table の block に「削除された行の
+    ビットマップ」を持たせ、prune 時に適用 → 即時 rewrite 無しの DELETE。
+    A.6-4 の delta 層の一形態として最有力。
+  - **record-level index**(Hudi 型): キー → block の索引。現状は bloom
+    filter による**否定的**枝刈りのみで、**肯定的**な直接ルックアップが無い。
+  - **Merge-on-Read の base+delta マージ読み取り**(Hudi 型): A.6-4 の
+    DeltaTree と本質同じ。
+
+#### A.1.9 ベクトル化実行(Photon / DuckDB)と型認識圧縮
+
+- **Photon**(Databricks、SIGMOD 2022 Best Industry Paper
+  <https://people.eecs.berkeley.edu/~matei/papers/2022/sigmod_photon.pdf>):
+  C++ の**ベクトル化**クエリエンジン。Delta Lake / Parquet を最小前提で
+  処理。**deletion vector** で MERGE/UPDATE/DELETE を最大 10x。
+- **DuckDB storage**(<https://duckdb.org/docs/current/internals/storage> /
+  <https://duckdb.org/2022/10/28/lightweight-compression>):
+  256KB 固定ブロック、行を **row group**(水平パーティション)へ、列は
+  DSM(列指向)。**型認識軽量圧縮**を analyze フェーズで選択:
+  constant / RLE / bitpacking / frame-of-reference / **dictionary** /
+  **FSST**(最大 255 個の頻出バイト列を 1 バイトコードへ、文字列内の
+  繰り返しも圧縮)/ **ALP**(浮動小数点、ベクトル化前提で高速 + 高圧縮
+  <https://ir.cwi.nl/pub/33334/33334.pdf>)/ Chimp / Patas。
+  目標は**スキャン時の高速展開**であって最大圧縮率ではない。
+- → aruaru-db `olap.rs` は既に **Apache Arrow + DataFusion** の
+  ベクトル化実行 + `arrow::compute::filter_record_batch` 等のカーネルを
+  使用。**取り込む価値**: 辞書エンコードは適応選択済みだが、**RLE /
+  bitpacking / FSST** は未実装(A.6-5)。ALP は数値列圧縮の候補。
+
+---
+
+### A.2 aruaru-db が既に取り込んでいるもの(2026-08-31 時点、crate 対応)
+
+| 系統 | 取り込み済みの技術 | crate / モジュール |
+|---|---|---|
+| CockroachDB / TiKV | Multi-Raft(Range 単位の独立合意グループ、split/merge/scatter-gather) | `aruaru-dist/src/multi_raft.rs`, `shard/topology.rs` |
+| CockroachDB / TiKV safe-ts / YugabyteDB | closed timestamp / follower read / bounded staleness / exact staleness、side transport(バイナリ化済み) | `aruaru-dist/src/closed_ts.rs`, `raft/binary_transport.rs` |
+| CockroachDB Serverless / TiDB Serverless | ephemeral SQL pod(使い捨てプロセス、テナント別スナップショット) | `aruaru-server/src/ephemeral_pod.rs` |
+| CockroachDB(キー空間プレフィックス方式のテナント分離) | `execute_as_tenant`(`__tenant_{id}__` プレフィックス) | `aruaru-query/src/engine.rs` |
+| Neon | safekeeper quorum(term fencing + `flushLsn[n-quorum]`)+ pageserver(`get_page_at_lsn` + image layer GC cutoff)+ バックプレッシャ | `aruaru-dist/src/wal_service.rs` |
+| Snowflake / Iceberg / Databend | 不変 snapshot→segment→block 3層メタデータ、min/max ゾーンマップ、bloom filter 等値枝刈り、MetaSrv 楽観的 CAS = コミット、`prev_snapshot_id` 連鎖の time travel | `aruaru-backup/src/table_format.rs` |
+| ClickHouse MergeTree / DuckDB row group / SingleStore segment | セグメント単位ゾーンマップ(既定 1024 行、`RecordBatch::slice` ゼロコピー枝刈り)、行→列インクリメンタルマージ(TiFlash delta 発想の単一プロセス版)、`tokio::mpsc` による非同期購読 | `aruaru-query/src/olap.rs` |
+| DuckDB / Parquet | 適応的辞書エンコード(ユニーク比率 < 0.7 のときのみ) | `aruaru-query/src/olap.rs` |
+| ScyllaDB / Seastar | shard-per-core shared-nothing ストア、murmur3 token-aware routing | `aruaru-query/src/sharded_store.rs` |
+| Neon(ブランチング)| 任意コミットからの CoW ブランチ(実データが切り替わる) | `aruaru-core/src/version/mod.rs`(`create_branch_from`)、`aruaru-query/src/engine.rs` |
+| FoundationDB | 決定的シミュレーションテスト(seed 再現、フォールト注入、Log Matching 検証) | `aruaru-dist/src/raft/sim.rs` |
+| Vitess Reshard / VTGate | Range 併合、scatter-gather 読み取り | `aruaru-dist/src/multi_raft.rs` |
+| 独自 | Git-on-SQL(`aruaru_commit` / `AS OF COMMIT` / branch / merge)= protected timestamp + zero-copy clone + time travel を 1 機構で | `aruaru-core/src/version/`, `aruaru-query/src/engine.rs` |
+
+---
+
+### A.3 未取り込み技術と、取り込み判断(2026 再設計の中核)
+
+#### A.6-1 HLC(Hybrid Logical Clock)による版付け — **取り込む(P?、別トラック)**
+
+- 現状: `closed_ts.rs` は論理ナノ秒を**呼び出し側が渡す**前提。クロック
+  スキュー上限(CockroachDB `max_offset`)の管理が無い。
+- 判断: **取り込む**。CockroachDB / YugabyteDB / Spanner が全て HLC で
+  「因果順序 + 実時刻近似」を得ている。`aruaru-dist` に `hlc.rs`(physical
+  + logical のペア、`update(remote_ts)` で単調前進)を新設し、`closed_ts`・
+  `wal_service`・`multi_raft` の timestamp 源を HLC へ差し替える。
+- スコープ注意: 真の分散クロック同期(NTP / TrueTime)は環境依存のため、
+  「単一プロセス内の HLC + ノード間メッセージに HLC を相乗り」までとする
+  (正直な簡略化点として明記)。
+
+#### A.6-2 Raft-Learner 上の 行→列 非同期変換レプリカ — **取り込む(本命)**
+
+- 現状: `--raft-role learner` で複製先にはなるが、learner が受け取った
+  Raft ログを **行→列変換して独立の解析ストアへ流す**部分が無い。
+  `olap.rs` の `OlapCache` は同一プロセス内の共有メモリ購読で、
+  `aruaru-dist` の Raft 複製ログを経由していない。
+- 判断: **取り込む**。これが「TiDB/TiFlash 型 HTAP」の核心であり、
+  SET(RPoem + aruaru-db)の価値(「REST 不要・列解析も 1 グラフ」)を
+  直接強化する。設計:
+  1. learner ノードに `ColumnarApplier`(`Applier` trait の実装)を注入。
+     Raft commit ごとに `WalRecord` 相当を受け取り、`table_format` の
+     block へ列変換して追記(TiFlash の delta 空間)。
+  2. 一定量たまったら `table_format` の segment へ compaction(stable 空間)。
+  3. 読み取りは `closed_ts` の gate + **learner の apply 済み Raft index**
+     を突合(A.6-3)して SI を保証。
+  4. 「どのテーブルに列レプリカを何個」は **execution-config**
+     (`ALTER TABLE ... SET TIFLASH REPLICA n` 相当)で宣言(§5・P5)。
+- スコープ注意: ネットワーク越しの真の別ノード learner は
+  `binary_transport.rs` の複製が前提(P4 以降)。まずは単一プロセス内で
+  「learner 用 `ColumnarApplier` へ Raft ログを流す」配線を作る。
+
+#### A.6-3 読み取り時の Raft index + MVCC による SI 検証 — **取り込む(A.6-2 と一体)**
+
+- 現状: `closed_ts` の `can_serve_read_at` は「read_ts ≤ closed_ts」だけ。
+  TiFlash はさらに「その read_ts に対応する **Raft log index** を learner が
+  apply 済みか」を確認してから読む。
+- 判断: **取り込む**。`ColumnarApplier` に `applied_raft_index()` を持たせ、
+  `plan_follower_read` の判定へ `min_required_index ≤ applied_index` を追加。
+
+#### A.6-4 DeltaTree / deletion vector / MoR — **取り込む(段階的)**
+
+- 現状: `table_format` の block は不変。行の**更新・削除**を表現できず、
+  DELETE 相当は「新 snapshot で block を差し替え」= 実質 Copy-on-Write の
+  重い経路のみ。
+- 判断: **取り込む**。優先度順:
+  1. **deletion vector**(Delta / Photon 型): `BlockMeta` に「削除行の
+     RoaringBitmap 相当」を持たせ、`prune`/読み取りで適用。即時 rewrite 無しの
+     DELETE/UPDATE。実装が最も軽く効果が大きい。
+  2. **base + delta の Merge-on-Read**(Hudi / TiFlash 型): segment に
+     delta log(追記のみ)を併設し、読み取りで base+delta をマージ。
+     A.6-2 の learner 列変換と同じ機構を流用できる。
+  3. **record-level index**(Hudi 型): キー → block の**肯定的**索引。
+     現状の bloom(否定的枝刈り)を補完。
+- スコープ注意: RoaringBitmap の外部 crate 依存は避け、`Vec<u64>` の
+  ソート済み集合 or 単純ビットベクタで最小実装(既存方針)。
+
+#### A.6-5 型認識軽量圧縮(RLE / bitpacking / FSST / ALP) — **保留(条件付き取り込み)**
+
+- 現状: 適応的辞書エンコードのみ。DataFusion/Arrow がスキャンの
+  ベクトル化は担うが、**格納サイズ**の圧縮は辞書止まり。
+- 判断: **保留**。理由はコストではなく前提——現状の想定データ規模
+  (単一プロセス内メモリ常駐)では DataFusion のストリーミング + 辞書で
+  足りる。**実データ規模がボトルネックになった時点で**、DuckDB の
+  analyze フェーズ(セグメントごとに複数方式を試算し最小を選ぶ)を
+  簡易移植し、RLE → bitpacking → FSST の順で足す。ALP は数値列専用。
+
+#### A.6-6 SingleStore「1 テーブル内で行 segment と列 segment 同居」 — **A.6-4 に吸収**
+
+- Universal Storage の hash index / subsegment access / row-level lock は、
+  「不変列 segment に対して行単位の更新を可能にする」ための仕掛け。
+  aruaru-db では A.6-4 の deletion vector + delta log が同じ目的を果たす
+  ため、SingleStore 固有機構の個別移植はしない(重複)。
+
+#### A.6-7 ClickHouse SharedMergeTree の Keeper — **取り込み済みの再確認**
+
+- 「共有メタデータの真実源 = 外部(Keeper)、計算ノードはステートレスで
+  メタデータを subscribe」というモデルは、本文書 §2 原則 2
+  (コントロールプレーン = RPoem)・`table_format` の MetaService(CAS)・
+  P5 の execution-config ポーリングと**既に同型**。新規取り込みは不要だが、
+  RPoem の schema-registry を「Keeper 相当の共有メタデータストア」として
+  位置づける記述を P5 に足す(A.7)。
+
+#### A.6-8 Aurora 型モノリシックストレージ — **取り込まない(明示)**
+
+- 理由: Neon 型の safekeeper/pageserver 分離の方が、follower read /
+  ephemeral pod / 列レプリカ(A.6-2)と組み合わせやすく、`wal_service.rs`
+  で既に分離型を実装済み。モノリシック化は後退。
+
+---
+
+### A.7 本再設計(管理面)への具体的な反映
+
+1. **§5 `aruaru.yaml` スキーマに `htap` セクションを追加**(P3〜P5 で実装):
+   ```yaml
+   htap:
+     columnar_replicas:            # A.6-2: TiFlash REPLICA n 相当
+       - table: "orders"
+         replicas: 1
+         node_selector: "role=learner"
+     read_consistency: "raft_index_checked"   # A.6-3: si | closed_ts_only | raft_index_checked
+     delta:                        # A.6-4
+       deletion_vectors: true
+       merge_on_read: false
+   ```
+   これは「望ましい状態の宣言」(§2 原則 12)であり `setX` mutation は作らない。
+2. **execution-config(RPoem 配信)**で `columnar_replicas` をクラスタ全体へ
+   配布(ClickHouse SharedMergeTree の Keeper、TiDB の PD 相当)。
+   `open-runo-schema-registry` を「共有 HTAP メタデータストア」と位置づける。
+3. **observability**: `Query.closedTimestamp` に `applied_raft_index` を追加、
+   `Query.htapReplicas`(列レプリカの遅延・行数)を新設(GraphQL、B3)。
+4. **P4 のバイナリトランスポート**は A.6-2 のネットワーク越し learner 複製の
+   前提。closed timestamp side transport は既にバイナリ化済み(`binary_transport.rs`)。
 
 ---
 
