@@ -9,38 +9,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aruaru_dist::{BinaryTcpTransport, Command, CommandResponse, RaftDriver, RaftNode};
+use aruaru_dist::{BinaryTcpTransport, Command, RaftDriver, RaftNode};
 use aruaru_query::{QueryEngine, QueryResponse};
 
-/// Raft commit を QueryEngine へ適用する状態機械
-pub struct EngineApplier {
-    engine: Arc<QueryEngine>,
-}
-
-impl EngineApplier {
-    pub fn new(engine: Arc<QueryEngine>) -> Self {
-        Self { engine }
-    }
-}
-
-impl aruaru_dist::Applier for EngineApplier {
-    fn apply(&self, command: &Command) -> CommandResponse {
-        match command {
-            Command::Exec(sql) => match self.engine.execute(sql) {
-                Ok(_) => CommandResponse::ok(),
-                Err(e) => CommandResponse::err(e),
-            },
-            Command::Commit(msg) => {
-                let safe = msg.replace('\'', "''");
-                match self.engine.execute(&format!("SELECT aruaru_commit('{safe}')")) {
-                    Ok(_) => CommandResponse::ok(),
-                    Err(e) => CommandResponse::err(e),
-                }
-            }
-            Command::Noop => CommandResponse::ok(),
-        }
-    }
-}
+/// 【2026-08-31移設】`EngineApplier`実体は`aruaru_dist::EngineApplier`へ
+/// 移設した(`MultiRaftCluster<EngineApplier>`をGraphQL側
+/// (`aruaru-graphql::AdminCtx`)から具体型として共有するため)。既存の
+/// `crate::cluster::EngineApplier`という参照経路は変えず、単なる
+/// 再エクスポートとして維持する。
+pub use aruaru_dist::EngineApplier;
 
 /// 同期マーカー (型エイリアス簡略化用)
 pub type ClusterNode = RaftNode<EngineApplier>;

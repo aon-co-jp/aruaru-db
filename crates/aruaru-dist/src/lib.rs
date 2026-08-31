@@ -1,6 +1,7 @@
 //! aruaru-dist: 分散レイヤー (openraft + Range シャーディング)
 pub mod admin_shared;
 pub mod closed_ts;
+pub mod engine_applier;
 pub mod ephemeral;
 pub mod keyring;
 pub mod dual_database;
@@ -40,6 +41,7 @@ pub use shard::{
     RangeStatusSnapshot, RouteTarget, DEFAULT_RANGE_SIZE, SPLIT_THRESHOLD,
 };
 pub use multi_raft::MultiRaftCluster;
+pub use engine_applier::EngineApplier;
 pub use closed_ts::{
     ClosedTimestampCoordinator, ClosedTimestampTracker, ReadPlan, Timestamp,
     DEFAULT_MAX_STALENESS_NANOS, DEFAULT_TARGET_LAG_NANOS,

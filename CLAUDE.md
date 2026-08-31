@@ -173,13 +173,12 @@
 > TiDB/CockroachDB/YugabyteDB/Snowflake/Neon vs Aurora/SingleStore/ClickHouse/
 > Iceberg・Delta・Hudi/Photon・DuckDB の**実装方法**、A.3〜A.7 に取り込み判断と
 > `aruaru.yaml: htap` 案)。フェーズ P0(設計)/P1(宣言的設定基盤)/P2
-> (parallel・follower_read)/P3 の一部(`/admin/parallel*`・`/v1/keys/self-issue`
-> 撤廃)まで完了・push 済み。**P3 本体(続き10)= `closed-timestamp`・
-> `wal-service`・`sharded-store` を GraphQL 化し該当 REST ルートを撤廃**——
-> commit・push 済み(`origin/main` `250956d`)、実プロセス HTTP E2E も
-> 続き11で完了。`ephemeral-query`・`multi-raft` は trait 化リファクタ
-> 待ちで次スライスへ。`git log --oneline -25` で `再設計 P1〜P3`・`付録A` の
-> コミット群を確認。
+> (parallel・follower_read)/**P3(`closed-timestamp`・`wal-service`・
+> `sharded-store`・`ephemeral-query`・`multi-raft`、全て GraphQL 化+
+> 該当 REST ルート撤廃)まで完了**。実プロセス HTTP E2E も全スライスで
+> 完了済み(続き11〜13)。**次は要求③の実装トラック
+> (A.6-2 `ColumnarApplier` 等)**。`git log --oneline -25` で
+> `再設計 P1〜P3`・`付録A` のコミット群を確認。
 >
 > **ユーザーの不変の要求(肝に銘じること)**:
 > 1. **REST API は SET(RPoem + aruaru-db)全体から例外なく完全撤廃**。
@@ -211,9 +210,14 @@
 >    ProcessEphemeralRunner`が実装、`AdminCtx.ephemeral`へ注入。
 >    `Mutation.ephemeralQuery`が実プロセス起動込みで実HTTP動作確認済み、
 >    旧REST `/admin/ephemeral-query`は削除・404を確認。
->    **⏳ 残り**: `multi-raft` の GraphQL 化。`Arc<dyn MultiRaftHandle>`
->    または `EngineApplier` のクレート移設が必要(理由は
->    `docs/CONTROL_PLANE_REDESIGN.md` §8 P3 に明記)。
+>    ✅(続き13 完了)`multi-raft`: `EngineApplier`(`Applier`実装)を
+>    `aruaru-server::cluster`から`aruaru_dist::engine_applier`へ移設し、
+>    `aruaru-graphql`が`aruaru_dist::MultiRaftCluster<aruaru_dist::
+>    EngineApplier>`を具体型のまま共有(`Arc<dyn MultiRaftHandle>`trait
+>    object化は不要と判明)。`Query.multiRaftScatterQuery`・
+>    `Mutation.multiRaftSplit`/`multiRaftMerge`が実HTTP動作確認済み、
+>    旧REST`/admin/multi-raft/{split,merge,scatter-query}`は削除・
+>    トークン付きで404を確認。
 > 3. ✅(続き11 完了)**実プロセス HTTP E2E**: 実 `aruaru-server` を起動し
 >    `closedTimestamp`/`closedTsRegisterRange`/`closedTsAdvance`・
 >    `walService`(safekeeper `1..=n` 是正の実証込み)・`shardedStorePut`/
@@ -5102,3 +5106,81 @@ FROM items")`が**実際に子プロセスを起動し**、`{"columns":["id","qt
 **次回の起点**: 「🛑 復活用メッセージ」項目2の後半=`multi-raft`
 (`MultiRaftCluster<crate::cluster::EngineApplier>`のtrait object化 or
 `EngineApplier`のクレート移設)、または項目4(A.6-2 `ColumnarApplier`)。
+
+## HANDOFF追記(2026-08-31続き13) `multi-raft`のGraphQL化完了(続き12の
+次項目2の後半、P3本体の最終スライス)
+
+**課題(続き10/12が残した技術的理由)**: `MultiRaftCluster<crate::
+cluster::EngineApplier>`は`aruaru-server`側のジェネリック具体型であり、
+`aruaru-graphql`から参照できなかった。続き12が検討していた
+`Arc<dyn MultiRaftHandle>`trait object化と`EngineApplier`のクレート
+移設の2案のうち、**後者(クレート移設)を採用**した——`EngineApplier`
+(`Applier for EngineApplier`実装)は`aruaru_query::QueryEngine`にしか
+依存しておらず、続き12で`aruaru-dist`が`aruaru-query`への依存を
+既に獲得していたため、`aruaru_dist::engine_applier`へそのまま
+移設できると判明し、trait object化より単純だった。
+
+**実装**:
+1. **`crates/aruaru-dist/src/engine_applier.rs`(新規)**: `EngineApplier`
+   struct・`new()`・`impl Applier for EngineApplier`(`crate::raft::
+   {Applier, Command, CommandResponse}`使用)を`aruaru-server::cluster`
+   から移設。単体テスト1件(`exec_and_commit_apply_to_the_shared_
+   engine`)も移設。
+2. **`crates/aruaru-dist/src/lib.rs`**: `pub mod engine_applier;`+
+   `pub use engine_applier::EngineApplier;`を追加。
+3. **`crates/aruaru-server/src/cluster.rs`**: ローカル`EngineApplier`
+   定義を削除し`pub use aruaru_dist::EngineApplier;`へ置換(既存の
+   `crate::cluster::EngineApplier`という参照経路は変えず単純な
+   再エクスポート)。`build_cluster`/`build_cluster_with_learners`が
+   引き続き`aruaru_query::QueryEngine`/`aruaru_dist::Command`を直接
+   使うため、それぞれのuse文は維持。
+4. **`crates/aruaru-server/src/admin.rs`**: 旧REST
+   `POST /admin/multi-raft/{split,merge}`・
+   `GET /admin/multi-raft/scatter-query`の3ルート・3ハンドラ・
+   `MultiRaftSplitRequest`/`MultiRaftMergeRequest`構造体を削除
+   (着手前に`admin/src`・`web/src`双方でTauri/webクライアントの
+   参照が皆無なことを`grep`で確認済み)。呼び出し元が消えたため
+   `AdminState::multi_raft()`getterも削除(`attach_multi_raft`と
+   下位の`Mutex<Option<Arc<...>>>`フィールドは`main.rs`起動時の
+   注入で引き続き使用するため残置)。
+5. **`crates/aruaru-graphql`**: `AdminCtx.multi_raft: Option<Arc<
+   aruaru_dist::MultiRaftCluster<aruaru_dist::EngineApplier>>>`を
+   追加(具体型のまま共有、trait objectは不要だった)。
+   `Query.multiRaftScatterQuery`・`Mutation.multiRaftSplit`
+   (range_id, split_key)・`Mutation.multiRaftMerge`(range_a,
+   range_b)を新設、`MultiRaftSplitResultGql`/`MultiRaftMergeResultGql`/
+   `MultiRaftRangeReadingGql`を`admin_types.rs`へ追加。
+6. **`crates/aruaru-server/src/main.rs`**: `attach_multi_raft`が
+   `multi_raft_cluster`を消費する直前に`.clone()`して
+   `AdminCtx.multi_raft`へも配線(1つの`Arc`インスタンスをREST起動時
+   構築経路とGraphQL経路が共有)。
+
+**検証(実測、型チェック・単体テストのみで終わらせない方針の徹底)**:
+- `cargo test -p aruaru-dist -p aruaru-graphql -p aruaru-server`
+  **失敗0**(aruaru-dist 74、aruaru-graphql **18**〈新規1:
+  `multi_raft_split_merge_and_scatter_query_operate_on_the_shared_
+  cluster`——split→scatter→merge→存在しないrange_idでの失敗ケース→
+  未設定時のケースまでの一連をカバー〉、aruaru-server 13)。
+- `cargo build --release -p aruaru-server`成功。実`aruaru-server.exe`
+  を起動(`--data <一時dir> --gql-port 15081 --raft-id 1`、
+  `ARUARU_DB_ADMIN_TOKEN`設定)し、`POST /graphql`へ実際に:
+  `multiRaftScatterQuery`(分割前、`rangeId:1`のみ)→
+  `multiRaftSplit(rangeId:1, splitKey:"m")`(`newRangeId:2,
+  rangeCount:2`)→`multiRaftScatterQuery`(分割後、`rangeId:1,2`の
+  2件)→`multiRaftMerge(rangeA:1, rangeB:2)`(`mergedRangeId:1,
+  rangeCount:1`)→`multiRaftScatterQuery`(併合後、`rangeId:1`のみ)の
+  一連を実行し、range数が1→2→1と正しく遷移することを確認。
+  旧REST`/admin/multi-raft/{split,merge,scatter-query}`はトークン付き
+  で全て`404`(真の削除)、残置`/admin/cluster`はトークン付きで`200`
+  (非破壊)を確認。サーバーログにエラー・パニック無し、プロセス終了・
+  一時データディレクトリ削除済み。
+
+**P3本体、これで完了**: `closed-timestamp`(続き10)・`wal-service`
+(続き10)・`sharded-store`(続き10)・`ephemeral-query`(続き12)・
+`multi-raft`(続き13、本エントリ)の5機能全てがGraphQL化+該当REST
+ルート撤廃+実プロセスHTTP E2Eまで完了した。
+
+**次回の起点**: 「🛑 復活用メッセージ」項目4=要求③の実装トラック
+(付録A.6-2「Raft-Learner上の行→列非同期変換レプリカ
+(`ColumnarApplier`)」が本命、A.6-1 HLC・A.6-4 deletion vectorも。
+`aruaru.yaml: htap`セクション(§5・A.7)を先に足すこと)。

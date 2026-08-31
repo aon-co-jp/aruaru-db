@@ -377,6 +377,33 @@ pub struct ShardedStoreStatsGql {
     pub total_len: i64,
 }
 
+// ── Vitess Reshard(併合)+ VTGate scatter-gather(2026-08-31、REST撤廃) ──
+// 旧 REST `POST /admin/multi-raft/split`・`/merge`・
+// `GET /admin/multi-raft/scatter-query` の等価。
+
+#[derive(SimpleObject, Clone)]
+pub struct MultiRaftSplitResultGql {
+    pub success: bool,
+    pub new_range_id: Option<i64>,
+    pub range_count: i32,
+    pub message: Option<String>,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct MultiRaftMergeResultGql {
+    pub success: bool,
+    pub merged_range_id: Option<i64>,
+    pub range_count: i32,
+    pub message: Option<String>,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct MultiRaftRangeReadingGql {
+    pub range_id: i64,
+    pub commit_index: i64,
+    pub role: String,
+}
+
 // ── ephemeral SQL pod(2026-08-31、trait注入リファクタでREST撤廃) ──
 // 旧 REST `POST /admin/ephemeral-query` の等価。`Mutation.ephemeralQuery`。
 
