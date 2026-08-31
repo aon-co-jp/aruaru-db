@@ -269,6 +269,10 @@ async fn main() -> anyhow::Result<()> {
         format!("127.0.0.1:{}", cli.gql_port),
         cluster::EngineApplier::new(engine.clone()),
     ));
+    // GraphQL側(`AdminCtx.multi_raft`)へ同一インスタンスを共有するため、
+    // `attach_multi_raft`で消費される前に複製しておく(`keyring_for_
+    // graphql`等と同じパターン、2026-08-31 trait注入リファクタ)。
+    let multi_raft_for_graphql = multi_raft_cluster.clone();
     admin_state.attach_multi_raft(multi_raft_cluster);
     // 【課金アイテムの権利消失防止】書き込みをRaft経由で複製するレプリケータ。
     // クラスタ構築に成功した場合のみ設定される (推奨構成: 自ノード+peers 2台=計3ノード)。
@@ -440,6 +444,7 @@ async fn main() -> anyhow::Result<()> {
                     wal_storage: Some(wal_storage_for_graphql.clone()),
                     sharded_store: Some(sharded_store_for_graphql.clone()),
                     ephemeral: ephemeral_for_graphql.clone(),
+                    multi_raft: Some(multi_raft_for_graphql.clone()),
                 },
             ))
             .at("/graphql/sdl", get(subgraph_sdl))

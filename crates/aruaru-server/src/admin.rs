@@ -170,9 +170,12 @@ impl AdminState {
         *self.multi_raft.lock() = Some(cluster);
     }
 
-    pub fn multi_raft(&self) -> Option<Arc<aruaru_dist::MultiRaftCluster<crate::cluster::EngineApplier>>> {
-        self.multi_raft.lock().clone()
-    }
+    // 【2026-08-31 REST完全撤廃】旧`multi_raft()`ゲッターはREST
+    // ハンドラ(`admin.rs`の`multi_raft_split`等)専用だったが、それらが
+    // GraphQLへ完全移行し`main.rs`が起動時に`Arc`を直接複製して
+    // `AdminCtx`へ渡す設計になったため未使用となり削除した
+    // (`AdminState.multi_raft`フィールド自体・`attach_multi_raft`は
+    // 引き続き使用、main.rs起動シーケンスでの取り付け先として必要)。
 
     /// Raft ノードを取り付ける (クラスタモード起動時)
     pub fn attach_cluster(&self, node: Arc<ClusterNode>) {
@@ -464,12 +467,11 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         // `Mutation.ephemeralQuery`へ移行済み(`admin_shared.rs`/
         // `keyring.rs`と同じ「trait/型を共有クレートへ移設」パターンで
         // trait注入の壁を解消した)。旧 `POST /ephemeral-query` は撤廃。
-        // 【2026-08-21新設・実配線】Vitess Reshard(併合)+ VTGate scatter-gather
-        // 【2026-08-29(続き10)】同上、`MultiRaftCluster<EngineApplier>` の
-        // trait object 化が必要な別スライス。
-        .at("/multi-raft/split", post(multi_raft_split))
-        .at("/multi-raft/merge", post(multi_raft_merge))
-        .at("/multi-raft/scatter-query", get(multi_raft_scatter_query))
+        // 【2026-08-31 REST完全撤廃】Vitess Reshard(併合)+ VTGate
+        // scatter-gather は `EngineApplier` の `aruaru-dist` 移設により
+        // trait object化不要でGraphQL化(`Mutation.multiRaftSplit`/
+        // `multiRaftMerge`・`Query.multiRaftScatterQuery`)。旧
+        // `/multi-raft/*` 3ルートは撤廃。
         // 【2026-08-29(続き10)REST完全撤廃】ScyllaDB shard-per-coreストアの
         // 3操作(put/get/stats)は GraphQL `shardedStorePut` mutation・
         // `shardedStoreGet`/`shardedStoreStats` query へ完全移行済み。
@@ -1028,87 +1030,14 @@ async fn cluster_propose(state: Data<&Arc<AdminState>>, Json(req): Json<SqlReque
     }
 }
 
-// ── Vitess Reshard(併合)+ VTGate scatter-gather の実配線(2026-08-21) ──
-//
-// `aruaru_dist::MultiRaftCluster`(Range単位の独立Raftグループ+キー空間
-// トポロジ)を、`main.rs`起動時に単一ノード構成で初期化し`AdminState`へ
-// 取り付けたものを実際にHTTP経由で操作する。既存の本番書き込み経路
-// (`cluster_propose`が使う`ClusterNode`/`replicator`)とは独立した並行
-// コンポーネント——`multi_raft`が未初期化(構築失敗等)の場合は503を返す。
-
-#[derive(Debug, Deserialize)]
-struct MultiRaftSplitRequest {
-    range_id: u64,
-    /// 分割キー(UTF-8文字列として受け取り、バイト列へ変換して使う)
-    split_key: String,
-}
-
-/// `POST /admin/multi-raft/split` — CockroachDB方式のRange分割を実際に
-/// 実行する(既存の`MultiRaftCluster::split`をHTTP経由で呼べるようにする)。
-#[handler]
-fn multi_raft_split(state: Data<&Arc<AdminState>>, Json(req): Json<MultiRaftSplitRequest>) -> Json<Value> {
-    let Some(cluster) = state.multi_raft() else {
-        return Json(json!({
-            "success": false,
-            "message": "MultiRaftCluster未初期化です(main.rsでの構築に失敗している可能性があります)。"
-        }));
-    };
-    let applier = crate::cluster::EngineApplier::new(state.engine.clone());
-    match cluster.split(req.range_id, req.split_key.into_bytes(), applier) {
-        Some(new_range_id) => Json(json!({
-            "success": true, "new_range_id": new_range_id, "range_count": cluster.range_count(),
-        })),
-        None => Json(json!({ "success": false, "message": format!("range_id {} が見つかりません", req.range_id) })),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct MultiRaftMergeRequest {
-    range_a: u64,
-    range_b: u64,
-}
-
-/// `POST /admin/multi-raft/merge` — Vitess Reshard(併合方向)を実際に
-/// 実行する(`ClusterTopology::merge_ranges`+`MultiRaftCluster::merge`を
-/// HTTP経由で呼べるようにする、`CLAUDE.md`2026-08-21(続き2)HANDOFF参照)。
-#[handler]
-fn multi_raft_merge(state: Data<&Arc<AdminState>>, Json(req): Json<MultiRaftMergeRequest>) -> Json<Value> {
-    let Some(cluster) = state.multi_raft() else {
-        return Json(json!({
-            "success": false,
-            "message": "MultiRaftCluster未初期化です(main.rsでの構築に失敗している可能性があります)。"
-        }));
-    };
-    match cluster.merge(req.range_a, req.range_b) {
-        Some(merged_id) => Json(json!({
-            "success": true, "merged_range_id": merged_id, "range_count": cluster.range_count(),
-        })),
-        None => Json(json!({
-            "success": false,
-            "message": format!("range {} と {} は併合できません(隣接していないか、存在しません)", req.range_a, req.range_b),
-        })),
-    }
-}
-
-/// `GET /admin/multi-raft/scatter-query` — VTGate scatter-gatherを実際に
-/// 実行する(全Rangeのcommit_indexをrange_id順に集約して返す)。
-#[handler]
-fn multi_raft_scatter_query(state: Data<&Arc<AdminState>>) -> Json<Value> {
-    let Some(cluster) = state.multi_raft() else {
-        return Json(json!({
-            "success": false,
-            "message": "MultiRaftCluster未初期化です(main.rsでの構築に失敗している可能性があります)。"
-        }));
-    };
-    let gathered = cluster.scatter_gather(|node| {
-        json!({ "commit_index": node.commit_index(), "role": format!("{:?}", node.role()) })
-    });
-    let ranges: Vec<Value> = gathered
-        .into_iter()
-        .map(|(range_id, v)| json!({ "range_id": range_id, "reading": v }))
-        .collect();
-    Json(json!({ "success": true, "range_count": ranges.len(), "ranges": ranges }))
-}
+// 【2026-08-31 REST完全撤廃】Vitess Reshard(併合)+ VTGate scatter-gather
+// (旧 `MultiRaftSplitRequest`/`MultiRaftMergeRequest`/
+// `multi_raft_split`/`multi_raft_merge`/`multi_raft_scatter_query`)は
+// GraphQL `Mutation.multiRaftSplit`/`multiRaftMerge`・
+// `Query.multiRaftScatterQuery`(`aruaru-graphql::admin_resolvers`)へ
+// 完全移行。`AdminState.multi_raft`はそのまま`AdminCtx.multi_raft`へ
+// 同一インスタンスとして共有する(`EngineApplier`の`aruaru-dist`移設
+// により具体型のまま共有でき、trait object化は不要だった)。
 
 // 【2026-08-29(続き10)REST完全撤廃】ScyllaDB shard-per-core ストアの
 // put/get/stats は GraphQL `shardedStorePut` mutation・`shardedStoreGet`/

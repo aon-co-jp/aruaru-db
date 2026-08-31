@@ -93,6 +93,15 @@ pub struct AdminCtx {
     /// 旧 REST `POST /admin/ephemeral-query` は削除済みで、
     /// `Mutation.ephemeralQuery`が唯一の経路。
     pub ephemeral: Option<Arc<dyn aruaru_dist::ephemeral::EphemeralRunner>>,
+    /// 【2026-08-31 trait注入リファクタ(続き)】REST(`AdminState.multi_raft`)
+    /// と**同一**の`MultiRaftCluster`インスタンス。`EngineApplier`を
+    /// `aruaru-dist`へ移設したことで、`aruaru-graphql`も具体型
+    /// `MultiRaftCluster<aruaru_dist::EngineApplier>`をそのまま名指し
+    /// できるようになった(trait object化は不要だった)。旧 REST
+    /// `/admin/multi-raft/{split,merge,scatter-query}` は削除済みで、
+    /// `Mutation.multiRaftSplit`/`multiRaftMerge`・
+    /// `Query.multiRaftScatterQuery`が唯一の経路。
+    pub multi_raft: Option<Arc<aruaru_dist::MultiRaftCluster<aruaru_dist::EngineApplier>>>,
 }
 
 /// UNIX epoch からの現在時刻(論理ナノ秒)。closed timestamp の `now` 既定値。
@@ -528,6 +537,29 @@ impl AdminQuery {
         let a = admin(ctx)?;
         let count = a.keyring.as_ref().map(|k| k.count()).unwrap_or(0);
         Ok(KeyStatusGql { issued_key_count: count as i32 })
+    }
+
+    // ── Vitess Reshard(併合)+ VTGate scatter-gather ─────────
+
+    /// 旧 REST `GET /admin/multi-raft/scatter-query`の等価。全Rangeの
+    /// `commit_index`/`role`をrange_id順に集約して返す(合意を伴わない
+    /// 読み取り専用の集約、`MultiRaftCluster::scatter_gather`)。
+    async fn multi_raft_scatter_query(&self, ctx: &Context<'_>) -> Result<Vec<MultiRaftRangeReadingGql>> {
+        let a = admin(ctx)?;
+        let Some(cluster) = &a.multi_raft else {
+            return Err(async_graphql::Error::new(
+                "MultiRaftCluster未初期化です(main.rsでの構築に失敗している可能性があります)。",
+            ));
+        };
+        let gathered = cluster.scatter_gather(|node| (node.commit_index(), format!("{:?}", node.role())));
+        Ok(gathered
+            .into_iter()
+            .map(|(range_id, (commit_index, role))| MultiRaftRangeReadingGql {
+                range_id: range_id as i64,
+                commit_index: commit_index as i64,
+                role,
+            })
+            .collect())
     }
 
     // ── オブジェクトテーブル: 時間旅行(VersionlessAPIの実体) ──────
@@ -1412,6 +1444,75 @@ impl AdminMutation {
         Ok(ShardedStorePutResultGql { key, shard_id })
     }
 
+    // ── Vitess Reshard(併合)+ VTGate scatter-gather ─────────
+
+    /// 旧 REST `POST /admin/multi-raft/split`の等価。CockroachDB方式の
+    /// Range分割を実際に実行する(`MultiRaftCluster::split`)。
+    async fn multi_raft_split(
+        &self,
+        ctx: &Context<'_>,
+        range_id: i64,
+        split_key: String,
+    ) -> Result<MultiRaftSplitResultGql> {
+        let a = admin(ctx)?;
+        let Some(cluster) = &a.multi_raft else {
+            return Ok(MultiRaftSplitResultGql {
+                success: false,
+                new_range_id: None,
+                range_count: 0,
+                message: Some("MultiRaftCluster未初期化です(main.rsでの構築に失敗している可能性があります)。".into()),
+            });
+        };
+        let applier = aruaru_dist::EngineApplier::new(a.engine.clone());
+        match cluster.split(range_id as u64, split_key.into_bytes(), applier) {
+            Some(new_range_id) => Ok(MultiRaftSplitResultGql {
+                success: true,
+                new_range_id: Some(new_range_id as i64),
+                range_count: cluster.range_count() as i32,
+                message: None,
+            }),
+            None => Ok(MultiRaftSplitResultGql {
+                success: false,
+                new_range_id: None,
+                range_count: cluster.range_count() as i32,
+                message: Some(format!("range_id {range_id} が見つかりません")),
+            }),
+        }
+    }
+
+    /// 旧 REST `POST /admin/multi-raft/merge`の等価。Vitess Reshard
+    /// (併合方向)を実際に実行する(`MultiRaftCluster::merge`)。
+    async fn multi_raft_merge(
+        &self,
+        ctx: &Context<'_>,
+        range_a: i64,
+        range_b: i64,
+    ) -> Result<MultiRaftMergeResultGql> {
+        let a = admin(ctx)?;
+        let Some(cluster) = &a.multi_raft else {
+            return Ok(MultiRaftMergeResultGql {
+                success: false,
+                merged_range_id: None,
+                range_count: 0,
+                message: Some("MultiRaftCluster未初期化です(main.rsでの構築に失敗している可能性があります)。".into()),
+            });
+        };
+        match cluster.merge(range_a as u64, range_b as u64) {
+            Some(merged_id) => Ok(MultiRaftMergeResultGql {
+                success: true,
+                merged_range_id: Some(merged_id as i64),
+                range_count: cluster.range_count() as i32,
+                message: None,
+            }),
+            None => Ok(MultiRaftMergeResultGql {
+                success: false,
+                merged_range_id: None,
+                range_count: cluster.range_count() as i32,
+                message: Some(format!("range {range_a} と {range_b} は併合できません(隣接していないか、存在しません)")),
+            }),
+        }
+    }
+
     // ── ephemeral SQL pod ────────────────────────────────────
 
     /// 旧 REST `POST /admin/ephemeral-query`の等価。指定テナントの
@@ -1567,6 +1668,9 @@ mod cluster_propose_tests {
     }
 
     fn admin_ctx(engine: Arc<QueryEngine>, replicator: Option<Arc<dyn ReplicatedWriter>>) -> AdminCtx {
+        // `test_backup_engine`が`engine`を消費するため、その後でも
+        // `EngineApplier`用に使えるよう先に複製しておく。
+        let engine_for_multi_raft = engine.clone();
         AdminCtx {
             engine: engine.clone(),
             registry: aruaru_registry::Registry::new(),
@@ -1595,6 +1699,11 @@ mod cluster_propose_tests {
             ))),
             sharded_store: Some(Arc::new(aruaru_query::sharded_store::ShardedRowStore::new(2))),
             ephemeral: Some(Arc::new(TestEphemeralRunner)),
+            multi_raft: Some(Arc::new(aruaru_dist::MultiRaftCluster::single_node(
+                1,
+                "127.0.0.1:5432".to_string(),
+                aruaru_dist::EngineApplier::new(engine_for_multi_raft),
+            ))),
         }
     }
 
@@ -2302,5 +2411,68 @@ mod cluster_propose_tests {
         let data2 = resp2.data.into_json().unwrap();
         assert_eq!(data2["ephemeralQuery"]["success"], false);
         assert!(data2["ephemeralQuery"]["message"].as_str().unwrap().contains("not configured"));
+    }
+
+    /// 【2026-08-31追加】旧 REST `/admin/multi-raft/{split,merge,
+    /// scatter-query}`の等価(`Mutation.multiRaftSplit`/`multiRaftMerge`・
+    /// `Query.multiRaftScatterQuery`)が、`EngineApplier`の`aruaru-dist`
+    /// 移設後も具体型のまま(trait object化なしで)実際に機能することを
+    /// 検証する——分割→2Range個別のscatter-gather確認→併合→1Rangeに
+    /// 戻ることの一連。
+    #[tokio::test]
+    async fn multi_raft_split_merge_and_scatter_query_operate_on_the_shared_cluster() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), None));
+
+        // 初期状態は単一Range(admin_ctxのMultiRaftCluster::single_node)。
+        let resp = schema.execute(authorized_request("query { multiRaftScatterQuery { rangeId } }")).await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        assert_eq!(resp.data.into_json().unwrap()["multiRaftScatterQuery"].as_array().unwrap().len(), 1);
+
+        // split: range 1 を "m" で分割 → 2 Range になる。
+        let resp = schema
+            .execute(authorized_request(
+                r#"mutation { multiRaftSplit(rangeId: 1, splitKey: "m") { success newRangeId rangeCount } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        let data = resp.data.into_json().unwrap();
+        assert_eq!(data["multiRaftSplit"]["success"], true, "result: {data:?}");
+        assert_eq!(data["multiRaftSplit"]["rangeCount"], 2);
+        let new_range_id = data["multiRaftSplit"]["newRangeId"].as_i64().unwrap();
+
+        // scatter-query: 2 Range 個別のcommit_index/roleが取れる。
+        let resp = schema.execute(authorized_request("query { multiRaftScatterQuery { rangeId commitIndex role } }")).await;
+        let ranges = resp.data.into_json().unwrap()["multiRaftScatterQuery"].as_array().unwrap().clone();
+        assert_eq!(ranges.len(), 2, "ranges: {ranges:?}");
+
+        // merge: 分割した2つを併合し1 Rangeへ戻す。
+        let resp = schema
+            .execute(authorized_request(&format!(
+                r#"mutation {{ multiRaftMerge(rangeA: 1, rangeB: {new_range_id}) {{ success mergedRangeId rangeCount }} }}"#
+            )))
+            .await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        let data = resp.data.into_json().unwrap();
+        assert_eq!(data["multiRaftMerge"]["success"], true, "result: {data:?}");
+        assert_eq!(data["multiRaftMerge"]["rangeCount"], 1);
+
+        // 存在しないrange_idでのmergeは正直な失敗メッセージ。
+        let resp = schema
+            .execute(authorized_request("mutation { multiRaftMerge(rangeA: 1, rangeB: 999) { success message } }"))
+            .await;
+        let data = resp.data.into_json().unwrap();
+        assert_eq!(data["multiRaftMerge"]["success"], false);
+        assert!(data["multiRaftMerge"]["message"].is_string());
+
+        // 未設定(trait未注入)の場合はエラーとして返る。
+        let mut ctx_without_cluster = admin_ctx(engine.clone(), None);
+        ctx_without_cluster.multi_raft = None;
+        let schema2 = build_schema(engine.clone(), ctx_without_cluster);
+        let resp2 = schema2.execute(authorized_request("query { multiRaftScatterQuery { rangeId } }")).await;
+        assert!(!resp2.errors.is_empty(), "should error when multi_raft is not configured");
     }
 }
