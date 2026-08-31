@@ -544,6 +544,13 @@ impl ObjectTable {
                 continue;
             }
             for b in seg.blocks {
+                // A.6-4: 全行が論理削除された block は、統計と無関係に
+                // 読む必要が無い(min/maxが古い値のまま残っていても、
+                // 実際に返す行が0件なのは確定しているため)。
+                if b.row_count > 0 && b.live_row_count() == 0 {
+                    skipped_blocks += 1;
+                    continue;
+                }
                 if b.column_stats.get(column).is_some_and(|s| s.disproves(op, value)) {
                     skipped_blocks += 1;
                     continue;
@@ -564,6 +571,11 @@ impl ObjectTable {
     ) -> Result<Vec<BlockMeta>, TableFormatError> {
         let mut kept = Vec::new();
         for b in self.blocks_at(snapshot_id)? {
+            // A.6-4: 全行が論理削除された block は bloom filter の結果に
+            // かかわらず不要(prune_rangeと同じ判断)。
+            if b.row_count > 0 && b.live_row_count() == 0 {
+                continue;
+            }
             let keep = match b.bloom.get(column) {
                 Some(f) => f.may_contain(key.as_bytes()),
                 None => true,
@@ -799,6 +811,52 @@ mod tests {
         assert!(kept.iter().any(|b| b.location == "b_users_a"));
         assert!(kept.iter().any(|b| b.location == "b_no_index"));
         assert!(kept.len() <= 3);
+    }
+
+    #[test]
+    fn prune_range_skips_blocks_whose_every_row_is_logically_deleted() {
+        let (_s, _m, t) = table();
+        // b1: 2行とも削除済み(live_row_count=0)。統計上はv=1..5とマッチ
+        // するはずの範囲だが、全行削除済みなので枝刈りされるべき。
+        let b1 = BlockMeta::new("all_deleted", 2, 10)
+            .with_stats("v", 1.0, 5.0, 0)
+            .with_deleted(0)
+            .with_deleted(1);
+        let b2 = BlockMeta::new("still_alive", 2, 10).with_stats("v", 1.0, 5.0, 0);
+        let v1 = t.commit_blocks(vec![b1, b2]).unwrap();
+
+        let (kept, _skipped_seg, skipped_blk) = t.prune_range(&v1, "v", RangeOp::Lt, 10.0).unwrap();
+        assert_eq!(kept.len(), 1, "the fully-deleted block must not be returned");
+        assert_eq!(kept[0].location, "still_alive");
+        assert_eq!(skipped_blk, 1);
+    }
+
+    #[test]
+    fn prune_equality_skips_blocks_whose_every_row_is_logically_deleted() {
+        let (_s, _m, t) = table();
+        let b1 = BlockMeta::new("all_deleted", 1, 10)
+            .with_bloom("name", ["alice"])
+            .with_deleted(0);
+        let b2 = BlockMeta::new("still_alive", 1, 10).with_bloom("name", ["alice"]);
+        let v1 = t.commit_blocks(vec![b1, b2]).unwrap();
+
+        let kept = t.prune_equality(&v1, "name", "alice").unwrap();
+        assert_eq!(kept.len(), 1, "the fully-deleted block must not be returned even though its bloom filter matches");
+        assert_eq!(kept[0].location, "still_alive");
+    }
+
+    #[test]
+    fn prune_range_still_returns_partially_deleted_blocks() {
+        let (_s, _m, t) = table();
+        // 3行中1行だけ削除——live_row_count=2>0なので、通常どおり
+        // 統計に基づいて判定される(読む必要がある可能性が残るため)。
+        let b1 = BlockMeta::new("partially_deleted", 3, 10)
+            .with_stats("v", 1.0, 5.0, 0)
+            .with_deleted(0);
+        let v1 = t.commit_blocks(vec![b1]).unwrap();
+        let (kept, _skipped_seg, skipped_blk) = t.prune_range(&v1, "v", RangeOp::Lt, 10.0).unwrap();
+        assert_eq!(kept.len(), 1, "a block with at least one live row must still be considered");
+        assert_eq!(skipped_blk, 0);
     }
 
     #[test]

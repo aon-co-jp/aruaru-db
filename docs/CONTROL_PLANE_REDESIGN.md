@@ -839,13 +839,15 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
      <https://delta.io/blog/2023-07-05-deletion-vectors/>
      **正直な簡略化点**: 本実装は`RoaringBitmap`ではなく`BTreeSet<u64>`
      (非圧縮の順序集合)——意味論は同一だが大量削除時のメモリ効率は劣る。
-     また、`ColumnarApplier`(A.6-2)は依然としてテーブル全体を都度
-     再構築する設計のため**deletion vector自体はまだ配線されていない**
-     ——単体で正しく検証済みの基盤として先に用意した段階(5テスト、
-     `crates/aruaru-backup/src/table_format.rs`)。`prune_range`/
-     `prune_equality`が`live_row_count`を考慮するようにする配線、
-     `ColumnarApplier`をdelta+base方式へ格上げする際にこのdeletion
-     vectorを実際の書き込みパスから呼ぶ配線が次段階。
+     **`prune_range`/`prune_equality`は`live_row_count()==0`のblockを
+     実際に枝刈りするよう配線済み**(2026-08-31続き18、3テストで検証)
+     ——統計/bloom filterがマッチしても、全行削除済みと分かれば
+     読まない。一方`ColumnarApplier`(A.6-2)は依然としてテーブル全体を
+     都度再構築する設計のため**deletion vectorへの書き込み(実際の
+     DELETE/UPDATE発生時に`with_deleted`を呼ぶ経路)はまだ配線されて
+     いない**——読み取り側(枝刈り)は完成、書き込み側(実際の削除
+     マーキング)が次段階。`ColumnarApplier`をdelta+base方式へ格上げ
+     する際にこの経路を接続する。
   2. **base + delta の Merge-on-Read**(Hudi / TiFlash 型): segment に
      delta log(追記のみ)を併設し、読み取りで base+delta をマージ。
      A.6-2 の learner 列変換と同じ機構を流用できる。
