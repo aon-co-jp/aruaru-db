@@ -5460,3 +5460,55 @@ DELETE/UPDATE発生時に`with_deleted`を呼ぶ**書き込み側**の経路は
 `ColumnarApplier`の書き込み側からdeletion vectorを実際に呼ぶ配線を
 含む)、(2) HLCを`closed_ts`/`wal_service`/`multi_raft`へ配線、
 (3) `aruaru.yaml: htap`セクション(§5・A.7)の実装。
+
+## HANDOFF追記(2026-08-31続き19) 本日の全実装(続き13〜18)をVPSへ反映+実バグ1件発見・修正
+
+**位置づけ**: 続き13(multi-raft REST撤廃)〜続き18(prune配線)の全実装を
+VPS(`ssh conoha`、`/root/aruaru-db`)へ反映し、実サービスで動作確認した。
+
+**実施内容**:
+1. VPS上の`/root/aruaru-db`(`git status`でCargo.lock系の自動生成差分
+   のみ、実質クリーンを確認)で`git pull origin main`(`250956d`→
+   `c0d3ce9`、23ファイル・2179行超の差分を反映)。
+2. **実バグ発見・修正**: `cargo build --release -p aruaru-server`が
+   `failed to read '/root/repository/open-raid-z/.../Cargo.toml':
+   No such file or directory`で失敗。原因調査の結果、`/root/aruaru-db`
+   は`/root/repository/aruaru-db`へのシンボリックリンクだが、
+   `aruaru-dist`の`Cargo.toml`が`open_raid_z_core`をpath依存
+   (`../../../open-raid-z/...`)として参照しており、この相対パスは
+   `/root/repository/open-raid-z/...`に解決される——しかし実際の
+   `open-raid-z`リポジトリは`/root/open-raid-z`に存在し
+   `/root/repository/open-raid-z`は存在しなかった(ローカル開発環境
+   〈`F:\runo\repository\aruaru-db`と`F:\runo\repository\open-raid-z`
+   が兄弟ディレクトリ〉とVPSのディレクトリ構成が食い違っていた、
+   本セッションの変更が原因ではない既存の構成不整合)。
+   `ln -sf /root/open-raid-z /root/repository/open-raid-z`で解消
+   (Cargoのoptional path依存は、featureが無効でもマニフェスト自体は
+   解決できる必要があるため、この不整合はfeature無効ビルドでも
+   顕在化する)。
+3. `cargo build --release -p aruaru-server`成功(7分52秒、既存の
+   `build_cluster`/`propose_commit`未使用警告2件のみ、無関係)。
+4. `systemctl restart aruaru-server`→`systemctl is-active`で`active`、
+   `curl http://127.0.0.1:4001/healthz`で`ok`、実際に
+   `POST /graphql`で`clusterStatus`クエリを実行し
+   `{"totalNodes":1,"healthyNodes":1}`が返ることを確認。起動ログに
+   エラー・パニック無し(DB-Engines巡回失敗の警告のみ、既知の
+   ネットワーク到達性起因で無関係)。
+5. `aruaru-db-web`(Web管理UI、リバースプロキシ)は今回の変更が
+   `web/`クレートへ影響しないため未再ビルド——`https://easy-web.tokyo/
+   aruaru-db/`が引き続き`200`を返すことのみ確認(非破壊であることの
+   確認)。
+6. 一時ビルドログ(`/root/aruaru_build.log`/`aruaru_build2.log`)を
+   削除、VPS上の状態をクリーンに保った。
+
+**正直な開示**: 今回反映した新機能(`--columnar-learner`起動フラグ、
+HLC、deletion vector)自体はVPS上の単一ノード常駐運用では現状呼ばれて
+いない(既存の`aruaru-server.service`は`--raft-id 1`のみ、複数プロセス
+構成やcolumnar learnerの実運用配備はしていない)——今回のVPS反映は
+「最新コードが実運用サービスとして正しくビルド・起動・応答すること」の
+確認であり、新機能自体の本番運用投入はまだ次段階。
+
+**次回の起点**: 続き18と同じ(A.6-4段階2、HLC配線、`aruaru.yaml: htap`)。
+加えて、VPS/ローカルのディレクトリ構成不整合(`open-raid-z`のパス)が
+今後同種のビルド失敗を再発させ得るため、次回VPSでこの種のエラーに
+遭遇したら本エントリの`ln -sf`対応を参照すること。
