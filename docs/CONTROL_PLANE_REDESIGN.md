@@ -540,7 +540,7 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
 | HLC(Hybrid Logical Clock)による版付け | Spanner / CockroachDB / YugabyteDB | `aruaru-dist/src/hlc.rs`(`now`/`update`、CAS実装) | 実装済(2026-08-31、既存`closed_ts`等への配線は次段階) |
 | Raft-Learner 上での 行→列 非同期変換レプリカ | TiDB/TiFlash | `aruaru-dist/src/columnar_applier.rs`(`Applier`実装)+ `aruaru-server --columnar-learner`(実プロセス、binary Raft経由で実複製) | 実装済(2026-08-31、2プロセス間の実HTTP/実TCPで検証済み。真のdelta蓄積はA.6-4/次段階) |
 | 読み取り時の Raft index + MVCC による SI 検証 | TiDB/TiFlash | closed_ts の gate はあるが Raft index 突合は無い | 未取込(A.6-3) |
-| DeltaTree(B+木 × LSM)= 更新耐性のある列エンジン | TiDB/TiFlash | object-table は不変セグメントのみ、delta 層無し | 未取込(A.6-4) |
+| DeltaTree(B+木 × LSM)= 更新耐性のある列エンジン | TiDB/TiFlash | `table_format::BlockMeta.deletion_vector`(段階1) | 部分実装(2026-08-31、MoR本体〈段階2〉はA.6-4次段階) |
 | 不変マイクロパーティション + メタデータ pruning + time travel | Snowflake / Iceberg / Delta / Databend | `aruaru-backup/src/table_format.rs`(snapshot→segment→block 3層、min/max + bloom) | 実装済 |
 | WAL サービス(quorum 耐久化)と pageserver(ページ再構成)の分離 | Neon(> Aurora) | `aruaru-dist/src/wal_service.rs`(term fencing + `flushLsn[n-quorum]`) | 実装済(単一プロセス) |
 | セグメント単位のゾーンマップ / スパース索引 | ClickHouse MergeTree / DuckDB row group / SingleStore segment | `aruaru-query/src/olap.rs`(`SegmentStats`、既定 1024 行) | 実装済(min/max のみ) |
@@ -818,15 +818,18 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
   同居するため read-index は関数呼び出しで済む(P4 のネットワーク越し
   learner で初めて実 RPC 化)。
 
-#### A.6-4 DeltaTree / deletion vector / MoR — **取り込む(段階的)**
+#### A.6-4 DeltaTree / deletion vector / MoR — **段階1(deletion vector)実装済(2026-08-31)、段階2(MoR)は次段階**
 
-- 現状: `table_format` の block は不変。行の**更新・削除**を表現できず、
+- 現状: ~~`table_format` の block は不変。行の**更新・削除**を表現できず、
   DELETE 相当は「新 snapshot で block を差し替え」= 実質 Copy-on-Write の
-  重い経路のみ。
+  重い経路のみ。~~ **2026-08-31更新**: `BlockMeta.deletion_vector`
+  (`BTreeSet<u64>`、block内の行位置集合)を実装済み——`with_deleted`/
+  `is_deleted`/`live_row_count`で「この位置の行は論理削除されている」を
+  表現できるようになった(`SegmentMeta::live_row_count`で集約も可能)。
 - 判断: **取り込む**。優先度順:
-  1. **deletion vector**(Delta / Photon 型): `BlockMeta` に「削除行の
-     RoaringBitmap 相当」を持たせ、`prune`/読み取りで適用。即時 rewrite 無しの
-     DELETE/UPDATE。実装が最も軽く効果が大きい。
+  1. **deletion vector**(Delta / Photon 型) — **実装済**。`BlockMeta` に
+     「削除行の位置集合」を持たせ、`prune`/読み取りで適用できる基盤を
+     用意した。即時 rewrite 無しの DELETE/UPDATE(MoRの前段)。
      *実装方法(Delta PROTOCOL.md より)*: DV は「data file 内の行位置の集合」を
      RoaringBitmap 配列で表す。64bit 位置を「上位 32bit = key / 下位 32bit =
      sub-position」に分け、key ごとに 32bit Roaring bitmap を 1 つ持つ
@@ -834,6 +837,15 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
      data file と並べて置き、1 ファイルに複数 data file 分の DV をシリアライズ。
      <https://github.com/delta-io/delta/blob/master/PROTOCOL.md> /
      <https://delta.io/blog/2023-07-05-deletion-vectors/>
+     **正直な簡略化点**: 本実装は`RoaringBitmap`ではなく`BTreeSet<u64>`
+     (非圧縮の順序集合)——意味論は同一だが大量削除時のメモリ効率は劣る。
+     また、`ColumnarApplier`(A.6-2)は依然としてテーブル全体を都度
+     再構築する設計のため**deletion vector自体はまだ配線されていない**
+     ——単体で正しく検証済みの基盤として先に用意した段階(5テスト、
+     `crates/aruaru-backup/src/table_format.rs`)。`prune_range`/
+     `prune_equality`が`live_row_count`を考慮するようにする配線、
+     `ColumnarApplier`をdelta+base方式へ格上げする際にこのdeletion
+     vectorを実際の書き込みパスから呼ぶ配線が次段階。
   2. **base + delta の Merge-on-Read**(Hudi / TiFlash 型): segment に
      delta log(追記のみ)を併設し、読み取りで base+delta をマージ。
      A.6-2 の learner 列変換と同じ機構を流用できる。

@@ -204,6 +204,26 @@ pub struct BlockMeta {
     pub column_stats: BTreeMap<String, ColumnStats>,
     /// 等値述語用の bloom filter (列名 -> フィルタ)
     pub bloom: BTreeMap<String, BloomFilter>,
+    /// **A.6-4(段階的取り込み・第一歩)**: 論理削除された行の
+    /// **block内の行位置**の集合(Delta Lake の Deletion Vector と
+    /// 同じ意味論——`docs/CONTROL_PLANE_REDESIGN.md` 付録A.6-4参照)。
+    /// UPDATE/DELETE のたびに block 全体を書き直す(重い CoW)代わりに、
+    /// 「この位置の行は論理的に消えている」というマーカーだけを立てる
+    /// ことで、即時 rewrite 無しの DELETE/UPDATE(MoR = Merge-on-Read の
+    /// 前段)を可能にする。
+    ///
+    /// **正直な簡略化点**: Delta の実プロトコルは 32bit 単位の
+    /// RoaringBitmap(圧縮ビットマップ)を使うが、本実装は`BTreeSet<u64>`
+    /// (非圧縮の順序集合)——**意味論〈どの行位置が消えたか〉は同一**だが、
+    /// 大量削除時のメモリ効率はRoaringBitmapに劣る。行数がボトルネックに
+    /// なった時点でRoaringBitmapへの置き換えを検討する(次回課題)。
+    /// また、この段階では`ColumnarApplier`(A.6-2)がテーブル全体を
+    /// 都度再構築する設計のため**未接続**——deletion vector自体を
+    /// 単体で正しく検証し、将来の delta 蓄積方式(A.6-2をテーブル全体
+    /// 再構築からdelta+base方式へ格上げする際)が使う基盤として先に
+    /// 用意した。
+    #[serde(default)]
+    pub deletion_vector: std::collections::BTreeSet<u64>,
 }
 
 impl BlockMeta {
@@ -214,6 +234,7 @@ impl BlockMeta {
             size_bytes,
             column_stats: BTreeMap::new(),
             bloom: BTreeMap::new(),
+            deletion_vector: std::collections::BTreeSet::new(),
         }
     }
 
@@ -229,6 +250,33 @@ impl BlockMeta {
             f.insert(k.as_bytes());
         }
         self
+    }
+
+    /// `row_position`(0始まりのblock内オフセット)を論理削除としてマーク
+    /// する。範囲外の位置(`row_position >= row_count`)を渡しても
+    /// パニックしない(将来 row_count が確定する前に呼ばれても安全な
+    /// ビルダーの一部として使えるようにするため)——正しさは
+    /// `live_row_count`/`is_deleted`が`row_count`を尊重することで保たれる。
+    pub fn with_deleted(mut self, row_position: u64) -> Self {
+        self.deletion_vector.insert(row_position);
+        self
+    }
+
+    /// `row_position`が論理削除されているか。
+    pub fn is_deleted(&self, row_position: u64) -> bool {
+        self.deletion_vector.contains(&row_position)
+    }
+
+    /// 物理行数から論理削除された行を除いた、実際に読むべき行数。
+    /// `deletion_vector`に`row_count`以上の位置が誤って含まれていても
+    /// 負の値にならないよう`saturating_sub`で保護する。
+    pub fn live_row_count(&self) -> u64 {
+        let deleted_within_range = self
+            .deletion_vector
+            .iter()
+            .filter(|&&pos| pos < self.row_count)
+            .count() as u64;
+        self.row_count.saturating_sub(deleted_within_range)
     }
 }
 
@@ -265,6 +313,11 @@ impl SegmentMeta {
             }
         }
         Ok(Self { blocks, row_count, column_stats })
+    }
+
+    /// 論理削除を反映した、この segment 全体の実際の行数。
+    pub fn live_row_count(&self) -> u64 {
+        self.blocks.iter().map(|b| b.live_row_count()).sum()
     }
 }
 
@@ -532,6 +585,69 @@ mod tests {
         let meta = Arc::new(MetaService::new());
         let t = ObjectTable::new(store.clone(), meta.clone(), "aruaru", 1, 42);
         (store, meta, t)
+    }
+
+    #[test]
+    fn deletion_vector_marks_rows_as_logically_deleted_without_rewriting_the_block() {
+        let block = BlockMeta::new("b1.parquet", 5, 100)
+            .with_deleted(1)
+            .with_deleted(3);
+        assert!(block.is_deleted(1));
+        assert!(block.is_deleted(3));
+        assert!(!block.is_deleted(0));
+        assert!(!block.is_deleted(2));
+        assert!(!block.is_deleted(4));
+        assert_eq!(block.live_row_count(), 3, "5 physical rows - 2 deleted = 3 live rows");
+        // block実体(location)は書き直されていない——同じlocationのまま
+        // deletion_vectorだけが増えている、というMoRの前提を確認。
+        assert_eq!(block.location, "b1.parquet");
+        assert_eq!(block.row_count, 5, "physical row_count is unchanged by logical deletion");
+    }
+
+    #[test]
+    fn deletion_vector_out_of_range_positions_do_not_underflow_live_row_count() {
+        // row_count確定前に位置を積む、または誤った位置が混入しても
+        // saturating_subで保護されることを確認(パニックしない)。
+        let block = BlockMeta::new("b1.parquet", 2, 20)
+            .with_deleted(0)
+            .with_deleted(1)
+            .with_deleted(999); // out of range
+        assert_eq!(block.live_row_count(), 0, "in-range deletions (0,1) exhaust all rows; the out-of-range 999 must not cause underflow");
+    }
+
+    #[test]
+    fn segment_live_row_count_aggregates_across_blocks_with_deletions() {
+        let b1 = BlockMeta::new("b1", 10, 100).with_deleted(0).with_deleted(1);
+        let b2 = BlockMeta::new("b2", 5, 50); // no deletions
+        let segment = SegmentMeta::from_blocks(vec![b1, b2]).unwrap();
+        assert_eq!(segment.row_count, 15, "physical row_count is the raw sum, unaffected by deletions");
+        assert_eq!(segment.live_row_count(), 13, "10-2 (b1) + 5 (b2) = 13 live rows");
+    }
+
+    #[test]
+    fn deletion_vector_round_trips_through_json_serialization() {
+        let block = BlockMeta::new("b1", 3, 30).with_deleted(2);
+        let json = serde_json::to_vec(&block).unwrap();
+        let decoded: BlockMeta = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded, block);
+        assert!(decoded.is_deleted(2));
+    }
+
+    #[test]
+    fn old_snapshots_without_a_deletion_vector_field_deserialize_with_no_deletions() {
+        // #[serde(default)] の後方互換性——A.6-4 導入前に書かれた
+        // block JSON(deletion_vectorフィールドが存在しない)を読んでも
+        // 失敗せず、削除0件として扱われることを確認。
+        let legacy_json = r#"{
+            "location": "old.parquet",
+            "row_count": 4,
+            "size_bytes": 40,
+            "column_stats": {},
+            "bloom": {}
+        }"#;
+        let decoded: BlockMeta = serde_json::from_str(legacy_json).unwrap();
+        assert!(decoded.deletion_vector.is_empty());
+        assert_eq!(decoded.live_row_count(), 4);
     }
 
     #[test]
