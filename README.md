@@ -16,10 +16,15 @@
 > Snowflake の不変マイクロパーティション・Neon vs Aurora の WAL 分離・
 > ClickHouse SharedMergeTree・Iceberg/Delta/Hudi・Photon/DuckDB の
 > 型認識軽量圧縮を**実装方法まで**整理し、Raft-Learner 行→列変換レプリカ・
-> HLC・deletion vector の取り込みを決定)。進捗: **P0/P1/P2 完了 + P3 本体で
-> `closed-timestamp`・`wal-service`・`sharded-store` を GraphQL 化し REST を撤廃**
-> (`ephemeral-query`・`multi-raft` は次スライス)。詳細・進捗・復活用メッセージは
-> [`CLAUDE.md`](CLAUDE.md) 冒頭「🔄 セッション再開用メモ」。
+> HLC・deletion vector の取り込みを決定)。進捗: **P0〜P3 完了(REST完全撤廃
+> は`closed-timestamp`・`wal-service`・`sharded-store`・`ephemeral-query`・
+> `multi-raft`の全5機能で完了、実プロセスHTTP E2E込み)**。続けて要求③
+> 実装トラックへ着手: **HLC**(`aruaru-dist::hlc`)、**ColumnarApplier**
+> (A.6-2本命、Raft-Learner上の行→列非同期変換レプリカ。`--columnar-learner`
+> で実際に2プロセス間の実HTTPまで検証済み)、**deletion vector**
+> (A.6-4段階1、`prune_range`/`prune_equality`への配線込み)を実装。
+> 詳細・進捗・復活用メッセージは[`CLAUDE.md`](CLAUDE.md)冒頭
+> 「🔄 セッション再開用メモ」と同日HANDOFF(続き13〜18)。
 
 > 📌 保留タスク(2026-08-06): 東芝SBM・DeepSeek技術の組み込み構想あり。詳細は[CLAUDE.md](CLAUDE.md)参照。
 

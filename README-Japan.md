@@ -38,6 +38,22 @@
 > 可能にする Cosmo の技術」。詳細・残作業・復活用メッセージは `CLAUDE.md`
 > 冒頭「🔄 セッション再開用メモ」と HANDOFF(続き5〜10)。
 >
+> **2026-08-31 続報(P3本体完了 + 要求③実装トラック始動)**:
+> **P3本体(REST完全撤廃)が全5機能で完了**——`closed-timestamp`・
+> `wal-service`・`sharded-store`(続き10)に加え、`ephemeral-query`
+> (続き12)・`multi-raft`(続き13、`EngineApplier`をaruaru-distへ移設し
+> trait object化なしで解決)も GraphQL化・REST撤廃・実プロセスHTTP
+> E2Eまで完了した。続けて「要求③=CockroachDB×Snowflakeハイブリッド
+> 変種の実装理論取り込み」の実装トラックへ着手: **A.6-1 HLC**
+> (Hybrid Logical Clock、ロックフリーCAS実装)、**A.6-2 ColumnarApplier**
+> (Raft-Learner上の行→列非同期変換レプリカ、TiFlash型HTAPの核心——
+> 単体テストだけでなく**実際に2プロセス間〈leader/columnar-learner〉で
+> Raft commitが列レプリカへ反映されることを実HTTPで検証済み**、
+> `--columnar-learner`起動フラグ)、**A.6-4段階1 deletion vector**
+> (`BlockMeta.deletion_vector`、Delta Lake方式の論理削除+
+> `prune_range`/`prune_equality`への配線済み)を実装。詳細は
+> `CLAUDE.md`の同日HANDOFF(続き13〜18)参照。
+>
 > **2026-07-25 更新**: 開発方針ファイル(`CLAUDE.md`)の見出しを
 > 「開発方針＆開発環境ルール」から「設計思想＆開発方針＆開発環境ルール」
 > へ改名しました。プロジェクトの設計思想(何を大事にしているか)・
