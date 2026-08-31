@@ -176,7 +176,8 @@
 > (parallel・follower_read)/P3 の一部(`/admin/parallel*`・`/v1/keys/self-issue`
 > 撤廃)まで完了・push 済み。**P3 本体(続き10)= `closed-timestamp`・
 > `wal-service`・`sharded-store` を GraphQL 化し該当 REST ルートを撤廃**——
-> commit 済み・push 待ち。`ephemeral-query`・`multi-raft` は trait 化リファクタ
+> commit・push 済み(`origin/main` `250956d`)、実プロセス HTTP E2E も
+> 続き11で完了。`ephemeral-query`・`multi-raft` は trait 化リファクタ
 > 待ちで次スライスへ。`git log --oneline -25` で `再設計 P1〜P3`・`付録A` の
 > コミット群を確認。
 >
@@ -211,9 +212,13 @@
 >    `Arc<dyn EphemeralRunner>`、`multi-raft` は `Arc<dyn MultiRaftHandle>`
 >    または `EngineApplier` のクレート移設。理由は `docs/CONTROL_PLANE_
 >    REDESIGN.md` §8 P3 に明記)。
-> 3. **⏳ 実プロセス HTTP E2E**(続き10 未達): 実 `aruaru-server` を起動し
->    新 GraphQL クエリ/ミューテーションを `/graphql` へ実 HTTP で叩き、旧
->    REST パス(`/admin/closed-timestamp` 等)が 404 になることも確認。
+> 3. ✅(続き11 完了)**実プロセス HTTP E2E**: 実 `aruaru-server` を起動し
+>    `closedTimestamp`/`closedTsRegisterRange`/`closedTsAdvance`・
+>    `walService`(safekeeper `1..=n` 是正の実証込み)・`shardedStorePut`/
+>    `shardedStoreGet`・`selfIssueKey` を実 `/graphql` へ実 HTTP で確認。
+>    旧 REST パス(`/admin/closed-timestamp`等)はトークン付きで `404`
+>    (真の削除、トークン無しの `401` に惑わされないこと)を確認。
+>    残置 REST(`/admin/cluster` 等)は `200` のまま(非破壊)を確認。
 > 4. **⏳ 要求③の実装トラック**: 付録 A.6-2「Raft-Learner 上の 行→列 非同期
 >    変換レプリカ(`ColumnarApplier`)」が本命。A.6-1 HLC、A.6-4 deletion
 >    vector も。`aruaru.yaml: htap` セクション(§5・A.7)を先に足す。
@@ -4982,3 +4987,54 @@ GraphQL だけで完結〉、aruaru-server 13)。`cargo build --release` は実�
 **次回の起点**: 本ファイル冒頭「🛑 復活用メッセージ」→ 次は
 `ephemeral-query` / `multi-raft` の trait 注入リファクタ、または A.6-2
 (Raft-Learner 行→列変換レプリカ)の着手。実プロセス HTTP E2E も残タスク。
+
+## HANDOFF追記(2026-08-31続き11) 実プロセス HTTP E2E(続き10の未達事項)を完了
+
+**経緯**: 別アカウント/別セッションから復帰。`git pull`(RUNO/open-english/
+aruaru-llm/aruaru-db 全て`Already up to date`——直前セッションが既に
+`250956d`までpush済みと確認)、`PORTING.md`のチェックポイント2節と
+CLAUDE.mdの2026-08-29 HANDOFFを読み、続き10が「正直な未達事項」として
+残していた「実プロセスHTTP E2E」から着手した(トラックA=open-english/
+aruaru-llm ASRとトラックB=aruaru-db REST撤廃のうち、直前の自分自身の
+作業文脈と連続性のあるBを選択)。
+
+**実施内容**: `cargo build --release -p aruaru-server`(36秒、キャッシュ
+済みのためP3本体コミット後初回にしては高速)成功。実際に`aruaru-server`を
+起動(`--data <一時dir> --pg-port 15532 --gql-port 15080 --raft-id 1`、
+`ARUARU_DB_ADMIN_TOKEN=e2etoken`)し、以下を全て実HTTPで確認:
+
+1. **旧REST撤廃の確認(誤検知を排除)**: `/admin/closed-timestamp`・
+   `/admin/wal-service`・`/admin/sharded-store`・`/admin/parallel`への
+   トークン無しリクエストは`401`だった——これは「まだ存在する」ことの
+   証明ではなく、`/admin/*`全体を包む認証ミドルウェアがルート未マッチの
+   404より先に認証チェックを行うために起きる見かけ上の結果だと気づき、
+   **正しいトークン付きで再検証**したところ全て`404`(真の削除)を確認。
+   一方`/admin/cluster`・`/admin/federation`・`/admin/backup`(削除対象
+   外)はトークン付きで`200`を確認——削除・残置の両方が意図通りである
+   ことを実証した。
+2. **新GraphQLフィールドの実データ動作確認**: `POST /graphql`へ実際に
+   `closedTimestamp`(query)→`closedTsRegisterRange`→`closedTsAdvance`
+   (mutation、`nowNanos: "10000000000"`→`closedTimestamp: "7000000000"`
+   が返る、target_lag=3秒の減算が正しく効いている)、`walService`
+   (query、`quorum: 2`・3台のsafekeeperの`flushLsn`、旧REST版が
+   取りこぼしていた1台目分も正しく`id: 1`から列挙されることを確認
+   ——続き10で修正した`0..n`→`1..=n`のoff-by-one是正の実証)、
+   `shardedStorePut`→`shardedStoreGet`(`key: "alpha"`→`shardId: 29`で
+   両呼び出しが一致、murmur3ルーティングの決定性を実証)を実行し、
+   いずれも期待通りの実データが返ることを確認。
+3. **`selfIssueKey`(P2続き8で撤廃した`POST /v1/keys/self-issue`の
+   GraphQL版)も無認証で実際にキーが発行される**ことを確認
+   (`adb_`プレフィックス付きキー、`role: "viewer"`、`expiresInHours: 24`)。
+4. サーバーログ(`tracing::json`)にエラー・パニックが一切無いことを
+   確認した上でプロセス終了・一時データディレクトリ削除。
+
+**正直な開示**: (a) これは単一プロセス・単一ノード構成での検証であり、
+複数ノードクラスタでの`closed-timestamp`のside transport(`/receive`・
+`/publish`、B4として意図的に残置されているREST)の実ネットワーク越し
+検証は今回のスコープ外。(b) `ephemeral-query`・`multi-raft`はまだREST
+のままのため、この2つのE2E確認は該当なし(次スライスで着手後に実施)。
+
+**次回の起点**: 「🛑 復活用メッセージ」の「次にやること」項目3
+(実プロセスHTTP E2E)を完了としてチェックを付ける。次は項目2
+(`ephemeral-query`/`multi-raft`のtrait注入リファクタ)または項目4
+(A.6-2 `ColumnarApplier`)に進むこと。
