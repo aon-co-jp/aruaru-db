@@ -84,6 +84,15 @@ pub struct AdminCtx {
     /// `shardedStoreGet`/`shardedStoreStats` query と `shardedStorePut`
     /// mutation が唯一の経路。
     pub sharded_store: Option<Arc<aruaru_query::sharded_store::ShardedRowStore<String>>>,
+    /// 【2026-08-31 trait注入リファクタ】ephemeral SQL pod
+    /// (`aruaru_dist::ephemeral::EphemeralRunner`)。実体
+    /// (`ProcessEphemeralRunner`、`current_exe()`で自プロセスを再起動する
+    /// `aruaru-server`バイナリ固有処理)は`aruaru-server`側にあるが、
+    /// `aruaru-graphql`はtrait経由でのみ参照する(`ReplicatedWriter`と
+    /// 同じ「実装はサーバー側、trait定義は共有クレート」パターン)。
+    /// 旧 REST `POST /admin/ephemeral-query` は削除済みで、
+    /// `Mutation.ephemeralQuery`が唯一の経路。
+    pub ephemeral: Option<Arc<dyn aruaru_dist::ephemeral::EphemeralRunner>>,
 }
 
 /// UNIX epoch からの現在時刻(論理ナノ秒)。closed timestamp の `now` 既定値。
@@ -1402,6 +1411,55 @@ impl AdminMutation {
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(ShardedStorePutResultGql { key, shard_id })
     }
+
+    // ── ephemeral SQL pod ────────────────────────────────────
+
+    /// 旧 REST `POST /admin/ephemeral-query`の等価。指定テナントの
+    /// テーブルを現在の状態からスナップショットし、`EphemeralRunner`
+    /// (実体は`aruaru-server::ephemeral_pod::ProcessEphemeralRunner`、
+    /// 独立子プロセスを起動してSQLを1回実行させ即終了する)へ委譲する。
+    /// 書き込みは子プロセスのメモリ上でのみ完結し親の永続状態には
+    /// 反映されない(既存の制約を継承、ephemeral_pod.rsのdoc参照)。
+    async fn ephemeral_query(
+        &self,
+        ctx: &Context<'_>,
+        tenant_id: String,
+        tables: Vec<String>,
+        sql: String,
+    ) -> Result<EphemeralQueryResultGql> {
+        let a = admin(ctx)?;
+        let Some(runner) = &a.ephemeral else {
+            return Ok(EphemeralQueryResultGql {
+                success: false,
+                tenant_id,
+                result: None,
+                error: None,
+                message: Some("ephemeral runner is not configured".into()),
+            });
+        };
+        let snapshot = aruaru_dist::ephemeral::snapshot_for_tenant(&a.engine, &tables);
+        let request = aruaru_dist::ephemeral::EphemeralRequest {
+            tenant_id: tenant_id.clone(),
+            tables: snapshot,
+            sql,
+        };
+        match runner.run(&request).await {
+            Ok(resp) => Ok(EphemeralQueryResultGql {
+                success: resp.ok,
+                tenant_id,
+                result: resp.result.map(crate::response_to_gql),
+                error: resp.error,
+                message: None,
+            }),
+            Err(e) => Ok(EphemeralQueryResultGql {
+                success: false,
+                tenant_id,
+                result: None,
+                error: None,
+                message: Some(format!("ephemeral worker process failed: {e}")),
+            }),
+        }
+    }
 }
 
 // ── 共通ヘルパ ────────────────────────────────────────────────
@@ -1536,6 +1594,34 @@ mod cluster_propose_tests {
                 aruaru_dist::DEFAULT_MAX_REPLICATION_LAG,
             ))),
             sharded_store: Some(Arc::new(aruaru_query::sharded_store::ShardedRowStore::new(2))),
+            ephemeral: Some(Arc::new(TestEphemeralRunner)),
+        }
+    }
+
+    /// テスト専用の`EphemeralRunner`実装——実プロセス起動
+    /// (`current_exe()`+`Command`)はこのクレート(`aruaru-graphql`)からは
+    /// 検証できない(実体は`aruaru-server::ephemeral_pod::
+    /// ProcessEphemeralRunner`で別クレート)ため、代わりに「子プロセスが
+    /// 行うのと同じ処理(受け取ったテーブルでインメモリQueryEngineを
+    /// 構築しSQLを1回実行する)」をこのプロセス内で直接行う——resolver
+    /// 側の配線(スナップショット構築→trait呼び出し→結果のGraphQL変換)を
+    /// 実データで検証できる。
+    struct TestEphemeralRunner;
+
+    #[async_trait::async_trait]
+    impl aruaru_dist::ephemeral::EphemeralRunner for TestEphemeralRunner {
+        async fn run(
+            &self,
+            request: &aruaru_dist::ephemeral::EphemeralRequest,
+        ) -> anyhow::Result<aruaru_dist::ephemeral::EphemeralResponse> {
+            let engine = QueryEngine::new();
+            for t in &request.tables {
+                engine.ingest_table(&t.name, t.columns.clone(), t.rows.clone());
+            }
+            Ok(match engine.execute(&request.sql) {
+                Ok(result) => aruaru_dist::ephemeral::EphemeralResponse { ok: true, result: Some(result), error: None },
+                Err(e) => aruaru_dist::ephemeral::EphemeralResponse { ok: false, result: None, error: Some(e) },
+            })
         }
     }
 
@@ -2175,5 +2261,46 @@ mod cluster_propose_tests {
         let st = resp.data.into_json().unwrap();
         assert_eq!(st["shardedStoreStats"]["shardCount"], 2);
         assert_eq!(st["shardedStoreStats"]["totalLen"], 1);
+    }
+
+    /// 【2026-08-31追加】旧 REST `POST /admin/ephemeral-query`の等価
+    /// (`Mutation.ephemeralQuery`)が、trait経由(`TestEphemeralRunner`)で
+    /// 実際に現在のテーブル状態をスナップショットし、SQLを実行して
+    /// 結果を返すことを検証する。
+    #[tokio::test]
+    async fn ephemeral_query_snapshots_current_tables_and_runs_sql_via_the_trait() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        engine.execute("CREATE TABLE items (id INT PRIMARY KEY, qty INT)").unwrap();
+        engine.execute("INSERT INTO items (id, qty) VALUES (1, 10)").unwrap();
+        let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), None));
+
+        let resp = schema
+            .execute(authorized_request(
+                r#"mutation { ephemeralQuery(tenantId: "t1", tables: ["items"], sql: "SELECT * FROM items") { success tenantId error message } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "GraphQL errors: {:?}", resp.errors);
+        let data = resp.data.into_json().unwrap();
+        let result = &data["ephemeralQuery"];
+        assert_eq!(result["success"], true, "result: {result:?}");
+        assert_eq!(result["tenantId"], "t1");
+        assert!(result["message"].is_null(), "worker should not have failed to start: {result:?}");
+
+        // ephemeral 未設定(トレイト未注入)の場合は正直に message で失敗を返す。
+        let mut ctx_without_runner = admin_ctx(engine.clone(), None);
+        ctx_without_runner.ephemeral = None;
+        let schema2 = build_schema(engine.clone(), ctx_without_runner);
+        let resp2 = schema2
+            .execute(authorized_request(
+                r#"mutation { ephemeralQuery(tenantId: "t2", tables: [], sql: "SELECT 1") { success message } }"#,
+            ))
+            .await;
+        assert!(resp2.errors.is_empty(), "GraphQL errors: {:?}", resp2.errors);
+        let data2 = resp2.data.into_json().unwrap();
+        assert_eq!(data2["ephemeralQuery"]["success"], false);
+        assert!(data2["ephemeralQuery"]["message"].as_str().unwrap().contains("not configured"));
     }
 }

@@ -7,6 +7,14 @@ license.workspace = true
 
 [dependencies]
 aruaru-core  = { path = "../aruaru-core" }
+# ephemeral SQL pod(`ephemeral.rs`)の `EphemeralResponse.result` が
+# `aruaru_query::QueryResponse` を、`snapshot_for_tenant` が
+# `aruaru_query::QueryEngine` を必要とするため追加(2026-08-31、
+# `aruaru-graphql`/`aruaru-server` 両方が本クレート経由でこの型・trait を
+# 共有するための移設、`admin_shared.rs`/`keyring.rs` と同じパターン)。
+# 循環依存にならないことを確認済み(`aruaru-query`/`aruaru-core`は
+# `aruaru-dist`に依存しない)。
+aruaru-query = { path = "../aruaru-query" }
 openraft      = { workspace = true }
 tokio.workspace = true
 serde.workspace = true

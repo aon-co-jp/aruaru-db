@@ -459,10 +459,11 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         .at("/cluster/node", post(cluster_node))
         .at("/cluster/rebalance", post(cluster_rebalance))
         .at("/cluster/propose", post(cluster_propose))
-        // 【2026-08-21新設】ephemeral SQL pod (計算資源の使い捨てプロセス分離)
-        // 【2026-08-29(続き10)】GraphQL 化は trait 注入リファクタが必要な
-        // 別スライス(`docs/CONTROL_PLANE_REDESIGN.md` §8 P3 参照)。
-        .at("/ephemeral-query", post(ephemeral_query))
+        // 【2026-08-31 REST完全撤廃】ephemeral SQL pod は `EphemeralRunner`
+        // trait注入(`aruaru_dist::ephemeral`)によりGraphQL
+        // `Mutation.ephemeralQuery`へ移行済み(`admin_shared.rs`/
+        // `keyring.rs`と同じ「trait/型を共有クレートへ移設」パターンで
+        // trait注入の壁を解消した)。旧 `POST /ephemeral-query` は撤廃。
         // 【2026-08-21新設・実配線】Vitess Reshard(併合)+ VTGate scatter-gather
         // 【2026-08-29(続き10)】同上、`MultiRaftCluster<EngineApplier>` の
         // trait object 化が必要な別スライス。
@@ -1117,47 +1118,12 @@ fn multi_raft_scatter_query(state: Data<&Arc<AdminState>>) -> Json<Value> {
 // `AdminCtx` へ注入する。GraphQL 側も同じく mpsc ブロッキング recv を
 // `spawn_blocking` で退避している。
 
-/// 【2026-08-21新設・ephemeral SQL pod化】指定テナントのテーブルを
-/// 独立した子プロセス(`--ephemeral-worker`)へスナップショットとして渡し、
-/// その子プロセス内だけで SQL を1回実行させる。子プロセスは応答後に必ず
-/// 終了する(`crate::ephemeral_pod::run_ephemeral_query`のdoc参照)。
-/// 書き込みは子プロセスのインメモリ上でのみ完結し、親プロセスの永続状態
-/// (fjall)には反映されない(意図的な制約、ephemeral_pod.rsのdoc参照)。
-#[derive(Debug, Deserialize)]
-struct EphemeralQueryRequest {
-    tenant_id: String,
-    /// 子プロセスへ渡すテーブル名一覧(親プロセスの現在の状態から
-    /// スナップショットして渡す)。
-    tables: Vec<String>,
-    sql: String,
-}
-
-#[handler]
-async fn ephemeral_query(
-    state: Data<&Arc<AdminState>>,
-    Json(req): Json<EphemeralQueryRequest>,
-) -> Json<Value> {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => return Json(json!({ "success": false, "message": format!("current_exe() failed: {e}") })),
-    };
-    let tables = crate::ephemeral_pod::snapshot_for_tenant(&state.engine, &req.tables);
-    let ephemeral_req = crate::ephemeral_pod::EphemeralRequest {
-        tenant_id: req.tenant_id.clone(),
-        tables,
-        sql: req.sql,
-    };
-    match crate::ephemeral_pod::run_ephemeral_query(&exe, &ephemeral_req).await {
-        Ok(resp) => Json(json!({
-            "success": resp.ok,
-            "tenant_id": req.tenant_id,
-            "result": resp.result,
-            "error": resp.error,
-            "mode": "ephemeral_process",
-        })),
-        Err(e) => Json(json!({ "success": false, "message": format!("ephemeral worker process failed: {e}") })),
-    }
-}
+// 【2026-08-31 REST完全撤廃】旧 `EphemeralQueryRequest`/`ephemeral_query`
+// (REST `POST /admin/ephemeral-query`)はGraphQL `Mutation.ephemeralQuery`
+// (`aruaru-graphql::admin_resolvers`)へ完全移行。実体
+// (`ProcessEphemeralRunner`)は`crate::ephemeral_pod`のまま、
+// `AdminCtx.ephemeral`(`Arc<dyn aruaru_dist::ephemeral::EphemeralRunner>`)
+// として注入する。
 
 // ── 対応DBレジストリ (150+件) ───────────────────────────────────
 

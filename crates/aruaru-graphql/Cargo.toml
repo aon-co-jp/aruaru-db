@@ -33,3 +33,6 @@ tokio = { workspace = true, features = ["rt"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 uuid.workspace             = true
+# ephemeralQuery resolverのテスト専用`EphemeralRunner`実装向け
+# (2026-08-31新設、`aruaru-dist`と同じバージョン)。
+async-trait = "0.1"

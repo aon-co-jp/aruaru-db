@@ -45,59 +45,20 @@
 //! 3. 複数物理マシンをまたぐ真のスケジューリング(Kubernetes pod 相当)
 //!    はこの環境では検証不可能 — 単一マシン上の複数プロセスとしての
 //!    検証に留まる。
+//!
+//! 【2026-08-31 移設】型定義(`EphemeralTable`/`EphemeralRequest`/
+//! `EphemeralResponse`)と`snapshot_for_tenant`は`aruaru_dist::ephemeral`
+//! へ移設した(REST/GraphQL両方が参照できるようにするため、
+//! `admin_shared.rs`/`keyring.rs`と同じ理由)。このファイルには
+//! `aruaru-server`バイナリ固有の処理(実プロセス起動・子プロセス
+//! エントリポイント)のみ残す。
 
 use std::io::Write as _;
 use std::process::Stdio;
 
-use aruaru_core::catalog::ColumnType;
-use aruaru_query::QueryResponse;
-use serde::{Deserialize, Serialize};
+use aruaru_dist::ephemeral::{EphemeralRequest, EphemeralResponse, EphemeralRunner};
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
-
-/// 子プロセスへ渡すテーブルスナップショット (列名は TEXT 型として単純化)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EphemeralTable {
-    pub name: String,
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<String>>,
-}
-
-/// 親→子 (標準入力) リクエスト
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EphemeralRequest {
-    pub tenant_id: String,
-    pub tables: Vec<EphemeralTable>,
-    pub sql: String,
-}
-
-/// 子→親 (標準出力) レスポンス
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EphemeralResponse {
-    pub ok: bool,
-    pub result: Option<QueryResponse>,
-    pub error: Option<String>,
-}
-
-/// 【親プロセス側】現在のテーブル群のスナップショットを、指定テナントの
-/// ephemeral pod で実行するために使いやすい形へ変換する。
-pub fn snapshot_for_tenant(
-    engine: &aruaru_query::QueryEngine,
-    table_names: &[String],
-) -> Vec<EphemeralTable> {
-    table_names
-        .iter()
-        .filter_map(|name| {
-            let (cols, _pks, rows) = engine.snapshot_table(name)?;
-            let columns: Vec<String> = cols.into_iter().map(|(n, _t): (String, ColumnType)| n).collect();
-            Some(EphemeralTable {
-                name: name.clone(),
-                columns,
-                rows,
-            })
-        })
-        .collect()
-}
 
 /// 【親プロセス側】ephemeral SQL pod を実際に子プロセスとして起動し、
 /// SQL を1回実行させて結果を受け取る。子プロセスは応答後に必ず終了する
@@ -137,6 +98,29 @@ pub async fn run_ephemeral_query(
     Ok(resp)
 }
 
+/// 【2026-08-31新設】`aruaru_dist::ephemeral::EphemeralRunner`の
+/// `aruaru-server`側実装。`AdminCtx.ephemeral`(GraphQL)・REST両方から
+/// 同じインスタンス(`current_exe()`を1回だけ解決)を共有する。
+pub struct ProcessEphemeralRunner {
+    exe_path: std::path::PathBuf,
+}
+
+impl ProcessEphemeralRunner {
+    /// `std::env::current_exe()`で自分自身の実行ファイルパスを解決する。
+    /// 失敗した場合(稀、権限やプラットフォームの制約)はエラーを返す
+    /// ——起動時に一度だけ呼び、以後は解決済みのパスを使い回す。
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self { exe_path: std::env::current_exe()? })
+    }
+}
+
+#[async_trait::async_trait]
+impl EphemeralRunner for ProcessEphemeralRunner {
+    async fn run(&self, request: &EphemeralRequest) -> anyhow::Result<EphemeralResponse> {
+        run_ephemeral_query(&self.exe_path, request).await
+    }
+}
+
 /// 【子プロセス側 (`--ephemeral-worker`)】標準入力から1件だけリクエストを
 /// 読み取り、独立したインメモリ QueryEngine 上で SQL を実行して標準出力へ
 /// 結果を書き、呼び出し元(`main.rs`)へ制御を返す。この関数が返った直後
@@ -173,8 +157,6 @@ pub fn run_worker_once() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// 実際にこの実行ファイル自身を `--ephemeral-worker` フラグ付きで
     /// 子プロセスとして起動し、標準入力/標準出力越しに実際のJSON
     /// リクエスト/レスポンスをやり取りできることを検証する。
