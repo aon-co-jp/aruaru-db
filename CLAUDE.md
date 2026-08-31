@@ -5184,3 +5184,58 @@ cluster::EngineApplier>`は`aruaru-server`側のジェネリック具体型で�
 (付録A.6-2「Raft-Learner上の行→列非同期変換レプリカ
 (`ColumnarApplier`)」が本命、A.6-1 HLC・A.6-4 deletion vectorも。
 `aruaru.yaml: htap`セクション(§5・A.7)を先に足すこと)。
+
+## HANDOFF追記(2026-08-31続き14) 要求③実装トラック着手: A.6-1 HLC実装完了
+
+**位置づけ**: P3本体(続き13)完了を受け、次の優先項目である要求③
+(CockroachDB×Snowflakeハイブリッド変種の実装理論取り込み)の実装
+トラックへ着手。付録A.6-1〜A.6-4のうち、他の3項目(A.6-2
+`ColumnarApplier`・A.6-3 SI検証・A.6-4 deletion vector)の前提となる
+最小単位である**A.6-1 HLC(Hybrid Logical Clock)**から着手した
+(他項目は既存タイムスタンプ源の差し替えを伴うため、まずHLC自体を
+単体で正しく動く形にしてから配線するのが手戻りが少ないと判断)。
+
+**実装**: `crates/aruaru-dist/src/hlc.rs`(新規)。
+- `HlcTimestamp { pt: u64, l: u32 }`(物理成分+論理成分)。
+- `Hlc`本体は`AtomicU64`1個に`pt`(上位)・`l`(下位16bit)をパックして
+  保持し、`now()`/`update()`をCAS(compare-and-swap)ループで実装
+  ——`parking_lot::Mutex`を使わないロックフリー設計(複数スレッドから
+  同時に呼ばれても正しく単調増加することをテストで実証)。
+- `now(wall_now_nanos)`: 論文/CockroachDB `hlc.go`と同じアルゴリズム
+  (`pt' = max(pt, wall_now)`、`pt'==pt`なら`l++`、そうでなければ`l=0`)。
+  壁時計を引数として受け取る設計(`SystemTime::now()`を直接呼ばない)
+  にしたことで、決定的なテストが書けるようにした。
+- `update(remote, wall_now_nanos)`: リモートから受信したHLCと自クロック
+  を統合(`pt`はローカル・リモート・壁時計の最大値、`l`はどれが採用
+  されたかに応じて単調増加を保証)。
+- `as_nanos()`: 既存の`closed_ts`/`wal_service`/`multi_raft`が受け取る
+  「論理ナノ秒(u64)」形式へエンコードする変換メソッド——既存APIの
+  型シグネチャを変更せずに、HLCタイムスタンプをそのまま渡せるように
+  するための橋渡し(`pt`を16bit左シフトし`l`を下位へ詰める)。
+
+**正直な簡略化点(誇張しない)**:
+1. **クロックスキュー上限は未実装**——CockroachDBの`max_offset`
+   (許容できるノード間時計ズレの上限を超えたら操作を拒否する安全弁)
+   に相当する仕組みは無く、`update()`は常に受理する。
+2. **ネットワーク越しの実際のHLC伝播は本モジュール単体では提供しない**
+   ——「送信時に相乗り・受信時にupdate」という配線は、
+   `raft/transport.rs`等の呼び出し側が明示的に行う必要がある(今回は
+   未実施)。
+3. **`closed_ts`/`wal_service`/`multi_raft`への実配線は未実施**
+   ——これらは引き続き「呼び出し側が論理ナノ秒を渡す」既存の設計の
+   ままで、`Hlc::now().as_nanos()`をその呼び出し元に代入する変更は
+   次回以降(A.6-3のSI検証と合わせて設計するのが自然)。
+
+**検証(実測)**: `cargo test -p aruaru-dist hlc` → **9 passed / 0
+failed**(壁時計前進時の`pt`更新・論理カウンタのインクリメント・
+繰り返し呼び出しでの単調性・リモート優位/ローカル優位/壁時計優位の
+3パターン全ての`update()`結果・8スレッド×200回の並行呼び出しで
+重複タイムスタンプが1件も発生しないことを直接検証)。
+`cargo build --workspace` → 成功(既存の`build_cluster`/
+`propose_commit`未使用警告2件のみ、無関係)。
+
+**次回の起点**: 「🛑 復活用メッセージ」項目4の続き=A.6-2
+`ColumnarApplier`(Raft-Learner上の行→列非同期変換レプリカ、本命)、
+または今回実装したHLCを`closed_ts`/`wal_service`/`multi_raft`の
+タイムスタンプ源へ実際に配線する作業。`aruaru.yaml: htap`セクション
+(§5・A.7)の実装も未着手のまま。
