@@ -82,25 +82,35 @@ pub struct AdminState {
     /// `POST /admin/multi-raft/merge`・`GET /admin/multi-raft/scatter-query`
     /// から実際に呼び出せる。
     multi_raft: Mutex<Option<Arc<aruaru_dist::MultiRaftCluster<crate::cluster::EngineApplier>>>>,
-    /// 【2026-08-21新設・ScyllaDB shard-per-coreストアの実配線】
+    /// 【2026-08-21新設・ScyllaDB shard-per-coreストアの実配線 /
+    /// 2026-08-29(続き10)RESTルート撤廃】
     /// `aruaru-query::sharded_store::ShardedRowStore<String>`を実際に
     /// 保持する。既存の`QueryEngine::tables`(`parking_lot::RwLock`)を
     /// 置き換えるのはRaft/Prolly Tree/OLAPキャッシュ全体への影響が大きい
-    /// ため見送り、`POST /admin/sharded-store`・`GET
-    /// /admin/sharded-store/{key}`という**オプトインの独立ストレージ経路**
-    /// として公開する(ユーザー指示「無理のない方を選んでよい」に基づく
-    /// 選択)。値は文字列固定(JSON文字列をそのまま保持、`ShardedRowStore<V>`
-    /// の型パラメータを固定した最小構成)。
-    sharded_store: aruaru_query::sharded_store::ShardedRowStore<String>,
-    /// 【2026-08-24新設・橋渡し】CockroachDB方式のclosed timestamp
-    /// (`aruaru-dist::closed_ts`)。2026-08-21に実装されたが管理APIへ
-    /// 未接続のままだったものを、`/admin/closed-timestamp/*`として公開する。
-    /// 既存のSQL実行経路(pgwire/GraphQL)の読み取り判定そのものを
-    /// 置き換えるものではなく、**follower readを行ってよいかの判定を
-    /// 外部から実際に問い合わせられるようにする**オプトインの経路。
+    /// ため見送り、独立ストレージとして公開する。かつては
+    /// `/admin/sharded-store*`のRESTでも公開していたが、GraphQL
+    /// `shardedStoreGet`/`shardedStoreStats` query・`shardedStorePut`
+    /// mutationへ完全移行し、RESTルートは削除した。この`Arc`は
+    /// `sharded_store_handle()`経由でGraphQL(`AdminCtx.sharded_store`)へ
+    /// 注入するためだけに残す。値は文字列固定。
+    sharded_store: Arc<aruaru_query::sharded_store::ShardedRowStore<String>>,
+    /// 【2026-08-24新設・橋渡し / 2026-08-29(続き10)RESTルート撤廃】
+    /// CockroachDB方式のclosed timestamp(`aruaru-dist::closed_ts`)。
+    /// 旧 REST `GET /admin/closed-timestamp`(status)・`/range`・`/advance`・
+    /// `/plan` は削除し、GraphQL `closedTimestamp`/`planFollowerRead` query・
+    /// `closedTsRegisterRange`/`closedTsAdvance` mutation へ完全移行した。
+    /// ノード間 side transport の受信(`/receive`)・配布トリガー
+    /// (`/publish`)は B4 として残る(受信の実体は `binary_transport.rs` の
+    /// バイナリ経路。`/publish` は「いつ誰に配布するか」を人間が指示する
+    /// 制御面のため P4 で再検討)。`closed_ts_coordinator()` で GraphQL
+    /// (`AdminCtx.closed_ts`)へ同一インスタンスを注入する。
     closed_ts: Arc<aruaru_dist::ClosedTimestampCoordinator>,
-    /// 【2026-08-24新設・橋渡し】Neon方式のsafekeeper/pageserver分離
-    /// (`aruaru-dist::wal_service`)。`/admin/wal-service/*`として公開。
+    /// 【2026-08-24新設・橋渡し / 2026-08-29(続き10)RESTルート撤廃】Neon方式の
+    /// safekeeper/pageserver分離(`aruaru-dist::wal_service`)。旧 REST
+    /// `GET /admin/wal-service`・`/append`・`/page`・`/image-layer` は削除し、
+    /// GraphQL `walService`/`walPage` query・`walAppend`/`walCreateImageLayer`
+    /// mutation へ完全移行した。`wal_storage_handle()` で GraphQL
+    /// (`AdminCtx.wal_storage`)へ同一インスタンスを注入する。
     wal_storage: Arc<aruaru_dist::DisaggregatedStorage>,
     /// 【2026-08-24新設・橋渡し / 2026-08-29(続き3)RESTルート撤廃】Databend
     /// 方式のオブジェクトストレージ直結テーブルフォーマット
@@ -137,7 +147,7 @@ impl AdminState {
             multi_raft: Mutex::new(None),
             // shard_count=0 -> このマシンの論理コア数を自動採用
             // (ScyllaDBの既定「コア数と同数のシャード」を踏襲、`sharded_store.rs`docコメント参照)。
-            sharded_store: aruaru_query::sharded_store::ShardedRowStore::new(0),
+            sharded_store: Arc::new(aruaru_query::sharded_store::ShardedRowStore::new(0)),
             closed_ts: Arc::new(aruaru_dist::ClosedTimestampCoordinator::with_default_lag()),
             // safekeeper 3台 (quorum=2) の既定構成。
             wal_storage: Arc::new(aruaru_dist::DisaggregatedStorage::new(
@@ -225,6 +235,22 @@ impl AdminState {
     /// `objectTablePrune` mutation)——RESTルートは撤廃済み。
     pub fn object_table_handle(&self) -> Arc<aruaru_backup::table_format::ObjectTable> {
         self.object_table.clone()
+    }
+
+    /// 【2026-08-29(続き10)新設】GraphQL側(`AdminCtx.wal_storage`)へ Neon 方式
+    /// safekeeper/pageserver 分離ストレージ(`aruaru_dist::DisaggregatedStorage`)
+    /// を注入するためのアクセサ。`walService`/`walPage` query・`walAppend`/
+    /// `walCreateImageLayer` mutation が唯一の経路(REST ルートは撤廃済み)。
+    pub fn wal_storage_handle(&self) -> Arc<aruaru_dist::DisaggregatedStorage> {
+        self.wal_storage.clone()
+    }
+
+    /// 【2026-08-29(続き10)新設】GraphQL側(`AdminCtx.sharded_store`)へ
+    /// ScyllaDB shard-per-core ストア(`ShardedRowStore<String>`)を注入する
+    /// ためのアクセサ。`shardedStoreGet`/`shardedStoreStats` query・
+    /// `shardedStorePut` mutation が唯一の経路(REST ルートは撤廃済み)。
+    pub fn sharded_store_handle(&self) -> Arc<aruaru_query::sharded_store::ShardedRowStore<String>> {
+        self.sharded_store.clone()
     }
 }
 
@@ -434,32 +460,31 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         .at("/cluster/rebalance", post(cluster_rebalance))
         .at("/cluster/propose", post(cluster_propose))
         // 【2026-08-21新設】ephemeral SQL pod (計算資源の使い捨てプロセス分離)
+        // 【2026-08-29(続き10)】GraphQL 化は trait 注入リファクタが必要な
+        // 別スライス(`docs/CONTROL_PLANE_REDESIGN.md` §8 P3 参照)。
         .at("/ephemeral-query", post(ephemeral_query))
         // 【2026-08-21新設・実配線】Vitess Reshard(併合)+ VTGate scatter-gather
+        // 【2026-08-29(続き10)】同上、`MultiRaftCluster<EngineApplier>` の
+        // trait object 化が必要な別スライス。
         .at("/multi-raft/split", post(multi_raft_split))
         .at("/multi-raft/merge", post(multi_raft_merge))
         .at("/multi-raft/scatter-query", get(multi_raft_scatter_query))
-        // 【2026-08-21新設・実配線】ScyllaDB shard-per-coreストア
-        .at("/sharded-store", post(sharded_store_put))
-        .at("/sharded-store/:key", get(sharded_store_get))
-        .at("/sharded-store-stats", get(sharded_store_stats))
-        // 【2026-08-24新設・橋渡し】closed timestamp / WALサービス /
-        // オブジェクトテーブルを実プロセスのHTTPから叩けるようにする。
-        .at("/closed-timestamp", get(closed_ts_status))
-        .at("/closed-timestamp/range", post(closed_ts_register))
-        .at("/closed-timestamp/advance", post(closed_ts_advance))
-        .at("/closed-timestamp/plan", post(closed_ts_plan))
-        // 【2026-08-24新設・タスク2】side transportのネットワーク越し配線
-        // (`aruaru_dist::raft::transport::HttpSideTransport`)。受信側
-        // (このエンドポイント)は他ノードから届いた closed timestamp
-        // 更新を取り込む。送信側は`/closed-timestamp/publish`でこの
-        // エンドポイントへ実際にHTTP POSTする。
+        // 【2026-08-29(続き10)REST完全撤廃】ScyllaDB shard-per-coreストアの
+        // 3操作(put/get/stats)は GraphQL `shardedStorePut` mutation・
+        // `shardedStoreGet`/`shardedStoreStats` query へ完全移行済み。
+        //
+        // 【2026-08-29(続き10)REST完全撤廃】closed timestamp の status/range/
+        // advance/plan も GraphQL `closedTimestamp`/`planFollowerRead` query・
+        // `closedTsRegisterRange`/`closedTsAdvance` mutation へ完全移行済み。
+        // ノード間 side transport の受信(`/receive`)・配布トリガー
+        // (`/publish`、いつ誰に配布するかを人間が指示する制御面)は B4 として
+        // 残置——受信の実体は既に `binary_transport.rs` のバイナリ経路。
         .at("/closed-timestamp/receive", post(closed_ts_receive))
         .at("/closed-timestamp/publish", post(closed_ts_publish))
-        .at("/wal-service", get(wal_service_status))
-        .at("/wal-service/append", post(wal_service_append))
-        .at("/wal-service/page", post(wal_service_page))
-        .at("/wal-service/image-layer", post(wal_service_image_layer))
+        // 【2026-08-29(続き10)REST完全撤廃】WAL サービス(status/append/page/
+        // image-layer)は GraphQL `walService`/`walPage` query・`walAppend`/
+        // `walCreateImageLayer` mutation へ完全移行済み。
+        //
         // 【2026-08-29(続き3)REST完全撤廃】object-table の3操作(status/
         // commit/prune)はGraphQL `objectTable` query / `objectTableCommit`
         // ・`objectTablePrune` mutationへ完全移行済み(REST→GraphQL段階
@@ -1084,64 +1109,13 @@ fn multi_raft_scatter_query(state: Data<&Arc<AdminState>>) -> Json<Value> {
     Json(json!({ "success": true, "range_count": ranges.len(), "ranges": ranges }))
 }
 
-// ── ScyllaDB shard-per-coreストアの実配線(2026-08-21) ──────────────
-//
-// `AdminState::sharded_store`(`ShardedRowStore<String>`)へ実際に
-// HTTP経由で読み書きする。専用シャードスレッドとの通信は`std::sync::
-// mpsc`のみ(`sharded_store.rs`のdocコメント参照)——このハンドラ自体は
-// tokioの非同期タスク上で動くが、`mpsc::Receiver::recv()`はブロッキング
-// なので`tokio::task::spawn_blocking`で包み、tokioワーカースレッドを
-// 占有しないようにする。
-
-#[derive(Debug, Deserialize)]
-struct ShardedStorePutRequest {
-    key: String,
-    value: String,
-}
-
-/// `POST /admin/sharded-store` — 指定キーをShardedRowStoreへ書き込む。
-/// 実際にキーのSHA-256から担当シャードを決定し、そのシャード専用スレッド
-/// (`std::sync::mpsc`経由)へ値を送って書き込む。
-#[handler]
-async fn sharded_store_put(state: Data<&Arc<AdminState>>, Json(req): Json<ShardedStorePutRequest>) -> Json<Value> {
-    let state = state.0.clone();
-    let shard_id = state.sharded_store.shard_for(req.key.as_bytes());
-    tokio::task::spawn_blocking(move || {
-        state.sharded_store.put(req.key.clone().into_bytes(), req.value.clone());
-        json!({ "success": true, "key": req.key, "shard_id": shard_id })
-    })
-    .await
-    .map(Json)
-    .unwrap_or_else(|e| Json(json!({ "success": false, "message": e.to_string() })))
-}
-
-/// `GET /admin/sharded-store/{key}` — 指定キーをShardedRowStoreから読む。
-#[handler]
-async fn sharded_store_get(state: Data<&Arc<AdminState>>, poem::web::Path(key): poem::web::Path<String>) -> Json<Value> {
-    let state = state.0.clone();
-    let shard_id = state.sharded_store.shard_for(key.as_bytes());
-    let key_for_get = key.clone();
-    let value = tokio::task::spawn_blocking(move || state.sharded_store.get(key_for_get.as_bytes()))
-        .await
-        .unwrap_or(None);
-    Json(json!({ "success": true, "key": key, "shard_id": shard_id, "found": value.is_some(), "value": value }))
-}
-
-/// `GET /admin/sharded-store-stats` — 各シャードのエントリ数(ScyllaDBの
-/// "hot shard"検知に相当する観測用エンドポイント)を返す。
-#[handler]
-async fn sharded_store_stats(state: Data<&Arc<AdminState>>) -> Json<Value> {
-    let state = state.0.clone();
-    tokio::task::spawn_blocking(move || {
-        let shard_count = state.sharded_store.shard_count();
-        let per_shard: Vec<usize> = (0..shard_count).map(|i| state.sharded_store.shard_len(i)).collect();
-        let total: usize = per_shard.iter().sum();
-        json!({ "success": true, "shard_count": shard_count, "per_shard_len": per_shard, "total_len": total })
-    })
-    .await
-    .map(Json)
-    .unwrap_or_else(|e| Json(json!({ "success": false, "message": e.to_string() })))
-}
+// 【2026-08-29(続き10)REST完全撤廃】ScyllaDB shard-per-core ストアの
+// put/get/stats は GraphQL `shardedStorePut` mutation・`shardedStoreGet`/
+// `shardedStoreStats` query(`aruaru-graphql::admin_resolvers`)へ完全移行。
+// 共有インスタンスは `AdminState.sharded_store`
+// (`ShardedRowStore<String>`)のまま、`sharded_store_handle()` で
+// `AdminCtx` へ注入する。GraphQL 側も同じく mpsc ブロッキング recv を
+// `spawn_blocking` で退避している。
 
 /// 【2026-08-21新設・ephemeral SQL pod化】指定テナントのテーブルを
 /// 独立した子プロセス(`--ephemeral-worker`)へスナップショットとして渡し、
@@ -1317,161 +1291,18 @@ async fn verify_disaster_email_backup(req: &Request, state: Data<&Arc<AdminState
     }
 }
 
-// ── 【2026-08-24新設】closed timestamp / WALサービス / オブジェクト
-//    テーブルの実経路への橋渡し ──────────────────────────────────
+// ── closed timestamp: ノード間 side transport の受信/配布トリガー ──
 //
-// 2026-08-21〜08-22に実装された3モジュール(`aruaru-dist::closed_ts`、
-// `aruaru-dist::wal_service`、`aruaru-backup::table_format`)は、
-// いずれも単体テストのみで管理APIへ未接続だった(CLAUDE.mdのHANDOFFで
-// 「橋渡しが3セッション分たまっている」と明記されていた項目)。ここで
-// `/admin/*`へ公開し、実プロセスのHTTP経由で実際に呼べるようにする。
-//
-// 既存のpgwire/GraphQL書き込み経路の判定ロジックそのものを置き換える
-// のではなく、**オプトインの独立経路**として公開する方針
-// (`multi-raft`・`sharded-store`と同じ、既存機能を壊さない方式)。
-
-#[derive(Debug, Deserialize)]
-struct ClosedTsRangeRequest {
-    range_id: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClosedTsAdvanceRequest {
-    /// 進める基準時刻(ナノ秒)。省略時は現在時刻(UNIX epoch ナノ秒)。
-    #[serde(default)]
-    now_nanos: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClosedTsPlanRequest {
-    range_ids: Vec<u64>,
-    /// `"bounded"`(既定) または `"exact"`。
-    #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
-    now_nanos: Option<u64>,
-    /// bounded では許容する最大の遅れ、exact では読み取り時刻の遡り量。
-    #[serde(default)]
-    staleness_nanos: Option<u64>,
-    /// 【2026-08-24追記】指定すると、判定(gate)だけで終わらず
-    /// `ReadPlan::FollowerRead`が許可された場合に実際に
-    /// `QueryEngine::select_follower_read`でテーブルを読み出す
-    /// (`AS OF COMMIT`と同じProlly Tree経由の読み取り経路)。
-    /// `RouteToLeaseholder`と判定された場合は読み取りを行わず理由のみ返す。
-    #[serde(default)]
-    table: Option<String>,
-    /// `WHERE col = value`のPK一致フィルタ(省略時はフルテーブルスキャン)。
-    #[serde(default)]
-    filter_col: Option<String>,
-    #[serde(default)]
-    filter_val: Option<String>,
-}
-
-fn now_nanos() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-/// `GET /admin/closed-timestamp` — 登録済みRangeごとの closed timestamp。
-#[handler]
-fn closed_ts_status(state: Data<&Arc<AdminState>>) -> Json<Value> {
-    let coord = &state.closed_ts;
-    let ranges: Vec<Value> = coord
-        .range_ids()
-        .into_iter()
-        .filter_map(|id| {
-            coord.tracker(id).map(|t| {
-                json!({
-                    "range_id": id,
-                    "closed_timestamp": t.closed_timestamp(),
-                    "lowest_in_flight": t.lowest_in_flight(),
-                    "target_lag_nanos": t.target_lag_nanos(),
-                })
-            })
-        })
-        .collect();
-    Json(json!({ "success": true, "range_count": ranges.len(), "ranges": ranges }))
-}
-
-/// `POST /admin/closed-timestamp/range` — Rangeを追跡対象として登録する。
-#[handler]
-fn closed_ts_register(state: Data<&Arc<AdminState>>, Json(req): Json<ClosedTsRangeRequest>) -> Json<Value> {
-    let tracker = state.closed_ts.register_range(req.range_id);
-    Json(json!({
-        "success": true,
-        "range_id": req.range_id,
-        "closed_timestamp": tracker.closed_timestamp(),
-    }))
-}
-
-/// `POST /admin/closed-timestamp/advance` — 全Rangeの closed timestamp を
-/// 進める(CockroachDBが定期的に行うのと同じ操作を手動で起こす)。
-#[handler]
-fn closed_ts_advance(state: Data<&Arc<AdminState>>, Json(req): Json<ClosedTsAdvanceRequest>) -> Json<Value> {
-    let now = req.now_nanos.unwrap_or_else(now_nanos);
-    let advanced = state.closed_ts.advance_all(now);
-    let entries: Vec<Value> = advanced
-        .into_iter()
-        .map(|(id, ts)| json!({ "range_id": id, "closed_timestamp": ts }))
-        .collect();
-    Json(json!({ "success": true, "now_nanos": now, "advanced": entries }))
-}
-
-/// `POST /admin/closed-timestamp/plan` — 指定Range群を follower read で
-/// 読めるかを実際に判定する。`AS OF SYSTEM TIME`相当の判断をHTTPから
-/// 確認できるようにしたもの。
-#[handler]
-fn closed_ts_plan(state: Data<&Arc<AdminState>>, Json(req): Json<ClosedTsPlanRequest>) -> Json<Value> {
-    let now = req.now_nanos.unwrap_or_else(now_nanos);
-    let staleness = req.staleness_nanos.unwrap_or(aruaru_dist::DEFAULT_MAX_STALENESS_NANOS);
-    let mode = req.mode.unwrap_or_else(|| "bounded".to_string());
-    let plan = match mode.as_str() {
-        "exact" => state.closed_ts.plan_exact_staleness_read(&req.range_ids, now, staleness),
-        _ => state.closed_ts.negotiate_bounded_staleness(&req.range_ids, now, staleness),
-    };
-    let (kind, reason) = match &plan {
-        aruaru_dist::ReadPlan::FollowerRead { .. } => ("follower_read", None),
-        aruaru_dist::ReadPlan::RouteToLeaseholder { reason } => ("route_to_leaseholder", Some(*reason)),
-    };
-
-    // 【2026-08-24追記】gate判定(上記)だけで終わらせず、`table`が指定され
-    // かつ`FollowerRead`が許可された場合は実際にデータを読み出す
-    // (`QueryEngine::select_follower_read`、`AS OF COMMIT`と同じProlly Tree
-    // 経由の読み取り経路への接続——タスク要件「FollowerReadのtimestampを
-    // 使って実際に該当する過去コミットの読み取りを行える経路」)。
-    let data = match (&plan, &req.table) {
-        (aruaru_dist::ReadPlan::FollowerRead { timestamp, .. }, Some(table)) => {
-            let filter = match (&req.filter_col, &req.filter_val) {
-                (Some(col), Some(val)) => Some((col.clone(), val.clone())),
-                _ => None,
-            };
-            // ReadPlan::Timestamp は論理ナノ秒 u64、Commit.timestamp は
-            // Unix ナノ秒 i64 — このコーディネータではテスト/管理APIから
-            // 単調増加する値が渡される前提(closed_ts.rs冒頭のスコープ注記1
-            // 参照)であり、実運用では両者とも実時刻ベースの値になるため
-            // 素直に i64 へキャストしてよい。
-            match state.engine.select_follower_read(table.clone(), filter, *timestamp as i64) {
-                Ok(resp) => Some(json!({ "ok": true, "result": resp })),
-                Err(e) => Some(json!({ "ok": false, "error": e })),
-            }
-        }
-        _ => None,
-    };
-
-    Json(json!({
-        "success": true,
-        "mode": mode,
-        "now_nanos": now,
-        "staleness_nanos": staleness,
-        "plan": kind,
-        "is_follower_read": plan.is_follower_read(),
-        "read_timestamp": plan.timestamp(),
-        "reason": reason,
-        "data": data,
-    }))
-}
+// 【2026-08-29(続き10)REST完全撤廃】status/range/advance/plan は GraphQL
+// (`closedTimestamp`/`planFollowerRead` query・`closedTsRegisterRange`/
+// `closedTsAdvance` mutation)へ完全移行し、`admin.rs` から削除した。
+// 残るのは B4(ノード間 RPC):
+// - `/closed-timestamp/receive` … 他ノード(leaseholder)から届いた
+//   closed timestamp 更新の受信。受信の実体は既に `binary_transport.rs`
+//   のバイナリ経路で、この REST は互換のための予備。
+// - `/closed-timestamp/publish` … 「いつ・誰に配布するか」を人間/運用
+//   ツールが指示する制御トリガー(データプレーンの生転送ではない)。
+//   実際の転送は `BinaryTcpSideTransport`(生 TCP)経由。P4 で再検討。
 
 #[derive(Debug, Deserialize)]
 struct ClosedTsReceiveRequest {
@@ -1568,113 +1399,9 @@ async fn closed_ts_publish(
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct WalAppendRecord {
-    page_key: String,
-    /// `"replace"`(既定)または `"append"`。
-    #[serde(default)]
-    op: Option<String>,
-    /// ページへ書く内容(UTF-8文字列として受け取る)。
-    data: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct WalAppendRequest {
-    /// 開始LSN。連続する複数レコードには +1 ずつ割り当てる。
-    start_lsn: aruaru_dist::Lsn,
-    records: Vec<WalAppendRecord>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WalPageRequest {
-    page_key: String,
-    /// 省略時は pageserver の最終適用LSN。
-    #[serde(default)]
-    lsn: Option<aruaru_dist::Lsn>,
-}
-
-/// `GET /admin/wal-service` — safekeeper quorum の状態と pageserver の
-/// 適用状況を返す。
-#[handler]
-fn wal_service_status(state: Data<&Arc<AdminState>>) -> Json<Value> {
-    let s = &state.wal_storage;
-    let safekeepers: Vec<Value> = (0..s.wal.len() as u64)
-        .filter_map(|i| {
-            s.wal.safekeeper(i).map(|sk| {
-                json!({ "id": sk.id(), "accepted_term": sk.accepted_term(), "flush_lsn": sk.flush_lsn() })
-            })
-        })
-        .collect();
-    Json(json!({
-        "success": true,
-        "term": s.term(),
-        "quorum": s.wal.quorum(),
-        "commit_lsn": s.wal.commit_lsn(),
-        "safekeepers": safekeepers,
-        "pageserver": {
-            "last_record_lsn": s.pageserver.last_record_lsn(),
-            "max_replication_lag": s.pageserver.max_replication_lag(),
-            "page_keys": s.pageserver.page_keys(),
-        }
-    }))
-}
-
-/// `POST /admin/wal-service/append` — WALレコードを quorum へ耐久化し、
-/// pageserver へ取り込ませる(Neon の compute → safekeeper → pageserver)。
-#[handler]
-fn wal_service_append(state: Data<&Arc<AdminState>>, Json(req): Json<WalAppendRequest>) -> Json<Value> {
-    let mut records = Vec::with_capacity(req.records.len());
-    for (i, r) in req.records.iter().enumerate() {
-        let lsn = req.start_lsn + i as aruaru_dist::Lsn;
-        let bytes = r.data.clone().into_bytes();
-        records.push(match r.op.as_deref() {
-            Some("append") => aruaru_dist::WalRecord::append(lsn, r.page_key.clone(), bytes),
-            _ => aruaru_dist::WalRecord::replace(lsn, r.page_key.clone(), bytes),
-        });
-    }
-    match state.wal_storage.write(&records) {
-        Ok(commit) => Json(json!({
-            "success": true,
-            "commit_lsn": commit,
-            "applied_lsn": state.wal_storage.pageserver.last_record_lsn(),
-            "record_count": records.len(),
-        })),
-        Err(e) => Json(json!({ "success": false, "message": e.to_string() })),
-    }
-}
-
-/// `POST /admin/wal-service/page` — 指定LSN時点のページを pageserver 上で
-/// 再構成して返す(`get_page_at_lsn`)。`AS OF COMMIT`読み取りの土台。
-#[handler]
-fn wal_service_page(state: Data<&Arc<AdminState>>, Json(req): Json<WalPageRequest>) -> Json<Value> {
-    let ps = &state.wal_storage.pageserver;
-    let lsn = req.lsn.unwrap_or_else(|| ps.last_record_lsn());
-    match ps.get_page_at_lsn(&req.page_key, lsn) {
-        Ok(bytes) => Json(json!({
-            "success": true,
-            "page_key": req.page_key,
-            "lsn": lsn,
-            "len": bytes.len(),
-            "data": String::from_utf8_lossy(&bytes),
-            "image_layer_lsn": ps.image_layer_lsn(&req.page_key),
-        })),
-        Err(e) => Json(json!({ "success": false, "page_key": req.page_key, "lsn": lsn, "message": e.to_string() })),
-    }
-}
-
-/// `POST /admin/wal-service/image-layer` — 指定LSNで image layer を作り、
-/// それより古いdeltaを落とす(pageserver の compaction 相当)。
-#[handler]
-fn wal_service_image_layer(state: Data<&Arc<AdminState>>, Json(req): Json<WalPageRequest>) -> Json<Value> {
-    let ps = &state.wal_storage.pageserver;
-    let lsn = req.lsn.unwrap_or_else(|| ps.last_record_lsn());
-    match ps.create_image_layer(&req.page_key, lsn) {
-        Ok(dropped) => Json(json!({
-            "success": true,
-            "page_key": req.page_key,
-            "gc_cutoff_lsn": lsn,
-            "dropped_deltas": dropped,
-        })),
-        Err(e) => Json(json!({ "success": false, "page_key": req.page_key, "lsn": lsn, "message": e.to_string() })),
-    }
-}
+// 【2026-08-29(続き10)REST完全撤廃】WAL サービス(safekeeper quorum /
+// pageserver)の status/append/page/image-layer は GraphQL
+// `walService`/`walPage` query・`walAppend`/`walCreateImageLayer` mutation
+// (`aruaru-graphql::admin_resolvers`)へ完全移行。共有インスタンスは
+// `AdminState.wal_storage`(`aruaru_dist::DisaggregatedStorage`)のまま、
+// `wal_storage_handle()` で `AdminCtx` へ注入する。

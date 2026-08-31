@@ -1,14 +1,24 @@
 # aruaru-DB 🦀
 
-> **2026-08-29 更新(管理面の抜本再設計)**: `/admin/*` の REST を GraphQL
-> へ 1 本ずつ移す手法は *アンチパターンの移送* にすぎない、との指摘を受け、
-> 正本の設計文書 **[`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md)**
-> を新設して抜本再設計へ移行。新・設計哲学: **すべてを「望ましい状態の宣言」+
+> **2026-08-29〜31 更新(管理面の抜本再設計 = 2026 年最新設計として進行中)**:
+> `/admin/*` の REST を GraphQL へ 1 本ずつ移す手法は *アンチパターンの移送* に
+> すぎない、との指摘を受け、正本の設計文書
+> **[`docs/CONTROL_PLANE_REDESIGN.md`](docs/CONTROL_PLANE_REDESIGN.md)** を新設して
+> 抜本再設計へ移行。新・設計哲学: **すべてを「望ましい状態の宣言」+
 > reconciliation で表し、データプレーンに命令的 RPC を置かない**
 > (K8s/GitOps・WunderGraph Cosmo・TiDB/TiFlash・SPIFFE の共通解)。
 > `aruaru-server` の HTTP は最終的に `/graphql`・`/graphql/sdl`・`/health*`・
 > `/metrics` のみとし、**`/admin/*` を含む REST を全撤廃**。運用設定は
-> 宣言的 `aruaru.yaml` + ホットリロード。詳細・進捗・復活用メッセージは
+> 宣言的 `aruaru.yaml` + ホットリロード。
+> **2026-08-31**: 付録 A を「CockroachDB × Snowflake ハイブリッド変種」の
+> 2026 年最新設計として大幅拡充(英・日・独で一次論文/GitHub を再調査、
+> TiDB/TiFlash の DeltaTree・CockroachDB の closed timestamp/Pebble・
+> Snowflake の不変マイクロパーティション・Neon vs Aurora の WAL 分離・
+> ClickHouse SharedMergeTree・Iceberg/Delta/Hudi・Photon/DuckDB の
+> 型認識軽量圧縮を**実装方法まで**整理し、Raft-Learner 行→列変換レプリカ・
+> HLC・deletion vector の取り込みを決定)。進捗: **P0/P1/P2 完了 + P3 本体で
+> `closed-timestamp`・`wal-service`・`sharded-store` を GraphQL 化し REST を撤廃**
+> (`ephemeral-query`・`multi-raft` は次スライス)。詳細・進捗・復活用メッセージは
 > [`CLAUDE.md`](CLAUDE.md) 冒頭「🔄 セッション再開用メモ」。
 
 > 📌 保留タスク(2026-08-06): 東芝SBM・DeepSeek技術の組み込み構想あり。詳細は[CLAUDE.md](CLAUDE.md)参照。

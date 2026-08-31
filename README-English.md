@@ -20,18 +20,33 @@
 > keys have a fully automatic lifecycle (self-issue / self-approve /
 > self-revoke / self-expire).
 >
-> Progress (of phases P0–P6, as of 2026-08-29): P0 design frozen /
+> Progress (of phases P0–P6, as of 2026-08-31): P0 design frozen /
 > P1 declarative-config foundation (`aruaru-server::config`, `--config`,
 > hot reload) done / P2 `query.parallel` (reduced to 4 fields) and
-> `follower_read.target_lag_ms` (fully hot-reloadable) done / P3
-> `/admin/parallel*` and `/v1/keys/self-issue` REST endpoints removed
-> (now GraphQL `explainDistributed`, `parallelJobs`, `selfIssueKey`).
-> Appendix A surveys real "CockroachDB × Snowflake hybrid" databases
-> (TiDB/TiFlash etc.); Appendix B documents the Cosmo technology that
-> makes REST removal possible (Federation / Connect / Persisted
-> Operations / Schema Registry + CDN). Details, remaining work and a
-> resume message are in `CLAUDE.md` — see the top "session resume note"
-> and the HANDOFF entries (continued 5+).
+> `follower_read.target_lag_ms` (fully hot-reloadable) done / **P3 main
+> body**: on top of `/admin/parallel*` and `/v1/keys/self-issue` (cont. 8),
+> the **`closed-timestamp`, `wal-service` and `sharded-store` REST
+> endpoints are now fully removed and moved to GraphQL query/mutation**
+> (cont. 10): `closedTimestamp`/`planFollowerRead`/`closedTsRegisterRange`/
+> `closedTsAdvance`, `walService`/`walPage`/`walAppend`/
+> `walCreateImageLayer`, `shardedStoreGet`/`shardedStoreStats`/
+> `shardedStorePut`. `ephemeral-query` and `multi-raft` need a trait-
+> injection refactor and are deferred to the next slice.
+> **Appendix A has been substantially expanded as a "2026 state-of-the-art
+> design"** (re-researched via primary papers / official docs / GitHub in
+> English, Japanese and German): TiDB/TiFlash's DeltaTree (a B+tree × LSM
+> hybrid), CockroachDB's Range/HLC/Pebble/closed timestamp, YugabyteDB's
+> DocDB, Snowflake's immutable micro-partitions + pruning + time travel,
+> Neon vs Aurora WAL disaggregation, SingleStore Universal Storage,
+> ClickHouse MergeTree/SharedMergeTree, an Iceberg/Delta/Hudi comparison,
+> and Photon/DuckDB type-aware lightweight compression (FSST/ALP) — all
+> down to **implementation methods (architecture, data structures,
+> algorithms)** — leading to decisions to adopt Raft-Learner row→column
+> replicas, HLC and deletion vectors (with reasons stated for what is
+> *not* adopted). Appendix B documents the Cosmo technology that makes
+> REST removal possible. Details, remaining work and a resume message
+> are in `CLAUDE.md` — see the top "session resume note" and the HANDOFF
+> entries (continued 5–10).
 >
 > Note: `open-cuda`/`open-directx` remain out of scope for this SET
 > policy for now (no HTTP surface), but this is a provisional call, not

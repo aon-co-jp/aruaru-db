@@ -318,19 +318,39 @@ cargo run -p aruaru-backup --bin backup-cli -- restore --path ./backups/<manifes
   `/admin/parallel*`(設定は `aruaru.yaml: query.parallel`、
   実効値/プラン/ジョブは `parallelConfig`/`explainDistributed`/
   `parallelJobs` query)、`/v1/keys/self-issue`(`selfIssueKey` mutation、
-  認証ガード無し)。
+  認証ガード無し)。**2026-08-31(続き10)追加**: `closed-timestamp`
+  (`closedTimestamp`/`planFollowerRead` query、`closedTsRegisterRange`/
+  `closedTsAdvance` mutation。`/receive`・`/publish` は B4 として残置)、
+  `wal-service`(`walService`/`walPage` query、`walAppend`/
+  `walCreateImageLayer` mutation)、`sharded-store`(`shardedStoreGet`/
+  `shardedStoreStats` query、`shardedStorePut` mutation)。タイムスタンプ・
+  LSN は u64 のため GraphQL では String 表現。
 - **設定へ移行済み**: `backup.schedule`・`federation.sources`・
   `query.parallel`・`follower_read.target_lag_ms`(`aruaru-server::config`
   の `reconcile` がホットリロード反映)。`wal`・`sharded_store` は
   構築時固定のため静的扱い(`restart_required`)。
-- **未着手(P3 本体)**: `ephemeral-query`・`multi-raft`・`sharded-store`
-  (put/get/stats)・`closed-timestamp`・`wal-service`。
-  `closed-timestamp`/`wal-service`/`sharded-store` は状態が
-  `aruaru-dist`/`aruaru-query` 型なので `AdminCtx` 注入で素直に GraphQL 化
-  できる。`ephemeral-query`(`current_exe` で自プロセス再起動)・
-  `multi-raft`(server-local ジェネリック)は trait 注入のリファクタが要る。
+- **未着手(P3 残り、次スライス)**: `ephemeral-query`・`multi-raft`
+  (split/merge/scatter-query)。いずれも `aruaru-server` 固有の型に依存
+  (`ephemeral-query` は `current_exe` で自プロセス再起動、`multi-raft` は
+  `MultiRaftCluster<crate::cluster::EngineApplier>` の server-local
+  ジェネリック)——`AdminCtx` へ `Arc<dyn EphemeralRunner>` /
+  `Arc<dyn MultiRaftHandle>` の trait を注入するリファクタが必要
+  (状態注入だけで済んだ上記 3 群とは別スライス。理由は
+  `docs/CONTROL_PLANE_REDESIGN.md` §8 P3 に明記)。
 - **注意**: `registry`(`crawlRegistry`/`testRegistryConnection`)は
   既に GraphQL 側で実データ接続済み——「未着手」と誤解しないこと。
+
+**付録 A(2026-08-31 大幅拡充)= データプレーン設計の指針**: `docs/
+CONTROL_PLANE_REDESIGN.md` 付録 A を「CockroachDB × Snowflake ハイブリッド
+変種」の 2026 年最新設計として再構成した(英・日・独で一次論文/GitHub
+再調査)。移植先で HTAP・列指向・ストレージ分離を実装する場合は、
+TiDB/TiFlash の DeltaTree、CockroachDB の closed timestamp/Pebble、Neon の
+safekeeper/pageserver 分離、ClickHouse SharedMergeTree(Keeper = 共有
+メタデータの真実源)、Iceberg/Delta/Hudi の table format、Photon/DuckDB の
+型認識軽量圧縮(FSST/ALP)を**実装方法まで**参照できる。aruaru-db が
+今後取り込むと決めたもの: Raft-Learner 上の行→列非同期変換レプリカ
+(本命、`ColumnarApplier` 案)/ HLC / deletion vector。宣言的設定
+(`aruaru.yaml: htap` 案)+ execution-config 配信で管理面に載る(§2 原則 12)。
 
 ## 8. 移植・拡張時の注意
 

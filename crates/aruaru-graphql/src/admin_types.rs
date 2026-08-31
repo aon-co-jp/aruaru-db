@@ -5,6 +5,8 @@
 
 use async_graphql::SimpleObject;
 
+use crate::QueryResultGql;
+
 // ── レジストリ ────────────────────────────────────────────────
 
 #[derive(SimpleObject, Clone)]
@@ -230,4 +232,147 @@ pub struct FederatedSourceGql {
     pub uri: String,
     pub status: String,
     pub tables: i32,
+}
+
+// ── Closed timestamp / Follower read(CockroachDB 方式、2026-08-29 再設計 P3) ──
+//
+// 旧 REST `GET /admin/closed-timestamp`・`POST /admin/closed-timestamp/{range,
+// advance,plan}` の等価。observability(status / plan)は `AdminQuery`、
+// ワンショット操作(register / advance)は `AdminMutation` へ(§2.2 判断フロー)。
+// タイムスタンプ・LSN はすべて u64 論理ナノ秒/位置であり、GraphQL の Int
+// (=JSON number、f64 精度)では 2^53 を超えると欠落するため **String 表現**
+// で受け渡す(revival メッセージの明示指示)。`range_id` は小さな整数なので
+// Int(i64)のまま。
+
+#[derive(SimpleObject, Clone)]
+pub struct ClosedTimestampRangeGql {
+    pub range_id: i64,
+    /// u64 論理ナノ秒(精度保持のため String)。
+    pub closed_timestamp: String,
+    /// 進行中書き込みの最小時刻(無ければ null)。
+    pub lowest_in_flight: Option<String>,
+    pub target_lag_nanos: String,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct ClosedTimestampStatusGql {
+    pub range_count: i32,
+    pub ranges: Vec<ClosedTimestampRangeGql>,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct ClosedTsRegisterResultGql {
+    pub range_id: i64,
+    pub closed_timestamp: String,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct ClosedTsAdvanceEntryGql {
+    pub range_id: i64,
+    pub closed_timestamp: String,
+}
+
+/// `table` を指定して follower read が許可された場合の実データ読み出し結果
+/// (`QueryEngine::select_follower_read` = `AS OF COMMIT` と同じ Prolly Tree
+/// 経由の読み取り)。読み取り自体がエラーになった場合は `ok=false` +
+/// `error`(GraphQL 全体をエラーにはしない——プラン判定自体は成功している)。
+#[derive(SimpleObject, Clone)]
+pub struct FollowerReadDataGql {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub result: Option<QueryResultGql>,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct FollowerReadPlanGql {
+    /// `"follower_read"` | `"route_to_leaseholder"`。
+    pub plan: String,
+    pub is_follower_read: bool,
+    /// follower read が許可されたときの読み取り時刻(u64 → String)。
+    pub read_timestamp: Option<String>,
+    pub staleness_nanos: Option<String>,
+    /// leaseholder へルーティングする場合の理由。
+    pub reason: Option<String>,
+    /// `table` 指定時のみ。
+    pub data: Option<FollowerReadDataGql>,
+}
+
+// ── WAL サービス(Neon 方式 safekeeper/pageserver 分離、2026-08-29 再設計 P3) ──
+//
+// 旧 REST `GET /admin/wal-service`・`POST /admin/wal-service/{append,page,
+// image-layer}` の等価。status / page(`get_page_at_lsn` = 純粋な読み取り)は
+// `AdminQuery`、append(耐久化)/ image-layer(compaction)は `AdminMutation`。
+// LSN・term は u64 のため String 表現。
+
+#[derive(SimpleObject, Clone)]
+pub struct WalSafekeeperGql {
+    pub id: i64,
+    pub accepted_term: String,
+    pub flush_lsn: String,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct WalPageserverGql {
+    pub last_record_lsn: String,
+    pub max_replication_lag: String,
+    pub page_keys: Vec<String>,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct WalServiceStatusGql {
+    pub term: String,
+    pub quorum: i32,
+    pub commit_lsn: String,
+    pub safekeepers: Vec<WalSafekeeperGql>,
+    pub pageserver: WalPageserverGql,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct WalAppendResultGql {
+    pub commit_lsn: String,
+    pub applied_lsn: String,
+    pub record_count: i32,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct WalPageGql {
+    pub page_key: String,
+    pub lsn: String,
+    pub len: i32,
+    pub data: String,
+    pub image_layer_lsn: Option<String>,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct WalImageLayerResultGql {
+    pub page_key: String,
+    pub gc_cutoff_lsn: String,
+    pub dropped_deltas: i32,
+}
+
+// ── ScyllaDB shard-per-core ストア(2026-08-29 再設計 P3) ──
+//
+// 旧 REST `POST /admin/sharded-store`・`GET /admin/sharded-store/:key`・
+// `GET /admin/sharded-store-stats` の等価。put は `AdminMutation`、
+// get / stats は `AdminQuery`。
+
+#[derive(SimpleObject, Clone)]
+pub struct ShardedStorePutResultGql {
+    pub key: String,
+    pub shard_id: i64,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct ShardedStoreEntryGql {
+    pub key: String,
+    pub shard_id: i64,
+    pub found: bool,
+    pub value: Option<String>,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct ShardedStoreStatsGql {
+    pub shard_count: i32,
+    pub per_shard_len: Vec<i64>,
+    pub total_len: i64,
 }
