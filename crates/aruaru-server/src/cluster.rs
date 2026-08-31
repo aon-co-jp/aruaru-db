@@ -112,6 +112,45 @@ pub fn build_cluster_with_learners(
     Ok((node, driver))
 }
 
+/// A.6-2「ColumnarApplier」(Raft-Learner上の行→列非同期変換レプリカ)の
+/// 実プロセス検証用。`ColumnarApplier`を`Applier`として注入した learner
+/// 専用の`RaftNode`/`RaftDriver`を構築する——通常の`build_cluster_
+/// with_learners`(常に`EngineApplier`を使う)とは別の型パラメータになる
+/// ため独立した関数として用意した。
+///
+/// `Arc<ColumnarApplier>`を`RaftNode`へ渡す設計にしたのは、`RaftNode<A>`
+/// が`applier: A`を値として保持するため、呼び出し元(`--columnar-learner`
+/// 起動フロー)が同じ`ColumnarApplier`インスタンスを観測用HTTPエンドポイント
+/// (`columnar_pod::serve`)へも共有する必要があるから
+/// (`raft::node::Applier`の`Arc<A>`向け blanket impl を利用)。
+///
+/// learner専用(`self_is_learner=true`固定、voter/leaderとしては使わない)。
+pub type ColumnarClusterNode = RaftNode<std::sync::Arc<aruaru_dist::ColumnarApplier>>;
+pub type ColumnarClusterDriver = RaftDriver<std::sync::Arc<aruaru_dist::ColumnarApplier>, BinaryTcpTransport>;
+
+pub fn build_columnar_learner_cluster(
+    node_id: u64,
+    leader_peers: &[(u64, String)],
+    applier: std::sync::Arc<aruaru_dist::ColumnarApplier>,
+) -> anyhow::Result<(Arc<ColumnarClusterNode>, Arc<ColumnarClusterDriver>)> {
+    let peer_ids: Vec<u64> = leader_peers.iter().map(|(id, _)| *id).collect();
+    let node = Arc::new(RaftNode::new_with_learners(
+        node_id,
+        applier,
+        peer_ids,
+        vec![],
+        true, // self_is_learner
+    ));
+    let peer_map: HashMap<u64, String> = leader_peers.iter().cloned().collect();
+    let mut binary_peer_map: HashMap<u64, std::net::SocketAddr> = HashMap::new();
+    for (id, addr) in &peer_map {
+        binary_peer_map.insert(*id, to_binary_peer_addr(addr)?);
+    }
+    let transport = Arc::new(BinaryTcpTransport::new(binary_peer_map));
+    let driver = RaftDriver::new(node.clone(), transport);
+    Ok((node, driver))
+}
+
 /// Leader として書き込み SQL を Raft 経由で提案・適用する。
 /// 単一ノードでは即 commit/apply、複数ノードでは propose 後に driver が複製・commit する。
 pub fn propose_write(node: &Arc<ClusterNode>, sql: &str) -> Result<u64, String> {

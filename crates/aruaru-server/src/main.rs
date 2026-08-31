@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 mod admin;
 mod cluster;
+mod columnar_pod;
 mod config;
 mod ephemeral_pod;
 mod self_update;
@@ -82,6 +83,17 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     ephemeral_worker: bool,
 
+    /// 【2026-08-31新設・A.6-2実プロセス検証用】このプロセスを
+    /// `ColumnarApplier`(行→列非同期変換レプリカ)を注入した learner
+    /// として起動する。`--raft-role learner --peers <leaderのアドレス>`
+    /// と組み合わせて使う——通常のlearner(`EngineApplier`、行ストアの
+    /// 単純複製)とは別の、TiFlash型の列レプリカ検証専用フロー。
+    /// 有効時は通常のpgwire/GraphQLサーバーを一切起動せず、Raft driverと
+    /// 最小限の観測用HTTP(`/healthz`・`GET /columnar/:table`)のみを
+    /// 提供して待ち受け続ける(`--gql-port`をその待受ポートとして流用)。
+    #[arg(long, default_value_t = false)]
+    columnar_learner: bool,
+
     /// ログレベル (trace/debug/info/warn/error)
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -131,6 +143,41 @@ async fn main() -> anyhow::Result<()> {
         raft_id  = cli.raft_id,
         "aruaru-DB starting 🦀"
     );
+
+    // 【A.6-2実プロセス検証用・ColumnarApplier learner】通常のpgwire/
+    // GraphQLサーバー起動フローを一切経由せず、`ColumnarApplier`を
+    // 注入したRaft learnerとして待ち受け続ける。`--raft-role learner
+    // --peers <leaderのアドレス> --columnar-learner`で起動する。
+    if cli.columnar_learner {
+        if cli.raft_role != "learner" {
+            tracing::warn!(
+                raft_role = %cli.raft_role,
+                "--columnar-learner は --raft-role learner と組み合わせて使う想定です(続行します)"
+            );
+        }
+        let leader_peers = cli
+            .peers
+            .as_deref()
+            .map(cluster::parse_peers)
+            .unwrap_or_default();
+        let applier = std::sync::Arc::new(aruaru_dist::ColumnarApplier::with_in_memory_store(
+            std::sync::Arc::new(aruaru_query::QueryEngine::new()),
+        ));
+        let (node, driver) =
+            cluster::build_columnar_learner_cluster(cli.raft_id, &leader_peers, applier.clone())?;
+        let binary_bind_addr: std::net::SocketAddr =
+            format!("0.0.0.0:{}", cli.gql_port + cluster::BINARY_RAFT_PORT_OFFSET).parse()?;
+        let _raft_handle = tokio::spawn(async move {
+            driver.run().await;
+        });
+        let _binary_handle = tokio::spawn(async move {
+            if let Err(e) = aruaru_dist::serve_binary_raft(binary_bind_addr, node, None).await {
+                tracing::error!(error = %e, "binary raft listener (columnar learner) exited");
+            }
+        });
+        columnar_pod::serve(format!("0.0.0.0:{}", cli.gql_port), applier).await?;
+        return Ok(());
+    }
 
     // ── 共有クエリエンジン (ストレージ + Git-on-SQL) ──────────
     let engine = std::sync::Arc::new(aruaru_query::QueryEngine::new());

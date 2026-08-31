@@ -20,6 +20,17 @@ pub trait Applier: Send + Sync {
     fn apply(&self, command: &Command) -> CommandResponse;
 }
 
+/// `Arc<A>` への blanket impl。`RaftNode<A>`は`applier: A`を値として
+/// 保持するため、呼び出し側(例: `ColumnarApplier`のHTTP観測エンドポイント)
+/// が`RaftNode`へ渡した後も同じ状態を共有して読みたい場合、
+/// `RaftNode<Arc<A>>`として構築できるようにする(`A`自体を複製する
+/// 必要が無い)。
+impl<A: Applier + ?Sized> Applier for std::sync::Arc<A> {
+    fn apply(&self, command: &Command) -> CommandResponse {
+        (**self).apply(command)
+    }
+}
+
 /// AppendEntries の結果
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppendResult {

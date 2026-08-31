@@ -5304,3 +5304,71 @@ Raft commitごとに行→列変換して`table_format`のblockへ追記」)に�
 実プロセスで検証、(2) A.6-4 deletion vector(delta蓄積の第一歩、
 `table_format::BlockMeta`への拡張)、(3) HLCを`closed_ts`等へ配線、
 (4) `aruaru.yaml: htap`セクション(§5・A.7)の実装。
+
+## HANDOFF追記(2026-08-31続き16) A.6-2の「残課題」= 実learnerプロセスへの実配線・実HTTP検証を完了
+
+**位置づけ**: 続き15が「正直な残課題」として明記していた「実learner
+プロセスへの実配線・実HTTP検証は未実施」を今回のパスで解消した。
+
+**実装**:
+1. **`crates/aruaru-dist/src/raft/node.rs`**: `Applier` traitに
+   `impl<A: Applier + ?Sized> Applier for Arc<A>`のblanket implを追加。
+   `RaftNode<A>`は`applier: A`を値として保持するため、`RaftNode<Arc<
+   ColumnarApplier>>`として構築すれば、呼び出し元(HTTP観測エンドポイント)
+   が同じ`ColumnarApplier`インスタンスをRaftNodeへ渡した後も共有して
+   読み続けられる。
+2. **`crates/aruaru-server/src/cluster.rs`**: `ColumnarClusterNode`
+   (`RaftNode<Arc<ColumnarApplier>>`)・`ColumnarClusterDriver`型エイリアス
+   と`build_columnar_learner_cluster()`を新設(`self_is_learner=true`
+   固定、voter/leaderとしては使わない専用コンストラクタ)。
+3. **`crates/aruaru-server/src/columnar_pod.rs`(新規)**: `--columnar-
+   learner`起動フロー専用の最小限HTTPサーバー。`GET /healthz`・
+   `GET /columnar/:table`(`latest_snapshot_id`/`replication_count`/
+   行数を返す)。**正直な開示**: 本番`admin.rs`の`KeyGuardian`認証とは
+   独立した簡易実装(`ARUARU_DB_ADMIN_TOKEN`の定数時間比較のみ)——
+   この検証用途に限定。
+4. **`crates/aruaru-server/src/main.rs`**: `--columnar-learner`CLIフラグ
+   新設。有効時は`ephemeral_worker`と同じ「早期分岐で通常のサーバー
+   起動フローを一切経由しない」パターンを踏襲——`ColumnarApplier`を
+   注入した`RaftNode`+`RaftDriver`を構築し、`serve_binary_raft`
+   (既存のバイナリRaft/WALリスナー、`--gql-port + BINARY_RAFT_PORT_
+   OFFSET`)とHTTP観測面(`columnar_pod::serve`、`--gql-port`)の両方を
+   起動して待ち受け続ける。leader側の`--learner-peers`にこの
+   columnar learnerのアドレスを含めれば、既存の学習済み仕組み
+   (2026-08-21確立、`to_binary_peer_addr`によるポートオフセット計算)が
+   そのまま使える(新しい複製プロトコルは作っていない)。
+
+**実プロセスHTTP E2E(型チェック・単体テストのみで終わらせない)**:
+実際に2プロセス起動——leader(`--raft-id 1 --learner-peers
+"2@127.0.0.1:15181"`、通常の`EngineApplier`)、columnar learner
+(`--raft-id 2 --raft-role learner --peers "1@127.0.0.1:15180"
+--columnar-learner --gql-port 15181`)。leaderへ`POST /admin/cluster/
+propose`で`CREATE TABLE items`→`INSERT (qty=42)`→`UPDATE (qty=99)`を
+実行し、その都度**別プロセスのcolumnar learnerへ`GET /columnar/items`
+を実HTTPで叩いて確認**:
+- `CREATE TABLE`+`INSERT`後: `{"replicationCount":2,"rowCount":1}`
+  (実際に挿入した行がRaft経由で列レプリカ側にも反映)。
+- `UPDATE`後: `{"replicationCount":3,"rowCount":1}`、スナップショットID
+  が前回と異なる値へ変化(時間旅行の連鎖が実際に機能)。
+- 誤ったトークンでの`GET /columnar/items`は`401`。
+- 両プロセスの標準エラーログにエラー・パニック無し。
+
+これにより「TiFlash型HTAPの核心(Raft learnerが受け取ったcommitを
+独立の列指向ストアへ変換する)」が、単体テストだけでなく**実際に
+別プロセス・実TCP経由で機能する**ことを実証した。
+
+**検証(実測)**: `cargo build --workspace` → 成功(既存の
+`build_cluster`/`propose_commit`未使用警告2件のみ、無関係)。
+
+**なお残る簡略化点(誇張しない)**: (1) `--columnar-learner`は検証専用の
+独立起動フローであり、本番の`admin.rs`/GraphQL(`AdminCtx`)へは未統合
+——`Query.htapReplicas`(§5・A.7で構想済み)のような正規の観測APIとして
+公開する作業は次段階。(2) 依然としてテーブル全体再構築方式(A.6-4の
+delta蓄積が真の解決)。(3) `--columnar-learner`のHTTP認証は簡易実装
+(上記3参照)。
+
+**次回の起点**: (1) A.6-4 deletion vector、(2) HLCを`closed_ts`等へ
+配線、(3) `aruaru.yaml: htap`セクション(§5・A.7)の実装(この際に
+`--columnar-learner`を正規の宣言的設定〈`columnar_replicas`〉経由の
+起動へ統合することも検討)、(4) `--columnar-learner`をGraphQL
+`Query.htapReplicas`として正式公開。

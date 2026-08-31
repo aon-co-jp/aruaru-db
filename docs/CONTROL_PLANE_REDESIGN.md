@@ -538,7 +538,7 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
 | Range 単位の独立 Raft グループ(Multi-Raft) | CockroachDB / TiKV | `aruaru-dist/src/multi_raft.rs`, `shard/topology.rs` | 実装済(単一プロセス) |
 | closed timestamp + follower read + bounded staleness | CockroachDB / TiKV safe-ts / YugabyteDB | `aruaru-dist/src/closed_ts.rs` | 実装済(P2 でホットリロード化) |
 | HLC(Hybrid Logical Clock)による版付け | Spanner / CockroachDB / YugabyteDB | `aruaru-dist/src/hlc.rs`(`now`/`update`、CAS実装) | 実装済(2026-08-31、既存`closed_ts`等への配線は次段階) |
-| Raft-Learner 上での 行→列 非同期変換レプリカ | TiDB/TiFlash | `aruaru-dist/src/columnar_applier.rs`(`Applier`実装、テーブル全体を都度 block 化して`table_format`へcommit) | 実装済(2026-08-31、単一プロセス内。真のdelta蓄積・ネットワーク越しlearnerへの実配線はA.6-4/次段階) |
+| Raft-Learner 上での 行→列 非同期変換レプリカ | TiDB/TiFlash | `aruaru-dist/src/columnar_applier.rs`(`Applier`実装)+ `aruaru-server --columnar-learner`(実プロセス、binary Raft経由で実複製) | 実装済(2026-08-31、2プロセス間の実HTTP/実TCPで検証済み。真のdelta蓄積はA.6-4/次段階) |
 | 読み取り時の Raft index + MVCC による SI 検証 | TiDB/TiFlash | closed_ts の gate はあるが Raft index 突合は無い | 未取込(A.6-3) |
 | DeltaTree(B+木 × LSM)= 更新耐性のある列エンジン | TiDB/TiFlash | object-table は不変セグメントのみ、delta 層無し | 未取込(A.6-4) |
 | 不変マイクロパーティション + メタデータ pruning + time travel | Snowflake / Iceberg / Delta / Databend | `aruaru-backup/src/table_format.rs`(snapshot→segment→block 3層、min/max + bloom) | 実装済 |
@@ -778,7 +778,7 @@ Snowflake の良い所取りのハイブリッドの特殊な変種の実在す�
   (正直な簡略化点として明記)。`max_offset` による不確実性ウィンドウ
   (CockroachDB の `commit-wait`)は次段階。
 
-#### A.6-2 Raft-Learner 上の 行→列 非同期変換レプリカ — **実装済(2026-08-31、単一プロセス内の核心ロジック)**
+#### A.6-2 Raft-Learner 上の 行→列 非同期変換レプリカ — **実装済(2026-08-31、実プロセス間で検証済み)**
 
 - 現状: `--raft-role learner` で複製先にはなるが、learner が受け取った
   Raft ログを **行→列変換して独立の解析ストアへ流す**部分が無い。
