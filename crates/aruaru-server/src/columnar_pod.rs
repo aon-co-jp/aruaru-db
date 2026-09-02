@@ -59,6 +59,51 @@ async fn columnar_status(
     if let Err(code) = check_token(req) {
         return code.into_response();
     }
+    // A.6-3: ?required_index=N&required_commit_seq=M が付いていれば、
+    // Raft index + MVCC(commit 通し番号)で staleness を検証し、
+    // 満たさなければ 409 CONFLICT + stale 詳細を返す。
+    let q: std::collections::HashMap<String, String> = req
+        .uri()
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+        .collect();
+    let required_index = q.get("required_index").and_then(|s| s.parse::<u64>().ok());
+    let required_commit_seq = q.get("required_commit_seq").and_then(|s| s.parse::<u64>().ok());
+    if required_index.is_some() || required_commit_seq.is_some() {
+        match applier.read_at_index(
+            &table,
+            required_index.unwrap_or(0),
+            required_commit_seq.unwrap_or(0),
+        ) {
+            Ok(view) => {
+                return Json(serde_json::json!({
+                    "table": table,
+                    "stale": false,
+                    "appliedIndex": view.applied_index,
+                    "appliedCommitSeq": view.applied_commit_seq,
+                    "columnarBlockCount": view.blocks.len(),
+                    "columnarLiveRowCount": view.live_row_count,
+                }))
+                .into_response();
+            }
+            Err(s) => {
+                let mut resp = Json(serde_json::json!({
+                    "table": table,
+                    "stale": true,
+                    "appliedIndex": s.applied_index,
+                    "requiredIndex": s.required_index,
+                    "appliedCommitSeq": s.applied_commit_seq,
+                    "requiredCommitSeq": s.required_commit_seq,
+                }))
+                .into_response();
+                resp.set_status(StatusCode::CONFLICT);
+                return resp;
+            }
+        }
+    }
+
     let snapshot_id = applier.latest_snapshot_id(&table);
     let row_count = applier
         .engine()
@@ -80,6 +125,8 @@ async fn columnar_status(
         "columnarBlockCount": block_count,
         "columnarLiveRowCount": applier.latest_live_row_count(&table),
         "columnarDeletionVectorPositions": deletion_vector_positions,
+        "appliedIndex": applier.applied_index(),
+        "appliedCommitSeq": applier.applied_commit_seq(),
     }))
     .into_response()
 }

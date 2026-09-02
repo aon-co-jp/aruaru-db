@@ -18,6 +18,14 @@ use super::{LogEntry, RaftRole, RaftState};
 /// commit されたコマンドを状態機械へ適用するインタフェース
 pub trait Applier: Send + Sync {
     fn apply(&self, command: &Command) -> CommandResponse;
+
+    /// Raft ログインデックス付きの適用(A.6-3: 読み取り時の
+    /// Raft index による staleness 検証に使う)。既定実装はインデックスを
+    /// 無視して `apply` へ委譲するため、既存の実装は変更不要。
+    /// `ColumnarApplier` はこれを override して「どこまで適用済みか」を記録する。
+    fn apply_at(&self, _index: u64, command: &Command) -> CommandResponse {
+        self.apply(command)
+    }
 }
 
 /// `Arc<A>` への blanket impl。`RaftNode<A>`は`applier: A`を値として
@@ -28,6 +36,9 @@ pub trait Applier: Send + Sync {
 impl<A: Applier + ?Sized> Applier for std::sync::Arc<A> {
     fn apply(&self, command: &Command) -> CommandResponse {
         (**self).apply(command)
+    }
+    fn apply_at(&self, index: u64, command: &Command) -> CommandResponse {
+        (**self).apply_at(index, command)
     }
 }
 
@@ -393,7 +404,7 @@ impl<A: Applier> RaftNode<A> {
         let mut applied = 0;
         let mut last = 0;
         for (idx, cmd) in &pending {
-            let resp = self.applier.apply(cmd);
+            let resp = self.applier.apply_at(*idx, cmd);
             if !resp.ok {
                 tracing::warn!(index = idx, msg = %resp.message, "apply failed");
             }
