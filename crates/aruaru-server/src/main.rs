@@ -160,9 +160,25 @@ async fn main() -> anyhow::Result<()> {
             .as_deref()
             .map(cluster::parse_peers)
             .unwrap_or_default();
-        let applier = std::sync::Arc::new(aruaru_dist::ColumnarApplier::with_in_memory_store(
-            std::sync::Arc::new(aruaru_query::QueryEngine::new()),
-        ));
+        // aruaru.yaml: htap.delta.compaction_threshold を反映(宣言的設定
+        // 経由の起動へ統合)。--config 未指定なら既定値のまま。
+        let compaction_threshold = cli
+            .config
+            .as_ref()
+            .and_then(|p| match config::AruaruConfig::load(p) {
+                Ok(cfg) => Some(cfg.htap.delta.compaction_threshold),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load --config for htap settings; using defaults");
+                    None
+                }
+            })
+            .unwrap_or(0);
+        let applier = std::sync::Arc::new(
+            aruaru_dist::ColumnarApplier::with_in_memory_store(std::sync::Arc::new(
+                aruaru_query::QueryEngine::new(),
+            ))
+            .with_compaction_threshold(compaction_threshold),
+        );
         let (node, driver) =
             cluster::build_columnar_learner_cluster(cli.raft_id, &leader_peers, applier.clone())?;
         let binary_bind_addr: std::net::SocketAddr =

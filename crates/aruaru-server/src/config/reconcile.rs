@@ -64,6 +64,9 @@ pub fn reconcile(
             ("wal.safekeepers", prev.wal.safekeepers != new.wal.safekeepers),
             ("wal.quorum", prev.wal.quorum != new.wal.quorum),
             ("sharded_store.shards", prev.sharded_store.shards != new.sharded_store.shards),
+            // htap は --columnar-learner の起動可否・読み取り検証方式・
+            // ColumnarApplier の compaction 閾値を決めるため構築時固定。
+            ("htap", prev.htap != new.htap),
         ] {
             if differs {
                 tracing::warn!(

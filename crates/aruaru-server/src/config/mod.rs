@@ -44,6 +44,7 @@ pub struct AruaruConfig {
     pub follower_read: FollowerReadConfig,
     pub wal: WalConfig,
     pub sharded_store: ShardedStoreConfig,
+    pub htap: HtapConfig,
     pub disaster_backup: DisasterBackupConfig,
 
     // ── コントロールプレーン取得(P5 で実配線) ──────────
@@ -176,6 +177,49 @@ impl Default for WalConfig {
 pub struct ShardedStoreConfig {
     /// 0 = 論理コア数を自動採用。
     pub shards: usize,
+}
+
+/// HTAP(行→列非同期変換レプリカ)設定。正本は
+/// `docs/CONTROL_PLANE_REDESIGN.md` 付録 A.7。**現状は静的セクション**
+/// ——`columnar_replicas` / `read_consistency` は `--columnar-learner`
+/// プロセスの起動可否・読み取り検証方式を決めるため稼働中の変更は
+/// プロセス再起動が必要(`wal` / `sharded_store` と同じ扱い)。
+/// `delta.compaction_threshold` も `ColumnarApplier` 構築時に渡すため静的。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct HtapConfig {
+    /// テーブルへ列レプリカ(`--columnar-learner`)を持たせるか。
+    pub columnar_replicas: bool,
+    /// フォロワー(列レプリカ)読み取りの一貫性レベル。
+    /// `"eventual"`(既定、非同期反映をそのまま読む)/
+    /// `"raft-index"`(読み取りに必要な Raft index まで適用済みか検証。
+    /// A.6-3)/ `"strict"`(raft-index + MVCC スナップショット分離)。
+    pub read_consistency: String,
+    pub delta: HtapDeltaConfig,
+}
+
+impl Default for HtapConfig {
+    fn default() -> Self {
+        Self {
+            columnar_replicas: false,
+            read_consistency: "eventual".into(),
+            delta: HtapDeltaConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct HtapDeltaConfig {
+    /// delta block がこの個数たまったら base へ compaction する
+    /// (TiFlash DeltaTree の閾値 compaction、`ColumnarApplier`)。
+    pub compaction_threshold: usize,
+}
+
+impl Default for HtapDeltaConfig {
+    fn default() -> Self {
+        Self { compaction_threshold: 8 }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
