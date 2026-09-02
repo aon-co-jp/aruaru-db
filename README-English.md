@@ -67,6 +67,32 @@
 > deletion, wired into `prune_range`/`prune_equality`). See `CLAUDE.md`'s
 > same-day HANDOFF entries (continued 13–18) for details.
 >
+> **Updated 2026-09-02 (cont. 20–23)**: **A.6-4 stage 2 base+delta
+> Merge-on-Read** (`ColumnarApplier` upgraded from full rebuild to delta
+> accumulation + threshold compaction; DELETE/UPDATE write the deletion
+> vector), **HLC redesign** (`as_nanos()`'s `pt<<16` u64 overflow fixed
+> via "plan B": physical component truncated to ~65µs granularity, logical
+> counter packed into the low 16 bits; wired into the `closed_ts` path).
+> Then a batch of next-phase items: `aruaru.yaml: htap` section, an
+> **`htapReplicas` pruning-aware observation query**
+> (`ColumnarApplier::prune_range_preview`/`prune_equality_preview`),
+> **A.6-3** (`Applier::apply_at` records Raft index + MVCC commit-seq;
+> `read_at_index` gates a stale read, returning 409 when behind), and
+> **HLC `max_offset`** (`try_update`/`try_observe_ordinal`,
+> `follower_read.max_offset_ms`). Finally, **`Query.htapReplicas` is now a
+> first-class GraphQL query on the production `aruaru-server`** (not just
+> the `--columnar-learner`-only `columnar_pod.rs` HTTP): with
+> `aruaru.yaml: htap.columnar_replicas: true`, the server runs a
+> **co-located `ColumnarApplier`** sharing the production `QueryEngine`
+> and following writes via a new `QueryEngine::set_columnar_observer`
+> channel. `htapReplicas` returns TiFlash `INFORMATION_SCHEMA.
+> TIFLASH_REPLICA`-style `PROGRESS`/`AVAILABLE` plus a pruning preview;
+> design informed by a WebSearch pass over TiFlash's columns and
+> CockroachDB issue #72393. Verified end-to-end over real HTTP `/graphql`
+> (release build). HLC case-A full migration remains future work
+> (`docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3). See `CLAUDE.md` HANDOFF
+> entries (continued 20–23).
+>
 > Note: `open-cuda`/`open-directx` remain out of scope for this SET
 > policy for now (no HTTP surface), but this is a provisional call, not
 > permanent — revisit if `open-directx`'s DirectX work matures and

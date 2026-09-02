@@ -263,9 +263,23 @@
 >    リモート closed-ts を拒否。**案A(2フィールド全面移行)は
 >    `docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3 として引き続き将来課題**。
 >    検証: `cargo test -p aruaru-dist -p aruaru-server` 失敗0
->    (aruaru-dist 101→、hlc 15 / columnar_applier 14)、`cargo build
+>    (aruaru-dist 101、hlc 15 / columnar_applier 14)、`cargo build
 >    --workspace` 成功(既存 `build_cluster`/`propose_commit` 警告のみ)。
->    実プロセス HTTP E2E はユーザー指示「ビルドまでで記録」により未実施。
+>    **続き23(2026-09-02)で (a)〜(d) を実 HTTP E2E で確認 + `Query.htapReplicas`
+>    を GraphQL 単一サーフェスへ正式公開**: 本番 `aruaru-server` が
+>    `aruaru.yaml: htap.columnar_replicas: true` で同居(co-located)
+>    `ColumnarApplier`(本番 `QueryEngine` 共有、`set_columnar_observer`
+>    通知で `observe_table` 追従)を立て、`Query.htapReplicas(table,
+>    pruneColumn, pruneOp, pruneValue)` が TiFlash `TIFLASH_REPLICA`
+>    (PROGRESS/AVAILABLE)相当の同期状態 + 枝刈り込みプレビューを返す。
+>    E2E(release): `execSql` で CREATE+5 INSERT → 自動追従
+>    (`replicationCount=6`)、`available=true`/`progress=1.0`/`blockCount=6`/
+>    `liveRowCount=5`、`prune amount>250` で `skippedBlocks=2`/
+>    `keptLiveRows=3`、DELETE で `deletionVectorPositions=1`、未知テーブルは
+>    `available=false`。`max_offset_ms=60000` 設定で `closed_ts_receive` が
+>    far-future リモート値を HLC 汚染前に拒否(WARN 確認)。**残り**: 
+>    `--columnar-learner` 真の別プロセス learner での `?required_index=` 409
+>    実 HTTP、HLC 案A 全面移行(P-HLC-3)。
 > 5. `disaster_backup.email` の reconcile(`feature = "disaster_email_backup"`
 >    ゲート。config スキーマは 7 フィールドへ拡張済み)。
 > 6. Tauri(`admin/src-tauri`、ワークスペース外・この環境ではビルド不可)
@@ -5798,12 +5812,106 @@ HLC の案A 全面移行・`max_offset` スキュー上限は
   /prune`・`?required_index=` の 409・`follower_read.max_offset_ms` を
   設定した `closed_ts_receive` 拒否を実 HTTP で確認する。
 
-### 復活用メッセージ(次回セッション・別アカウント向け)
-続き22 で「🛑 復活用メッセージ」項目4 の (a)〜(d) は**コード実装+
-ビルド/ユニットテストまで完了**。次にやること:
-1. 上記「実プロセス HTTP E2E」(未実施分)。
-2. `Query.htapReplicas` を GraphQL(`AdminCtx`)へ正式公開する
-   (現状は `--columnar-learner` 専用 `columnar_pod.rs` の HTTP のみ)。
-3. 復活用メッセージ項目5(`disaster_backup.email` reconcile、feature
-   ゲート)・項目6(Tauri)・項目7(P4〜P6)。
-4. HLC 案A 全面移行(P-HLC-3)は引き続き将来。
+### 復活用メッセージ(続き22 時点)
+続き22 で「🛑 復活用メッセージ」項目4 の (a)〜(d) はコード実装+
+ビルド/ユニットテストまで完了。→ **続き23 で E2E 確認 + GraphQL 公開まで完了**
+(下記)。
+
+## HANDOFF追記(2026-09-02続き23) `Query.htapReplicas` を GraphQL 単一
+サーフェスへ正式公開 + 続き22 (a)〜(d) の実 HTTP E2E
+
+**位置づけ**: 続き22 の「残り」2件——(2)`Query.htapReplicas` の GraphQL
+正式公開、(1)実 HTTP E2E——を実施。ユーザー指示「世界中の言語で Google/
+GitHub 調査を実装に活かし、実用的になるまで数回繰り返す」に沿って、
+まず TiFlash / CockroachDB の列/フォロワーレプリカ観測手法を WebSearch で
+調査してから設計した。
+
+### 調査(WebSearch)
+- **TiFlash**: `INFORMATION_SCHEMA.TIFLASH_REPLICA` に `PROGRESS`(0.0〜1.0、
+  1 = 少なくとも1レプリカが同期完了)と `AVAILABLE`(0/1)。「AVAILABLE=1 かつ
+  PROGRESS<1 なら列レプリカが TiKV から大きく遅延しており、pushdown した
+  クエリはタイムアウトしやすい」というガイダンス
+  (`docs.pingcap.com/.../information-schema-tiflash-replica`)。
+- **CockroachDB**: per-range の closed timestamp がフォロワーリードの根拠。
+  ただし「Raft 提案パイプラインの end-to-end レイテンシ観測は現状限定的」
+  という未解決課題(`github.com/cockroachdb/cockroach` issue #72393)。
+  → `htapReplicas` に applied-index / progress / availability を一度に
+  出すのは十分に価値がある、と判断。
+
+### 実装
+- **`aruaru-query::QueryEngine`**: `columnar_notify` スロット +
+  `set_columnar_observer(tx)`(`olap_notify` と独立、両方同時に配線可)。
+  `persist_row`/`persist_delete`/`persist_schema`/`persist_drop` の
+  `notify_olap_change` で変更テーブル名を両チャネルへ送る。
+- **`aruaru-dist::ColumnarApplier`**:
+  - `observing(shared_engine: Arc<QueryEngine>)` = 本番 `QueryEngine` を
+    **そのまま共有**する同居(co-located)オブザーバモード。行ストアの
+    ローカルミラーを二重に持たない。
+  - `observe_table(table)` → `replicate_table` を再利用して MoR ビューを追従。
+  - `replication_progress(table)`(TiFlash PROGRESS 相当、列レプリカ実効
+    行数 ÷ 行ストア行数、0 行は 1.0、クランプ 0..1)、
+    `replica_available(table)`(AVAILABLE 相当、1回でもレプリケート済みか)。
+- **`aruaru-server::main.rs`**: `aruaru.yaml: htap.columnar_replicas: true`
+  のとき同居 `ColumnarApplier` を構築 → `engine.set_columnar_observer(tx)` →
+  `tokio::spawn` で通知を受けて `observe_table`。`AdminCtx.columnar` へ共有。
+- **`aruaru-graphql`**: `AdminCtx.columnar: Option<Arc<ColumnarApplier>>`。
+  `Query.htapReplicas(table, pruneColumn, pruneOp, pruneValue)` →
+  `HtapReplicaStatusGql { table, available, progress, columnarBlockCount,
+  columnarLiveRowCount, deletionVectorPositions, appliedIndex,
+  appliedCommitSeq, replicationCount, prune }`。`pruneColumn`+`pruneValue`
+  指定時は `prune_range_preview`/`prune_equality_preview` を呼んで
+  `HtapPrunePreviewGql` を同梱。`admin(ctx)?` で認証。
+
+### 検証
+- `cargo test -p aruaru-graphql` **20 passed**(新規
+  `htap_replicas_query_reports_columnar_replica_progress_and_pruning`)、
+  `-p aruaru-dist` 101 / `-p aruaru-query` 60 / `-p aruaru-server` 13、
+  `cargo build --workspace` 成功。
+- **実 HTTP E2E(release、`htap.columnar_replicas: true` +
+  `max_offset_ms: 60000`)**:
+  - `/graphql` の `execSql` で `CREATE TABLE orders` + 5 `INSERT` →
+    同居オブザーバが自動追従(`replicationCount=6`)。
+  - `htapReplicas(table:"orders")` → `available=true`, `progress=1.0`,
+    `columnarBlockCount=6`(空 base + 5 delta), `columnarLiveRowCount=5`。
+  - `htapReplicas(..., pruneColumn:"amount", pruneOp:"gt",
+    pruneValue:"250")` → `totalBlocks=6`, `skippedBlocks=2`,
+    `keptLiveRows=3`。
+  - `DELETE FROM orders WHERE id=2` → 再観測で `columnarLiveRowCount=4`,
+    `deletionVectorPositions=1`(deletion vector 書き込み側が co-located
+    経路でも動く)。
+  - `htapReplicas(table:"ghost")` → `available=false`, `progress=0.0`。
+  - `/admin/closed-timestamp/receive` に `closed_timestamp:
+    9999999999999999999` → WARN `closed_ts_receive: rejected a remote
+    closed timestamp beyond max_offset`(HLC 汚染前に拒否)。
+
+### 残り
+1. `--columnar-learner` **真の別プロセス learner** での
+   `GET /columnar/:table/prune`・`?required_index=` の 409 実 HTTP
+   (同居モードでは applied_index は常に 0、staleness ゲートは学習器
+   プロセス用)。
+2. `htapReplicas` に「複数テーブル一括」「per-table availability 一覧」
+   (TiFlash の `TIFLASH_REPLICA` は全テーブル行を返す)。
+3. 復活用メッセージ項目5(`disaster_backup.email` reconcile)・項目6
+   (Tauri)・項目7(P4〜P6)。HLC 案A 全面移行(P-HLC-3)。
+
+**English summary**: `Query.htapReplicas` is now a first-class GraphQL query
+on the production `aruaru-server` (not just the `--columnar-learner`-only
+`columnar_pod.rs` HTTP). When `aruaru.yaml: htap.columnar_replicas: true`,
+the server builds a **co-located `ColumnarApplier`** that shares the
+production `QueryEngine` and follows writes via a new
+`QueryEngine::set_columnar_observer` channel (independent of the existing
+`olap_notify`). `htapReplicas` returns TiFlash `INFORMATION_SCHEMA.
+TIFLASH_REPLICA`-style `PROGRESS` (columnar live rows ÷ row-store rows,
+clamped 0..1) and `AVAILABLE`, plus applied Raft index / commit-seq and an
+optional pruning preview (`pruneColumn`/`pruneOp`/`pruneValue`). Design
+informed by a WebSearch pass over TiFlash's `PROGRESS`/`AVAILABLE` columns
+and CockroachDB issue #72393 ("per-range Raft-latency observability is
+currently limited"). Verified end-to-end over real HTTP `/graphql` (release
+build): `execSql` CREATE + 5 INSERT auto-followed (`replicationCount=6`),
+`available=true`/`progress=1.0`/`blockCount=6`/`liveRowCount=5`, prune
+`amount>250` → `skippedBlocks=2`/`keptLiveRows=3`, DELETE →
+`deletionVectorPositions=1`, unknown table → `available=false`, and a
+far-future `closed_ts_receive` value rejected before poisoning the HLC
+(`max_offset_ms=60000`). Remaining: the true separate-process
+`--columnar-learner` `?required_index=` 409 path, multi-table
+`htapReplicas`, and P-HLC-3 (HLC case-A full migration).
