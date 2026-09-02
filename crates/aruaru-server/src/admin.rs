@@ -1241,7 +1241,11 @@ fn closed_ts_receive(state: Data<&Arc<AdminState>>, Json(req): Json<ClosedTsRece
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        state.hlc.observe_ordinal(max_closed, wall);
+        // max_offset(クロックスキュー上限)が設定されていれば、遠すぎる
+        // 未来の closed-ts は HLC を汚染しないよう拒否する(検査版を使う)。
+        if let Err(skew) = state.hlc.try_observe_ordinal(max_closed, wall) {
+            tracing::warn!(%skew, "closed_ts_receive: rejected a remote closed timestamp beyond max_offset");
+        }
     }
     Json(json!({
         "success": true,

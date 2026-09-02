@@ -85,7 +85,36 @@ impl HlcTimestamp {
 pub struct Hlc {
     /// `as_ordinal()` と同じ表現(上位 = バケット整列 pt、下位 16bit = l)。
     packed: AtomicU64,
+    /// クロックスキュー上限(ナノ秒、CockroachDB の `max_offset` 相当)。
+    /// `0` = 無効(リモート値を常に受理、従来挙動)。有効時、
+    /// リモートの物理成分が壁時計より `max_offset` 以上先なら
+    /// `try_update` は `Err(ClockSkew)` を返し、`update` はリモート値を
+    /// 無視してローカル進行のみ行う。
+    max_offset_nanos: AtomicU64,
 }
+
+/// `try_update` / `try_observe_ordinal` がスキュー上限を超えたリモート値を
+/// 拒否したときの詳細。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockSkew {
+    /// リモートの物理成分(バケット整列済み)。
+    pub remote_pt: u64,
+    /// 判定に使った壁時計(バケット整列済み)。
+    pub wall_bucket: u64,
+    /// 設定されているスキュー上限(ナノ秒)。
+    pub max_offset_nanos: u64,
+}
+
+impl std::fmt::Display for ClockSkew {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "remote HLC pt {} is more than max_offset {}ns ahead of local wall bucket {}",
+            self.remote_pt, self.max_offset_nanos, self.wall_bucket
+        )
+    }
+}
+impl std::error::Error for ClockSkew {}
 
 #[inline]
 fn unpack(v: u64) -> (u64, u32) {
@@ -112,13 +141,55 @@ fn advance_local(pt: u64, l: u32, wall_now_nanos: u64) -> (u64, u32) {
 
 impl Hlc {
     pub fn new() -> Self {
-        Self { packed: AtomicU64::new(0) }
+        Self {
+            packed: AtomicU64::new(0),
+            max_offset_nanos: AtomicU64::new(0),
+        }
     }
 
     /// テスト・決定的シミュレーション用に初期値を指定して構築する。
     /// `pt` はバケット整列される(下位 16bit は捨てられる)。
     pub fn with_initial(pt: u64, l: u32) -> Self {
-        Self { packed: AtomicU64::new(pack(pt, l)) }
+        Self {
+            packed: AtomicU64::new(pack(pt, l)),
+            max_offset_nanos: AtomicU64::new(0),
+        }
+    }
+
+    /// クロックスキュー上限(ナノ秒)を設定して構築する。`0` = 無効。
+    pub fn with_max_offset_nanos(n: u64) -> Self {
+        let h = Self::new();
+        h.set_max_offset_nanos(n);
+        h
+    }
+
+    /// クロックスキュー上限(ナノ秒)を実行時に設定する。`0` = 無効。
+    pub fn set_max_offset_nanos(&self, n: u64) {
+        self.max_offset_nanos.store(n, Ordering::SeqCst);
+    }
+
+    /// 現在のクロックスキュー上限(ナノ秒、`0` = 無効)。
+    pub fn max_offset_nanos(&self) -> u64 {
+        self.max_offset_nanos.load(Ordering::SeqCst)
+    }
+
+    /// リモート物理成分が壁時計 + `max_offset` を超えていないか検査する。
+    fn skew_ok(&self, remote_pt: u64, wall_now_nanos: u64) -> Result<(), ClockSkew> {
+        let max_offset = self.max_offset_nanos.load(Ordering::SeqCst);
+        if max_offset == 0 {
+            return Ok(());
+        }
+        let wall_bucket = bucket(wall_now_nanos);
+        let remote_b = bucket(remote_pt);
+        if remote_b > wall_bucket.saturating_add(max_offset) {
+            Err(ClockSkew {
+                remote_pt: remote_b,
+                wall_bucket,
+                max_offset_nanos: max_offset,
+            })
+        } else {
+            Ok(())
+        }
     }
 
     /// ローカルイベント(書き込み等)発生時に呼ぶ。`wall_now_nanos` は
@@ -163,6 +234,17 @@ impl Hlc {
     /// どれが採用されたかで決める(単調増加を保証)。論理が枯渇したら
     /// 物理を次バケットへ桁上げする。
     pub fn update(&self, remote: HlcTimestamp, wall_now_nanos: u64) -> HlcTimestamp {
+        // スキュー上限を超えたリモート値はクロックを汚染しないよう無視し、
+        // ローカル進行だけ行う(`try_update` は代わりに Err を返す)。
+        if self.skew_ok(remote.pt, wall_now_nanos).is_err() {
+            tracing::warn!(
+                remote_pt = bucket(remote.pt),
+                wall = bucket(wall_now_nanos),
+                max_offset_ns = self.max_offset_nanos.load(Ordering::SeqCst),
+                "HLC update: remote timestamp exceeds max_offset; ignoring remote, advancing locally only"
+            );
+            return self.now(wall_now_nanos);
+        }
         let remote_b = bucket(remote.pt);
         loop {
             let old = self.packed.load(Ordering::SeqCst);
@@ -200,10 +282,30 @@ impl Hlc {
         }
     }
 
+    /// `update` のスキュー検査版。上限を超えたリモート値なら
+    /// `Err(ClockSkew)` を返す(クロックは進めない)。
+    pub fn try_update(
+        &self,
+        remote: HlcTimestamp,
+        wall_now_nanos: u64,
+    ) -> Result<HlcTimestamp, ClockSkew> {
+        self.skew_ok(remote.pt, wall_now_nanos)?;
+        Ok(self.update(remote, wall_now_nanos))
+    }
+
     /// side transport 等から届いた u64 ordinal を復号して `update` する。
     /// 戻り値は統合後のローカル HLC。
     pub fn observe_ordinal(&self, remote_ordinal: u64, wall_now_nanos: u64) -> HlcTimestamp {
         self.update(HlcTimestamp::from_ordinal(remote_ordinal), wall_now_nanos)
+    }
+
+    /// `observe_ordinal` のスキュー検査版。
+    pub fn try_observe_ordinal(
+        &self,
+        remote_ordinal: u64,
+        wall_now_nanos: u64,
+    ) -> Result<HlcTimestamp, ClockSkew> {
+        self.try_update(HlcTimestamp::from_ordinal(remote_ordinal), wall_now_nanos)
     }
 
     /// 現在値をイベントとして進めずにそのまま読む(観測用)。
@@ -346,6 +448,34 @@ mod tests {
         let c = HlcTimestamp { pt: 0x20_0000, l: 0 };
         assert!(a.as_ordinal() < b.as_ordinal());
         assert!(b.as_ordinal() < c.as_ordinal());
+    }
+
+    #[test]
+    fn max_offset_rejects_a_remote_timestamp_from_the_far_future() {
+        // 上限 1ms。壁時計は小さいバケット、リモートは遥か先。
+        let hlc = Hlc::with_max_offset_nanos(1_000_000);
+        let wall = 0x10_0000u64;
+        let far_future = HlcTimestamp { pt: 0x9000_0000, l: 3 };
+
+        let err = hlc.try_update(far_future, wall).expect_err("should reject far-future remote");
+        assert_eq!(err.max_offset_nanos, 1_000_000);
+
+        // 汚染されていない: permissive update もローカル進行のみ。
+        let local = hlc.update(far_future, wall);
+        assert!(local.pt <= bucket(wall) + BUCKET, "clock not poisoned by rejected remote");
+
+        // 上限内のリモートは通常どおり受理。
+        let near = HlcTimestamp { pt: wall + 0x2_0000, l: 1 };
+        assert!(hlc.try_update(near, wall).is_ok());
+    }
+
+    #[test]
+    fn max_offset_zero_disables_the_check_backward_compatible() {
+        let hlc = Hlc::new(); // 既定は上限無効
+        assert_eq!(hlc.max_offset_nanos(), 0);
+        let far = HlcTimestamp { pt: 0x9000_0000, l: 0 };
+        assert!(hlc.try_update(far, 0x10_0000).is_ok(), "disabled check accepts anything");
+        assert_eq!(hlc.peek().pt, 0x9000_0000);
     }
 
     #[test]

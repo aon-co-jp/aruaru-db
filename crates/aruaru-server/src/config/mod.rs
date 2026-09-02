@@ -151,11 +151,14 @@ pub struct FederationSourceConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct FollowerReadConfig {
     pub target_lag_ms: u64,
+    /// HLC クロックスキュー上限(ミリ秒、CockroachDB の `max_offset` 相当)。
+    /// `0` = 無効(リモート HLC 値を常に受理、従来挙動)。
+    pub max_offset_ms: u64,
 }
 
 impl Default for FollowerReadConfig {
     fn default() -> Self {
-        Self { target_lag_ms: 3_000 }
+        Self { target_lag_ms: 3_000, max_offset_ms: 0 }
     }
 }
 

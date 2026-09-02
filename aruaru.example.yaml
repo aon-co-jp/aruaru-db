@@ -57,6 +57,9 @@ federation:
 
 follower_read:
   target_lag_ms: 3000    # ホットリロード可(全 closed-ts tracker へ即反映)
+  max_offset_ms: 0       # HLC クロックスキュー上限(ms)。0 = 無効。
+                         # >0 なら壁時計より N ms 以上先のリモート HLC 値を
+                         # closed_ts_receive で拒否(CockroachDB max_offset 相当)。
 
 # wal / sharded_store は safekeeper 台数・シャード数が構築時固定のため
 # 「静的」扱い。変更は検知して "要再起動" を警告するのみ(進行中状態を

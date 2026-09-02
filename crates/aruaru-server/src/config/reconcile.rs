@@ -107,6 +107,17 @@ pub fn reconcile(
                 "aruaru.yaml: follower_read.target_lag_ms を全 tracker へ反映しました"
             );
         }
+        // HLC クロックスキュー上限(max_offset)。
+        let desired_offset_nanos = new.follower_read.max_offset_ms.saturating_mul(1_000_000);
+        let hlc = state.hlc_handle();
+        if hlc.max_offset_nanos() != desired_offset_nanos {
+            hlc.set_max_offset_nanos(desired_offset_nanos);
+            report.follower_read_lag_changed = true;
+            tracing::info!(
+                max_offset_ms = new.follower_read.max_offset_ms,
+                "aruaru.yaml: follower_read.max_offset_ms を HLC へ反映しました"
+            );
+        }
     }
 
     // ── backup.schedule ─────────────────────────────────────
