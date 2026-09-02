@@ -89,9 +89,12 @@
 > TIFLASH_REPLICA`-style `PROGRESS`/`AVAILABLE` plus a pruning preview;
 > design informed by a WebSearch pass over TiFlash's columns and
 > CockroachDB issue #72393. Verified end-to-end over real HTTP `/graphql`
-> (release build). HLC case-A full migration remains future work
+> (release build). **cont. 24** adds `Query.htapReplicasAll` — the
+> multi-table version (like `TIFLASH_REPLICA` returning one row per
+> (db, table)): list the sync state of every columnar replica without
+> knowing table names. HLC case-A full migration remains future work
 > (`docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3). See `CLAUDE.md` HANDOFF
-> entries (continued 20–23).
+> entries (continued 20–24).
 >
 > Note: `open-cuda`/`open-directx` remain out of scope for this SET
 > policy for now (no HTTP surface), but this is a provisional call, not

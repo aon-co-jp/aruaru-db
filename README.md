@@ -46,7 +46,10 @@
 > 同期状態 + 枝刈り込みプレビューを返す。設計は TiFlash / CockroachDB の
 > レプリカ観測手法の WebSearch 調査を反映。実 HTTP `/graphql` E2E 済み
 > (`execSql` で書き込み→自動追従、prune/DELETE/未知テーブル/`max_offset`
-> リモート値拒否まで確認)。詳細は [`CLAUDE.md`](CLAUDE.md) HANDOFF(続き20〜23)。
+> リモート値拒否まで確認)。**続き24**: `Query.htapReplicasAll`(全テーブル
+> 一覧、TiFlash `TIFLASH_REPLICA` が全 (db,table) 行を返すのと同様、テーブル
+> 名を知らなくても全列レプリカの同期状態を一覧できる)を追加。
+> 詳細は [`CLAUDE.md`](CLAUDE.md) HANDOFF(続き20〜24)。
 
 > 📌 保留タスク(2026-08-06): 東芝SBM・DeepSeek技術の組み込み構想あり。詳細は[CLAUDE.md](CLAUDE.md)参照。
 
