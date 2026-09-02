@@ -590,6 +590,16 @@ impl ColumnarApplier {
         self.replica_state.lock().contains_key(table_name)
     }
 
+    /// これまでに一度でもレプリケートされたテーブル名の一覧(ソート済み)。
+    /// TiFlash の `INFORMATION_SCHEMA.TIFLASH_REPLICA` が全テーブル行を返す
+    /// のと同じく、`Query.htapReplicasAll` が「テーブル名を知らなくても
+    /// 全列レプリカの状態を一覧できる」ようにするための入口。
+    pub fn replicated_tables(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.replica_state.lock().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// A.6-3: この列レプリカが適用済みの最大 Raft ログインデックス。
     pub fn applied_index(&self) -> u64 {
         self.applied_index.load(std::sync::atomic::Ordering::Relaxed)

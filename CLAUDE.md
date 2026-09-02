@@ -5915,3 +5915,49 @@ far-future `closed_ts_receive` value rejected before poisoning the HLC
 (`max_offset_ms=60000`). Remaining: the true separate-process
 `--columnar-learner` `?required_index=` 409 path, multi-table
 `htapReplicas`, and P-HLC-3 (HLC case-A full migration).
+
+## HANDOFF追記(2026-09-02続き24) `Query.htapReplicasAll`(全テーブル一覧)
+
+**位置づけ**: 続き23 の「残り」の1つ——`htapReplicas` の複数テーブル一括版
+——を実装。TiFlash の `INFORMATION_SCHEMA.TIFLASH_REPLICA` が全 (db, table)
+行を返すのと同じく、**テーブル名を知らなくても全列レプリカの同期状態を
+一覧できる**ようにするのが目的(監視サーフェスとしての実用性向上)。
+
+- `aruaru-dist::ColumnarApplier::replicated_tables() -> Vec<String>`
+  (`replica_state` のキー、ソート済み)を追加。
+- `aruaru-graphql`: `htapReplicas` / `htapReplicasAll` 共通の
+  `htap_status_for(columnar, table, prune)` ヘルパーへ切り出し
+  (per-table のステータス組み立てロジックの重複を排除)。
+  `Query.htapReplicasAll -> [HtapReplicaStatusGql]`(prune プレビューは
+  含めない。列レプリカ無効なら空配列)。`admin(ctx)?` で認証。
+- テスト: `htap_replicas_query_reports_columnar_replica_progress_and_pruning`
+  を拡張——2 テーブル目(`a_first`)を足すと `htapReplicasAll` が
+  ソート順で両方(`a_first`, `m`)を返し、いずれも `available=true`。
+- 検証: `cargo test -p aruaru-graphql` **20 passed** / `-p aruaru-dist`
+  **101 passed**、`cargo build --workspace` 成功。
+
+### 残り(続き24 時点)
+1. `--columnar-learner` **真の別プロセス learner** での
+   `GET /columnar/:table/prune`・`?required_index=` の 409 実 HTTP
+   (同居モードでは applied_index は常に 0)。
+2. 復活用メッセージ項目5(`disaster_backup.email` reconcile、feature
+   ゲート)・項目6(Tauri)・項目7(P4〜P6)。
+3. HLC 案A 全面移行(`docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3)。
+4. open-cuda: Hopper/Ada 実機での `sgemm_fp8_weight_vendor` 実装、
+   AWQ 実配布モデルでの E2E。
+
+**English summary**: added `Query.htapReplicasAll`, the multi-table version
+of `htapReplicas`. Like TiFlash's `INFORMATION_SCHEMA.TIFLASH_REPLICA`
+(one row per (db, table)), it lets you list the sync state of *every*
+columnar replica without knowing table names — useful as a monitoring
+surface. `ColumnarApplier::replicated_tables()` returns the sorted
+`replica_state` keys; a shared `htap_status_for` helper removes the
+per-table status-building duplication; `htapReplicasAll` returns
+`[HtapReplicaStatusGql]` (no pruning preview; empty when the feature is
+off). Test extended: adding a second table (`a_first`) makes
+`htapReplicasAll` return both in sorted order, both `available=true`.
+`cargo test -p aruaru-graphql` 20 passed / `-p aruaru-dist` 101 passed,
+`cargo build --workspace` OK. Remaining: the true separate-process
+`--columnar-learner` `?required_index=` 409 path; `disaster_backup.email`
+reconcile; Tauri; P4–P6; HLC case-A (P-HLC-3); open-cuda Hopper/Ada FP8
+vendor GEMM.
