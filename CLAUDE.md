@@ -5961,3 +5961,110 @@ off). Test extended: adding a second table (`a_first`) makes
 `--columnar-learner` `?required_index=` 409 path; `disaster_backup.email`
 reconcile; Tauri; P4–P6; HLC case-A (P-HLC-3); open-cuda Hopper/Ada FP8
 vendor GEMM.
+
+## HANDOFF追記(2026-09-02続き25) 残タスク消化: (1) 真の別プロセス learner の E2E、(2a) `disaster_backup.email` reconcile 配線
+
+### (1) `--columnar-learner` **真の別プロセス learner** の実 HTTP E2E(検証・バグ無し)
+
+続き23 で「同居モードでは `applied_index` は常に 0、staleness ゲートは
+学習器プロセス用」と残していた分を、実際に 2 プロセス起動して確認した。
+
+- leader(`--raft-id 1 --learner-peers "2@127.0.0.1:18081"`、単一 voter=
+  quorum 1)+ columnar learner(`--raft-id 2 --raft-role learner
+  --peers "1@..." --columnar-learner --gql-port 18081`)を release バイナリで起動。
+- leader へ `POST /admin/cluster/propose` で `CREATE TABLE gear` + 5 `INSERT`
+  → RaftWriter 経由 commit → **バイナリトランスポート**で learner へ複製。
+- learner の `columnar_pod` を実 HTTP:
+  - `GET /columnar/gear` → `appliedIndex=6`(**同居モードの 0 と違い、
+    `apply_at` が実 Raft ログインデックスを記録**)、`replicationCount=6`、
+    `columnarBlockCount=6`、`columnarLiveRowCount=5`。
+  - `GET /columnar/gear/prune?column=qty&op=gt&value=25` → `skippedBlocks=2`、
+    `keptBlocks=4`、`keptLiveRows=3`。
+  - `GET /columnar/gear?required_index=99999` → **409** +
+    `{"stale":true,"appliedIndex":6,"requiredIndex":99999}`。
+  - `GET /columnar/gear?required_index=6` → **200** `{"stale":false}`。
+  - `DELETE FROM gear WHERE id=3` → 複製され `columnarDeletionVectorPositions=1`、
+    `columnarLiveRowCount=4`。
+- ログにエラー・パニック無し(無関係な DB-Engines クロール失敗 WARN のみ)。
+  **バグは見つからなかった**——`apply_at` の Raft index 記録・409 staleness
+  ゲート・deletion vector 書き込み側が真の別プロセス learner で機能する
+  ことを実証した。
+
+### (2a) `disaster_backup.email` の reconcile 配線(`feature = "disaster_email_backup"`)
+
+宣言的設定「メールアドレスひとつ」でディザスタ退避を有効化する。復活用
+メッセージ項目5 の前半。
+
+- `config::reconcile` に `#[cfg(feature = "disaster_email_backup")]` ブロックを
+  追加。`new.disaster_backup`(前回適用分と `PartialEq` 比較で冪等判定)で
+  変化を検知し、`enabled=true` かつ必須7フィールドが揃っていれば
+  `DisasterEmailBackupConfig` を構築 →
+  `AdminState::set_disaster_email_backup`(新設、REST ハンドラと共通経路)で
+  保管 + 稼働中 `RaftWriter` へ注入。必須フィールド欠落は warn のみで無効
+  継続。`enabled` を false へ戻した場合は「稼働中経路からの取り外しは
+  未対応(要再起動)」と warn。
+- `aruaru-dist::DisasterEmailBackupConfig::from_parts(...)` を追加
+  (`aruaru-server` が `open_raid_z_core::EmailBackupTargetConfig` を直接
+  名前参照せずに済む)。
+- `ReconcileReport` に `disaster_backup_changed: bool`。
+- `admin.rs` の `set_disaster_email_backup` REST ハンドラを共通経路
+  `AdminState::set_disaster_email_backup` 経由へリファクタ。
+- **ついでに pre-existing バグ修正**: `disaster_email_backup` feature 配下の
+  REST ハンドラ 2 本の `check_admin_auth(req)` が 1 引数のままで、
+  `KeyGuardian` 引数追加以降コンパイル不能だった(feature が CI に無く
+  露見していなかった)。`check_admin_auth(req, &state.keyring)` へ是正。
+- `aruaru.example.yaml` の `disaster_backup` コメントを更新。
+- テスト: `disaster_backup_email_reconcile_wires_config_and_is_idempotent`
+  (初回で `disaster_backup_changed`、同一再適用で不変、必須欠落で不変)。
+
+### 検証
+- 既定ビルド: `cargo test -p aruaru-server` 13 passed、
+  `cargo build --workspace` 成功。
+- feature ビルド: `cargo test -p aruaru-server -p aruaru-dist
+  --features disaster_email_backup` → aruaru-server **14 passed** /
+  aruaru-dist **108 passed**(いずれも 1 ignored)。
+
+### 未着手(ハードウェア/前提の制約で不可、正直な開示)
+- **HLC 案A 全面移行(P-HLC-3)**: P3 で GraphQL 化したばかりの API を
+  物理/論理 2 フィールドで運ぶ形へ再全面変更する大改修。過大なため
+  引き続き `docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3 として保留。
+- **open-cuda Hopper/Ada `sgemm_fp8_weight_vendor` 実装**: NVIDIA H100/
+  RTX40 世代 + cuBLASLt FP8 が必要。この開発機は GT 730(Kepler、Tensor
+  Core 無し)のため**実装・検証とも不可能**。能力フラグ
+  (`supports_fp8_tensor_core`)+ スタブ + ソフトウェアフォールバックまでが
+  この環境で正直に到達できる範囲。
+- **AWQ 実配布モデルでの E2E**: AWQ は Llama/Mistral/Qwen 系が対象で、
+  GPT-2 アーキテクチャ(`Conv1D`)の AWQ 公開モデルは事実上存在しない。
+  `open-cuda-llm::GptModel` は GPT-2 のみロード可のため、実 AWQ モデルでの
+  E2E は現実的に不可。合成 interleaved-4bit テンソルの厳密一致テストが
+  この loader の検証上限。
+
+### 残り(次回)
+1. 復活用メッセージ項目5 の後半 / 項目6(Tauri)・項目7(P4〜P6)。
+2. HLC 案A 全面移行(P-HLC-3)。
+3. Hopper/Ada 実機が入手できた場合の open-cuda FP8 ベンダー GEMM。
+
+**English summary**: Two remaining next-phase items cleared. **(1)** The true
+separate-process `--columnar-learner` path was verified end-to-end over real
+HTTP: a leader (`POST /admin/cluster/propose`) replicates via the binary
+transport to a learner process whose `columnar_pod` now reports a **real
+Raft log index** (`appliedIndex=6`, vs always 0 in co-located mode) because
+`apply_at` records it; `?required_index=99999` returns **409**
+(`stale:true`), `?required_index=6` returns 200, pruning
+(`skippedBlocks=2`) and the deletion vector (`deletionVectorPositions=1`
+after DELETE) all work. No bugs found. **(2a)** `disaster_backup.email` is
+now wired into `config::reconcile` (feature `disaster_email_backup`): a
+declarative `aruaru.yaml` block, when `enabled` with all 7 fields, builds a
+`DisasterEmailBackupConfig` and injects it into the live `RaftWriter` via a
+new shared `AdminState::set_disaster_email_backup` (also used by the REST
+handler); idempotent via `PartialEq`; missing fields → warn only. Fixed a
+**pre-existing compile break**: the two `disaster_email_backup`-gated REST
+handlers still called `check_admin_auth(req)` (1-arg) — never compiled since
+`KeyGuardian` was added, since the feature isn't in CI — now
+`check_admin_auth(req, &state.keyring)`. Tests: default `cargo test -p
+aruaru-server` 13, `cargo build --workspace` OK; feature build `cargo test
+-p aruaru-server -p aruaru-dist --features disaster_email_backup` → 14 / 108
+passed. **Still blocked (honestly)**: HLC case-A full migration (P-HLC-3,
+over-churn); open-cuda Hopper/Ada `sgemm_fp8_weight_vendor` (needs H100/RTX40
++ cuBLASLt FP8 — this box is a GT 730); AWQ real-model E2E (no public
+GPT-2-architecture AWQ models exist).

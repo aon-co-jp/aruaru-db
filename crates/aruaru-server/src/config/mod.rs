@@ -225,7 +225,7 @@ impl Default for HtapDeltaConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DisasterBackupConfig {
     /// この宣言的設定を有効化するか（`feature = "disaster_email_backup"`
@@ -240,7 +240,7 @@ pub struct DisasterBackupConfig {
 /// フィールド（`aruaru.yaml` に正直に全項目を出す）。`${VAR}` 展開で
 /// SMTP パスワードは環境変数名を渡す設計（値そのものは書かない）。
 /// P3 で `config::reconcile` の feature ゲート付き分岐が消費する。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct DisasterBackupEmail {

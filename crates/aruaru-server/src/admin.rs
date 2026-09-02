@@ -204,6 +204,25 @@ impl AdminState {
         self.replicator.lock().clone()
     }
 
+    /// ディザスタ用メール退避先を保管し、稼働中の `RaftWriter` があれば
+    /// そこへ注入する。戻り値は「稼働中の書き込み経路へ実際に注入できたか」。
+    /// REST `POST /admin/disaster-email-backup` と `config::reconcile`
+    /// (`aruaru.yaml: disaster_backup.email`)の両方から呼ばれる共通経路。
+    #[cfg(feature = "disaster_email_backup")]
+    pub fn set_disaster_email_backup(
+        &self,
+        backup: Arc<aruaru_dist::DisasterEmailBackup>,
+    ) -> bool {
+        *self.disaster_email_backup.lock() = Some(backup.clone());
+        match self.replicator() {
+            Some(replicator) => {
+                replicator.set_disaster_email_backup(backup);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// 【2026-08-29新設】バイナリRaft/WALリスナー(`main.rs`)がclosed
     /// timestampのside transportを受信側で取り込めるようにするための
     /// アクセサ。
@@ -1134,25 +1153,16 @@ fn set_disaster_email_backup(
     state: Data<&Arc<AdminState>>,
     Json(config): Json<aruaru_dist::DisasterEmailBackupConfig>,
 ) -> poem::Result<Json<Value>> {
-    if let Err((status, msg)) = check_admin_auth(req) {
+    if let Err((status, msg)) = check_admin_auth(req, &state.keyring) {
         return Err(poem::Error::from_string(msg, status));
     }
 
-    let backup = Arc::new(aruaru_dist::DisasterEmailBackup::new(config));
-    *state.disaster_email_backup.lock() = Some(backup.clone());
-
     // gap (b) 対応: 検証・保管だけでなく、実際に稼働中の RaftWriter
     // (pgwire サーバへ渡しているのと同一インスタンス)へ注入する。
-    // クラスタ構築(Raft)に成功していない場合(単一ノード・レプリケータ
-    // 無し)は `replicator` が `None` のままなので、その旨を正直に message
-    // へ含める。
-    let injected = match state.replicator() {
-        Some(replicator) => {
-            replicator.set_disaster_email_backup(backup);
-            true
-        }
-        None => false,
-    };
+    // `config::reconcile` と共通の `AdminState::set_disaster_email_backup`
+    // 経由。クラスタ未構築(replicator None)なら `false`。
+    let backup = Arc::new(aruaru_dist::DisasterEmailBackup::new(config));
+    let injected = state.set_disaster_email_backup(backup);
 
     Ok(Json(json!({
         "message_ja": if injected {
@@ -1173,7 +1183,7 @@ fn set_disaster_email_backup(
 #[cfg(feature = "disaster_email_backup")]
 #[handler]
 async fn verify_disaster_email_backup(req: &Request, state: Data<&Arc<AdminState>>) -> poem::Result<Json<Value>> {
-    if let Err((status, msg)) = check_admin_auth(req) {
+    if let Err((status, msg)) = check_admin_auth(req, &state.keyring) {
         return Err(poem::Error::from_string(msg, status));
     }
 
