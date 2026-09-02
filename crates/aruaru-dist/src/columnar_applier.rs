@@ -206,6 +206,24 @@ pub struct HtapPrunePreview {
     pub kept_live_rows: u64,
 }
 
+/// A.6-3: `read_at_index` が staleness を検知したときの詳細。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaleRead {
+    pub applied_index: u64,
+    pub required_index: u64,
+    pub applied_commit_seq: u64,
+    pub required_commit_seq: u64,
+}
+
+/// A.6-3: staleness 検証を通過した MoR ビューのスナップショット。
+#[derive(Clone, Debug)]
+pub struct HtapReplicaView {
+    pub blocks: Vec<BlockMeta>,
+    pub live_row_count: u64,
+    pub applied_index: u64,
+    pub applied_commit_seq: u64,
+}
+
 /// Raft learner 用の行→列変換 `Applier`。
 pub struct ColumnarApplier {
     /// 行ストアのローカルミラー(learner 自身が保持、`EngineApplier`と
@@ -219,6 +237,13 @@ pub struct ColumnarApplier {
     replica_state: Mutex<HashMap<String, TableReplicaState>>,
     /// 実際に commit された列変換の回数(観測用)。
     replication_count: std::sync::atomic::AtomicU64,
+    /// A.6-3: 適用済みの最大 Raft ログインデックス(読み取り時の
+    /// staleness 検証に使う)。
+    applied_index: std::sync::atomic::AtomicU64,
+    /// A.6-3(MVCC SI 簡易版): 適用済み `Command::Commit` の通し番号。
+    /// follower read が「クエリ発行時点までの全コミットを見られる」ことを
+    /// 呼び出し側が確認するためのゲート。
+    applied_commit_seq: std::sync::atomic::AtomicU64,
     /// delta がこの個数たまったら base へ compaction する
     /// (`aruaru.yaml: htap.delta.compaction_threshold`)。
     compaction_threshold: usize,
@@ -233,6 +258,8 @@ impl ColumnarApplier {
             tables: Mutex::new(HashMap::new()),
             replica_state: Mutex::new(HashMap::new()),
             replication_count: std::sync::atomic::AtomicU64::new(0),
+            applied_index: std::sync::atomic::AtomicU64::new(0),
+            applied_commit_seq: std::sync::atomic::AtomicU64::new(0),
             compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
         }
     }
@@ -525,6 +552,56 @@ impl ColumnarApplier {
         self.replication_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// A.6-3: この列レプリカが適用済みの最大 Raft ログインデックス。
+    pub fn applied_index(&self) -> u64 {
+        self.applied_index.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A.6-3: 適用済み `Command::Commit` の通し番号(MVCC SI 簡易版)。
+    pub fn applied_commit_seq(&self) -> u64 {
+        self.applied_commit_seq.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A.6-3: Raft index + MVCC(commit 通し番号)で staleness を検証した
+    /// うえで MoR ビューを返す。`required_index` までのログ、かつ
+    /// `required_commit_seq` までのコミットが適用済みでなければ
+    /// `Err(StaleRead)` を返す(TiKV safe-ts / TiFlash の
+    /// 「読み取り時 Raft index + MVCC で SI 検証」に相当)。
+    /// どちらの要件も `0` を渡せば無条件(index/seq を問わない)。
+    pub fn read_at_index(
+        &self,
+        table_name: &str,
+        required_index: u64,
+        required_commit_seq: u64,
+    ) -> Result<HtapReplicaView, StaleRead> {
+        let applied_index = self.applied_index();
+        let applied_commit_seq = self.applied_commit_seq();
+        if applied_index < required_index || applied_commit_seq < required_commit_seq {
+            return Err(StaleRead {
+                applied_index,
+                required_index,
+                applied_commit_seq,
+                required_commit_seq,
+            });
+        }
+        let (blocks, live_row_count) = {
+            let states = self.replica_state.lock();
+            match states.get(table_name) {
+                Some(st) => (
+                    st.blocks.clone(),
+                    st.blocks.iter().map(|b| b.live_row_count()).sum(),
+                ),
+                None => (Vec::new(), 0),
+            }
+        };
+        Ok(HtapReplicaView {
+            blocks,
+            live_row_count,
+            applied_index,
+            applied_commit_seq,
+        })
+    }
+
     /// 行ストアのミラー(テスト・診断用に直接読みたい場合)。
     pub fn engine(&self) -> &Arc<QueryEngine> {
         &self.engine
@@ -532,6 +609,21 @@ impl ColumnarApplier {
 }
 
 impl Applier for ColumnarApplier {
+    fn apply_at(&self, index: u64, command: &Command) -> CommandResponse {
+        let resp = self.apply(command);
+        // 行ストアへの適用が成功したエントリだけを「適用済み」として
+        // 前進させる(失敗したエントリを跨いで index を進めない)。
+        if resp.ok {
+            self.applied_index
+                .fetch_max(index, std::sync::atomic::Ordering::Relaxed);
+            if matches!(command, Command::Commit(_)) {
+                self.applied_commit_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        resp
+    }
+
     fn apply(&self, command: &Command) -> CommandResponse {
         match command {
             Command::Exec(sql) => {
@@ -795,6 +887,39 @@ mod tests {
         );
 
         assert!(applier.prune_range_preview("missing", "v", RangeOp::Gt, 0.0).is_none());
+    }
+
+    #[test]
+    fn read_at_index_gates_on_applied_raft_index_and_commit_seq() {
+        let applier = new_applier();
+        applier.apply_at(10, &Command::Exec(
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT)".into(),
+        ));
+        applier.apply_at(11, &Command::Exec("INSERT INTO t (id, v) VALUES (1, 5)".into()));
+        assert_eq!(applier.applied_index(), 11);
+        assert_eq!(applier.applied_commit_seq(), 0);
+
+        // まだ index 11 までしか適用していない → index 20 の読み取りは stale。
+        let err = applier
+            .read_at_index("t", 20, 0)
+            .expect_err("index 20 not applied yet");
+        assert_eq!(err.applied_index, 11);
+        assert_eq!(err.required_index, 20);
+
+        // index 11 までの読み取りは通り、MoR ビューが返る。
+        let view = applier.read_at_index("t", 11, 0).expect("index 11 is applied");
+        assert_eq!(view.live_row_count, 1);
+        assert_eq!(view.applied_index, 11);
+
+        // Commit を適用すると commit_seq が前進する。
+        applier.apply_at(12, &Command::Commit("snap".into()));
+        assert_eq!(applier.applied_commit_seq(), 1);
+        assert!(applier.read_at_index("t", 0, 2).is_err(), "commit_seq 2 not reached");
+        assert!(applier.read_at_index("t", 12, 1).is_ok());
+
+        // 失敗したエントリでは applied_index を前進させない。
+        applier.apply_at(99, &Command::Exec("INSERT INTO missing (id) VALUES (1)".into()));
+        assert_eq!(applier.applied_index(), 12, "failed apply must not advance the index");
     }
 
     #[test]
