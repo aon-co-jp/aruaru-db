@@ -432,6 +432,7 @@ async fn main() -> anyhow::Result<()> {
         // 旧 REST `/admin/closed-timestamp/{status,range,advance,plan}`・
         // `/admin/wal-service/*`・`/admin/sharded-store*` は撤廃済み。
         let closed_ts_for_graphql = admin_state.closed_ts_coordinator();
+        let hlc_for_graphql = admin_state.hlc_handle();
         let wal_storage_for_graphql = admin_state.wal_storage_handle();
         let sharded_store_for_graphql = admin_state.sharded_store_handle();
         // 【2026-08-31 trait注入リファクタ】ephemeral SQL pod。実プロセス
@@ -492,6 +493,7 @@ async fn main() -> anyhow::Result<()> {
                     sharded_store: Some(sharded_store_for_graphql.clone()),
                     ephemeral: ephemeral_for_graphql.clone(),
                     multi_raft: Some(multi_raft_for_graphql.clone()),
+                    hlc: Some(hlc_for_graphql.clone()),
                 },
             ))
             .at("/graphql/sdl", get(subgraph_sdl))

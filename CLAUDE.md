@@ -231,15 +231,21 @@
 > 4. **⏳ 要求③の実装トラック**: A.6-2 `ColumnarApplier` 本体は続き15、
 >    実プロセス配線は続き16、**A.6-4 段階2(base+delta の Merge-on-Read
 >    + deletion vector の書き込み側配線)は続き20 で完了**(8ユニット
->    テスト green、2プロセス実HTTP E2E で DELETE/UPDATE が block を
->    書き直さず deletion vector を立てることを実証)。**残り**:
->    (a) A.6-1 HLC(続き14 で `hlc.rs` 実装済み・未配線)を
->    `closed_ts`/`wal_service`/`multi_raft` のタイムスタンプ源へ配線、
->    (b) `aruaru.yaml: htap` セクション(§5・A.7)実装 +
+>    テスト green、2プロセス実HTTP E2E で実証)。**A.6-1 HLC は続き21 で
+>    完了**——`docs/HLC_TIMESTAMP_REDESIGN.md`(u64 オーバーフローの
+>    設計ミスを一次資料調査で再設計、案B=物理を 65µs 粒度へ切り捨てて
+>    下位 16bit に論理を収める)、`hlc.rs` 全面書き換え(13テスト)、
+>    `closed_ts` 系の「now 既定値」を HLC ordinal へ配線
+>    (`AdminState`/`AdminCtx` 共有、`closed_ts_receive` で
+>    `observe_ordinal`)、実HTTP E2E で `closedTsAdvance` が実 Unix
+>    ナノ秒スケールの単調 ordinal を返すことを確認。**残り**:
+>    (a) `aruaru.yaml: htap` セクション(§5・A.7)実装 +
 >    `--columnar-learner` を宣言的設定経由の起動へ統合、
->    (c) `ColumnarApplier` の block を `prune_range`/`prune_equality` へ
+>    (b) `ColumnarApplier` の block を `prune_range`/`prune_equality` へ
 >    流す枝刈り込み観測 API(`Query.htapReplicas` 相当)、
->    (d) A.6-3(読み取り時の Raft index + MVCC による SI 検証)。
+>    (c) A.6-3(読み取り時の Raft index + MVCC による SI 検証)、
+>    (d) HLC の案A全面移行・`max_offset` スキュー上限
+>    (`docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3、将来)。
 > 5. `disaster_backup.email` の reconcile(`feature = "disaster_email_backup"`
 >    ゲート。config スキーマは 7 フィールドへ拡張済み)。
 > 6. Tauri(`admin/src-tauri`、ワークスペース外・この環境ではビルド不可)
@@ -5602,3 +5608,83 @@ vector を立てる経路)まで通した。
 経由の起動へ統合、(3) `ColumnarApplier` の block を `prune_range`/
 `prune_equality` へ流す枝刈り込み観測 API(`Query.htapReplicas` 相当)、
 (4) A.6-3(読み取り時の Raft index + MVCC による SI 検証)。
+
+## HANDOFF追記(2026-09-02続き21) HLC タイムスタンプ・エンコーディングの設計ミス(u64オーバーフロー)を再設計・修正・配線
+
+**位置づけ**: ユーザー指摘「`hlc.rs` の `as_nanos()` が Unix ナノ秒 `pt` を
+`<<16` すると u64 オーバーフローする。**一から設計し直して新規設計書を
+まず完成させて**」への対応。
+
+### (1) 新規設計書(正本): `docs/HLC_TIMESTAMP_REDESIGN.md`
+
+一次資料調査(CockroachDB `timestamp.go` は物理=ナノ秒・論理を**別
+フィールド**でパックしない/ compact な 1 整数版は物理を ms・µs 粒度へ
+落として下位ビットを空ける)を踏まえ、案A(パックをやめ 2 フィールドで
+運ぶ=P3 で GraphQL 化したばかりの API を再全面変更、過大)ではなく
+**案B**を採用:
+
+- `Hlc` の内部 `pt` を**常に `wall & !0xFFFF`**(下位 16bit ゼロの
+  Unix ナノ秒、分解能 ≒ 65.536µs)として保持。論理カウンタ `l` は
+  その空いた 16bit にちょうど収まる。
+- `as_ordinal()`(旧 `as_nanos()`)= `(pt & PHYSICAL_MASK) | (l & 0xFFFF)`。
+  **左シフトしないためオーバーフローしない**。同一 65µs バケット内は
+  `l` で順序、バケットが進めば `pt` が 65536 以上ジャンプするため
+  `l`(< 65536)がどれだけ大きくても逆転不能(厳密単調)。
+- 論理枯渇時(65µs に 65536 回超のイベント、現実にはほぼ不可能)は
+  `pt` を次バケットへ先食いして `l=0`(単調性を絶対に壊さない)。
+- 正直な代償: 物理分解能 65.536µs(旧コメントが暗に主張していた
+  ナノ秒精度は失われる)。`closed_ts` の `target_lag` は秒単位のため
+  実用影響なし。`max_offset` 相当のスキュー上限は引き続き未実装。
+
+### (2) 実装(P-HLC-1): `crates/aruaru-dist/src/hlc.rs` 全面書き換え
+
+`as_nanos()` → `as_ordinal()` へ改名(`#[deprecated]` エイリアスは
+残す、外部呼び出し元ゼロを grep 確認済み)。`from_ordinal`・
+`now_ordinal`(`SystemTime` 内蔵の実運用向け)・`observe_ordinal`
+(side transport の u64 を復号して `update`)を新設。
+`cargo test -p aruaru-dist hlc::` **13 passed**(新規回帰:
+実 Unix ナノ秒での非オーバーフロー、バケット境界跨ぎの単調性、
+論理枯渇時の桁上げ、`observe_ordinal` の前進、並行 500×8 で
+ordinal 重複ゼロ)。
+
+### (3) 配線(P-HLC-2): `closed_ts` 系の「now 既定値」を HLC 由来へ
+
+- `AdminState`(aruaru-server)+ `AdminCtx`(aruaru-graphql)へ
+  `Arc<aruaru_dist::Hlc>` を追加、`main.rs` で同一インスタンス共有
+  (`hlc_handle()`、`topology`/`closed_ts`/`keyring` と同じパターン)。
+- `admin_resolvers.rs`: `now_unix_nanos()`(生 `SystemTime`)を
+  `now_default_nanos(ctx)`(HLC があれば `now_ordinal()`、無ければ
+  従来フォールバック)へ差し替え。`closedTsAdvance` /
+  `planFollowerRead` の `nowNanos` 省略時に効く(明示指定時は尊重、
+  既存挙動維持)。
+- `admin.rs::closed_ts_receive`(side transport 受信): 取り込んだ
+  更新の最大 closed-ts で `state.hlc.observe_ordinal(max, wall)`
+  ——「送信時に相乗り・受信時に update」という HLC の因果伝播。
+- `wal_service`(`commitLSN` は LSN であって時刻ではない)・
+  `multi_raft`(タイムスタンプを取らない)は HLC 対象外——付録 A.6-1
+  の記述をこの点で precise 化した。
+
+### 検証(実測)
+
+- `cargo test -p aruaru-dist -p aruaru-graphql -p aruaru-server` →
+  aruaru-dist **95 passed / 1 ignored**、aruaru-graphql **19 passed**
+  (新規 `closed_ts_advance_without_now_uses_monotonic_hlc_ordinal`)、
+  aruaru-server **13 passed / 1 ignored**、失敗0。
+- `cargo build --workspace` 成功(既存の `build_cluster`/
+  `propose_commit` 未使用警告2件のみ、無関係)。
+- **実プロセス HTTP E2E**: 実 `aruaru-server` を起動し、
+  `closedTsAdvance`(`nowNanos` 省略)→ HLC ordinal
+  `1788327316574937600`(≈ 1.788×10¹⁸、実 Unix ナノ秒スケール——
+  旧 `pt<<16` なら u64 ラップして桁が壊れていた値)、2 連続呼び出しで
+  厳密増加、`planFollowerRead`(now 省略)→ `plan=follower_read`、
+  旧 REST `/admin/closed-timestamp/advance` はトークン付きで `404`
+  (P3 撤廃は維持)を確認。
+
+### 次にやること(要求③実装トラックの残り)
+
+`aruaru.yaml: htap` セクション(§5・A.7、`columnar_replicas`/
+`read_consistency`/`delta.compaction_threshold`)+ `--columnar-learner` の
+宣言的設定経由起動への統合、`Query.htapReplicas` 相当の枝刈り込み
+観測 API、A.6-3(読み取り時の Raft index + MVCC による SI 検証)。
+HLC の案A 全面移行・`max_offset` スキュー上限は
+`docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3 として将来検討。
