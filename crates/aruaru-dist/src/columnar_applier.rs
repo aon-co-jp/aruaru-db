@@ -280,6 +280,24 @@ impl ColumnarApplier {
         )
     }
 
+    /// **同居(co-located)オブザーバモード**: 本番の `aruaru-server` が
+    /// 既に持っている行ストア `QueryEngine` を**そのまま共有**し、
+    /// `apply()` 経由ではなく [`ColumnarApplier::observe_table`] 経由で
+    /// 列レプリカを追従させる(`main.rs` が `set_columnar_observer` の
+    /// 通知を受けてテーブル名ごとに呼ぶ)。行ストアのローカルミラーを
+    /// 二重に持たないぶん軽量で、TiFlash の「learner が変更通知を受けて
+    /// 列ストアへ変換する」構造の単一プロセス内近似になる。
+    pub fn observing(shared_engine: Arc<QueryEngine>) -> Self {
+        Self::with_in_memory_store(shared_engine)
+    }
+
+    /// 同居モードで、変更のあったテーブルの列レプリカを追従させる。
+    /// 共有 `QueryEngine` の現在の行内容と差分を取り、base+delta の
+    /// Merge-on-Read ビューへ反映する([`replicate_table`] と同じロジック)。
+    pub fn observe_table(&self, table_name: &str) -> Result<(), TableFormatError> {
+        self.replicate_table(table_name)
+    }
+
     fn object_table_for(&self, table_name: &str) -> Arc<ObjectTable> {
         let mut tables = self.tables.lock();
         tables
@@ -550,6 +568,26 @@ impl ColumnarApplier {
     /// 累計レプリケーション回数(observability用)。
     pub fn replication_count(&self) -> u64 {
         self.replication_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// TiFlash の `INFORMATION_SCHEMA.TIFLASH_REPLICA.PROGRESS`(0.0〜1.0)
+    /// に相当する同期進捗。列レプリカの MoR 実効行数 ÷ 行ストア(共有
+    /// `QueryEngine`)の現在行数。行ストア側にテーブルが無ければ `None`、
+    /// 行数 0 のテーブルは「同期済み」とみなして `1.0`。1.0 を上回る
+    /// (列側が一時的に先行)場合は 1.0 にクランプ。
+    pub fn replication_progress(&self, table_name: &str) -> Option<f64> {
+        let primary_rows = self.engine.snapshot_table(table_name)?.1.len() as f64;
+        if primary_rows == 0.0 {
+            return Some(1.0);
+        }
+        let columnar_rows = self.latest_live_row_count(table_name).unwrap_or(0) as f64;
+        Some((columnar_rows / primary_rows).clamp(0.0, 1.0))
+    }
+
+    /// このテーブルが列レプリカとして「利用可能」か(TiFlash の
+    /// `AVAILABLE` 相当)。一度でもレプリケートされていれば `true`。
+    pub fn replica_available(&self, table_name: &str) -> bool {
+        self.replica_state.lock().contains_key(table_name)
     }
 
     /// A.6-3: この列レプリカが適用済みの最大 Raft ログインデックス。

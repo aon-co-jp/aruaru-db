@@ -417,3 +417,42 @@ pub struct EphemeralQueryResultGql {
     /// spawn失敗等)のメッセージ。`result`/`error`はこの場合`None`のまま。
     pub message: Option<String>,
 }
+
+// ── HTAP 列レプリカ観測(2026-09-02 続き23、Query.htapReplicas) ──
+// TiFlash `INFORMATION_SCHEMA.TIFLASH_REPLICA`(PROGRESS/AVAILABLE)相当。
+// 同居 `ColumnarApplier`(`aruaru.yaml: htap.columnar_replicas: true`)の
+// 行→列非同期変換レプリカの状態を、GraphQL 単一サーフェスから観測する。
+
+#[derive(SimpleObject, Clone)]
+pub struct HtapReplicaStatusGql {
+    pub table: String,
+    /// 一度でもレプリケートされていれば true(TiFlash AVAILABLE 相当)。
+    pub available: bool,
+    /// 同期進捗 0.0〜1.0(列レプリカ実効行数 ÷ 行ストア行数、TiFlash PROGRESS 相当)。
+    pub progress: f64,
+    /// MoR ビューの block 数(base + delta)。
+    pub columnar_block_count: i32,
+    /// deletion vector 差し引き後の実効行数。
+    pub columnar_live_row_count: i64,
+    /// deletion vector にマークされた行位置の総数(論理削除数)。
+    pub deletion_vector_positions: i64,
+    /// 適用済みの最大 Raft ログインデックス(同居モードでは 0)。
+    pub applied_index: i64,
+    /// 適用済み `Command::Commit` 通し番号(MVCC SI ゲート用)。
+    pub applied_commit_seq: i64,
+    /// 累計レプリケーション回数。
+    pub replication_count: i64,
+    /// 枝刈り込みプレビュー(クエリ引数 pruneColumn を渡した場合のみ)。
+    pub prune: Option<HtapPrunePreviewGql>,
+}
+
+#[derive(SimpleObject, Clone)]
+pub struct HtapPrunePreviewGql {
+    pub column: String,
+    pub op: String,
+    pub value: String,
+    pub total_blocks: i32,
+    pub kept_blocks: i32,
+    pub skipped_blocks: i32,
+    pub kept_live_rows: i64,
+}

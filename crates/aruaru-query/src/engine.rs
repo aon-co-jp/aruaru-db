@@ -147,6 +147,11 @@ pub struct QueryEngine {
     /// 後方互換性を保つ——プッシュ通知はあくまで「早く追従できる」
     /// 追加の経路であり、正しさの根拠は引き続きポーリング側にある)。
     olap_notify: RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
+    /// 同居(co-located)`ColumnarApplier` への「行→列」非同期変換の
+    /// トリガーチャネル。`olap_notify` と同じく変更テーブル名を積むが、
+    /// 別スロットなので `OlapCache::subscribe` と同時に配線できる
+    /// (`aruaru.yaml: htap.columnar_replicas: true` で有効化、`main.rs`)。
+    columnar_notify: RwLock<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
 }
 
 impl QueryEngine {
@@ -162,6 +167,7 @@ impl QueryEngine {
             olap_delta_pks: RwLock::new(std::collections::HashMap::new()),
             olap_schema_dirty: RwLock::new(std::collections::HashSet::new()),
             olap_notify: RwLock::new(None),
+            columnar_notify: RwLock::new(None),
         }
     }
 
@@ -178,6 +184,7 @@ impl QueryEngine {
             olap_delta_pks: RwLock::new(std::collections::HashMap::new()),
             olap_schema_dirty: RwLock::new(std::collections::HashSet::new()),
             olap_notify: RwLock::new(None),
+            columnar_notify: RwLock::new(None),
         }
     }
 
@@ -201,6 +208,18 @@ impl QueryEngine {
         if let Some(tx) = self.olap_notify.read().as_ref() {
             let _ = tx.send(table.to_string());
         }
+        if let Some(tx) = self.columnar_notify.read().as_ref() {
+            let _ = tx.send(table.to_string());
+        }
+    }
+
+    /// 同居 `ColumnarApplier`(行→列非同期変換レプリカ)へ、変更テーブル名を
+    /// 通知するチャネルの送信側を登録する。`set_olap_notifier` と独立した
+    /// スロットで、両方同時に配線できる。受信側は `main.rs` が
+    /// `spawn` したタスクで、テーブル名ごとに
+    /// `ColumnarApplier::observe_table` を呼ぶ。
+    pub fn set_columnar_observer(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        *self.columnar_notify.write() = Some(tx);
     }
 
     /// 永続ストアを取り付ける。以後 aruaru_commit ごとに自動で persist する。
