@@ -68,6 +68,15 @@ wal:
 sharded_store:
   shards: 0              # 0 = 論理コア数(静的)
 
+# HTAP(Raft-Learner 上の 行→列 非同期変換レプリカ)。--columnar-learner
+# 起動の可否・読み取り検証方式・ColumnarApplier の compaction 閾値を
+# 決めるため「静的」扱い(変更検知で "要再起動" を警告するのみ)。
+htap:
+  columnar_replicas: false          # true で列レプリカ learner を有効化(予定)
+  read_consistency: "eventual"      # eventual | raft-index | strict
+  delta:
+    compaction_threshold: 8         # delta ブロックが N 個たまったら base へ畳み込む(0 = 既定値 8)
+
 # disaster_backup:       # feature = "disaster_email_backup" ビルドのみ。P3 で reconcile 接続予定
 #   enabled: false
 #   email:                # EmailBackupTargetConfig と同じ7項目

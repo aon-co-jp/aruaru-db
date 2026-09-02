@@ -35,7 +35,7 @@
 //!   いた残課題)**: 実際の DELETE / UPDATE が発生したら、消えた行・
 //!   古くなった行の**block 内位置**を `BlockMeta::deletion_vector` へ
 //!   マークする。block の実体は書き直さない(即時 rewrite 無しの MoR)。
-//! - **compaction**: delta が `COMPACTION_THRESHOLD` 個たまったら、
+//! - **compaction**: delta が `DEFAULT_COMPACTION_THRESHOLD` 個たまったら、
 //!   現在のテーブル全体から新しい base を作り直し、delta を畳み込む。
 //!
 //! `object_table.commit_blocks()` には毎回 `[base, delta_1, .., delta_n]`
@@ -81,8 +81,10 @@ use aruaru_query::QueryEngine;
 use crate::raft::{Applier, Command, CommandResponse};
 
 /// delta block をこの個数ためたら、テーブル全体から base を作り直して
-/// 畳み込む(TiFlash DeltaTree の閾値 compaction 相当)。
-const COMPACTION_THRESHOLD: usize = 8;
+/// 畳み込む(TiFlash DeltaTree の閾値 compaction 相当)の既定値。
+/// `aruaru.yaml: htap.delta.compaction_threshold` で上書きできる
+/// (`ColumnarApplier::with_compaction_threshold`)。
+pub const DEFAULT_COMPACTION_THRESHOLD: usize = 8;
 
 /// `table_format::ObjectTable`は `(db_id, table_id)` という u64 の組で
 /// テーブルを識別する(Databend と同じキー空間)。列レプリカは SQL の
@@ -199,6 +201,9 @@ pub struct ColumnarApplier {
     replica_state: Mutex<HashMap<String, TableReplicaState>>,
     /// 実際に commit された列変換の回数(観測用)。
     replication_count: std::sync::atomic::AtomicU64,
+    /// delta がこの個数たまったら base へ compaction する
+    /// (`aruaru.yaml: htap.delta.compaction_threshold`)。
+    compaction_threshold: usize,
 }
 
 impl ColumnarApplier {
@@ -210,7 +215,14 @@ impl ColumnarApplier {
             tables: Mutex::new(HashMap::new()),
             replica_state: Mutex::new(HashMap::new()),
             replication_count: std::sync::atomic::AtomicU64::new(0),
+            compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
         }
+    }
+
+    /// compaction 閾値(delta 個数)を指定する。`0` は既定値へフォールバック。
+    pub fn with_compaction_threshold(mut self, n: usize) -> Self {
+        self.compaction_threshold = if n == 0 { DEFAULT_COMPACTION_THRESHOLD } else { n };
+        self
     }
 
     /// テストやサーバー起動時にメモリ実装をそのまま使いたい場合の便利
@@ -354,7 +366,7 @@ impl ColumnarApplier {
 
                     // 3. compaction: delta がたまったらテーブル全体から base を
                     //    作り直して畳み込む(TiFlash DeltaTree の閾値 compaction)。
-                    if st.deltas_since_base >= COMPACTION_THRESHOLD {
+                    if st.deltas_since_base >= self.compaction_threshold {
                         st.base_generation += 1;
                         let base = build_block(
                             format!("mem://{table_name}/base/{}", st.base_generation),
@@ -608,9 +620,9 @@ mod tests {
         applier.apply(&Command::Exec(
             "CREATE TABLE t (id INT PRIMARY KEY, v INT)".into(),
         ));
-        // 各 INSERT が delta を1つ足す。COMPACTION_THRESHOLD 個目の delta で
+        // 各 INSERT が delta を1つ足す。DEFAULT_COMPACTION_THRESHOLD 個目の delta で
         // compaction が走り、テーブル全体から作り直した base 1つに戻る。
-        for i in 1..=(COMPACTION_THRESHOLD as i64) {
+        for i in 1..=(DEFAULT_COMPACTION_THRESHOLD as i64) {
             applier.apply(&Command::Exec(format!(
                 "INSERT INTO t (id, v) VALUES ({i}, {i})"
             )));
@@ -619,11 +631,11 @@ mod tests {
         assert_eq!(
             blocks.len(),
             1,
-            "after {COMPACTION_THRESHOLD} deltas the replica compacts to a single fresh base"
+            "after {DEFAULT_COMPACTION_THRESHOLD} deltas the replica compacts to a single fresh base"
         );
         let live: u64 = blocks.iter().map(|b| b.live_row_count()).sum();
         assert_eq!(
-            live, COMPACTION_THRESHOLD as u64,
+            live, DEFAULT_COMPACTION_THRESHOLD as u64,
             "compacted base holds every live row exactly once"
         );
         // compaction 後の追加 INSERT はまた delta を足していく。
@@ -633,6 +645,25 @@ mod tests {
             Some(2),
             "post-compaction inserts append fresh deltas onto the new base"
         );
+    }
+
+    #[test]
+    fn with_compaction_threshold_overrides_the_default() {
+        // 閾値 3 → 3 個目の delta で base 1つへ畳み込む。
+        let applier =
+            ColumnarApplier::with_in_memory_store(Arc::new(QueryEngine::new())).with_compaction_threshold(3);
+        applier.apply(&Command::Exec("CREATE TABLE t (id INT PRIMARY KEY, v INT)".into()));
+        for i in 1..=3 {
+            applier.apply(&Command::Exec(format!("INSERT INTO t (id, v) VALUES ({i}, {i})")));
+        }
+        assert_eq!(
+            applier.latest_blocks("t").map(|b| b.len()),
+            Some(1),
+            "custom threshold=3 compacts after the 3rd delta"
+        );
+        // 0 は既定値へフォールバック。
+        let a0 = ColumnarApplier::with_in_memory_store(Arc::new(QueryEngine::new())).with_compaction_threshold(0);
+        assert_eq!(a0.compaction_threshold, DEFAULT_COMPACTION_THRESHOLD);
     }
 
     #[test]
