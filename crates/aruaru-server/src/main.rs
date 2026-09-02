@@ -305,9 +305,14 @@ async fn main() -> anyhow::Result<()> {
     // 設計の正本: docs/CONTROL_PLANE_REDESIGN.md(P1)。`--config` 指定時のみ
     // 読み込み・初回 reconcile・ホットリロード監視を行う。未指定なら
     // 従来どおり CLI フラグのみで動作(後方互換)。
+    // `aruaru.yaml: htap.columnar_replicas` を初回ロードで拾う(同居
+    // `ColumnarApplier` を配線するかの判断に使う。ホットリロード対象外の
+    // 静的セクション)。
+    let mut htap_columnar_replicas = false;
     if let Some(config_path) = cli.config.clone() {
         match config::AruaruConfig::load(&config_path) {
             Ok(cfg) => {
+                htap_columnar_replicas = cfg.htap.columnar_replicas;
                 let report = config::reconcile(&cfg, None, &admin_state);
                 tracing::info!(path = %config_path, ?report, "aruaru.yaml を読み込み、初回 reconcile を適用しました");
                 config::spawn_config_watcher(
@@ -321,6 +326,31 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // 【2026-09-02 続き23】同居(co-located)`ColumnarApplier`。
+    // `htap.columnar_replicas: true` のとき、本番 `QueryEngine` を共有した
+    // 行→列非同期変換レプリカを立て、`set_columnar_observer` の通知
+    // (変更テーブル名)を受けて `observe_table` で追従させる。GraphQL
+    // `htapReplicas` query がこのインスタンスの同期状態を返す。
+    let columnar_for_graphql: Option<std::sync::Arc<aruaru_dist::ColumnarApplier>> =
+        if htap_columnar_replicas {
+            let applier =
+                std::sync::Arc::new(aruaru_dist::ColumnarApplier::observing(engine.clone()));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            engine.set_columnar_observer(tx);
+            let observer = applier.clone();
+            tokio::spawn(async move {
+                while let Some(table) = rx.recv().await {
+                    if let Err(e) = observer.observe_table(&table) {
+                        tracing::warn!(table = %table, error = %e, "co-located columnar replica: observe_table failed");
+                    }
+                }
+            });
+            tracing::info!("htap.columnar_replicas=true: co-located ColumnarApplier wired (Query.htapReplicas active)");
+            Some(applier)
+        } else {
+            None
+        };
     // 【2026-08-21新設・Vitess Reshard/VTGate scatter-gatherの実配線】
     // 既存の単一`ClusterNode`(本番のOLTP書き込み経路、pgwire/GraphQL/REST
     // `/admin/cluster/propose`が実際に使う)とは独立した、
@@ -510,6 +540,7 @@ async fn main() -> anyhow::Result<()> {
                     ephemeral: ephemeral_for_graphql.clone(),
                     multi_raft: Some(multi_raft_for_graphql.clone()),
                     hlc: Some(hlc_for_graphql.clone()),
+                    columnar: columnar_for_graphql.clone(),
                 },
             ))
             .at("/graphql/sdl", get(subgraph_sdl))

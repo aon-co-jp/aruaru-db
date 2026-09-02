@@ -107,6 +107,13 @@ pub struct AdminCtx {
     /// (`now_unix_nanos()` の生の `SystemTime` ではなく、単調性を保証する
     /// HLC ordinal)。正本: `docs/HLC_TIMESTAMP_REDESIGN.md`。
     pub hlc: Option<Arc<aruaru_dist::Hlc>>,
+    /// 【2026-09-02 続き23】同居(co-located)`ColumnarApplier`
+    /// (`aruaru.yaml: htap.columnar_replicas: true` で `main.rs` が構築、
+    /// 本番 `QueryEngine` を共有して行→列非同期変換レプリカを追従させる)。
+    /// `htapReplicas` query が TiFlash `INFORMATION_SCHEMA.TIFLASH_REPLICA`
+    /// (PROGRESS / AVAILABLE)相当の観測値と枝刈り込みプレビューを返す。
+    /// `None` = このサーバーで列レプリカ機能が無効。
+    pub columnar: Option<Arc<aruaru_dist::ColumnarApplier>>,
 }
 
 /// closed timestamp の `now` 既定値。`AdminCtx.hlc` があれば HLC ordinal
@@ -817,6 +824,89 @@ impl AdminQuery {
             shard_count: shard_count as i32,
             per_shard_len,
             total_len,
+        })
+    }
+
+    /// 【2026-09-02 続き23】HTAP 列レプリカの観測。同居 `ColumnarApplier`
+    /// (`aruaru.yaml: htap.columnar_replicas: true`)の行→列非同期変換
+    /// レプリカについて、TiFlash `INFORMATION_SCHEMA.TIFLASH_REPLICA`
+    /// (PROGRESS / AVAILABLE)相当の同期状態を返す。`prune_column` を渡すと
+    /// `prune_op`(`gt`|`ge`|`lt`|`le`|`eq`)+ `prune_value` で MoR ビューを
+    /// 枝刈りしたプレビュー(読む必要のある block 数)も含める。
+    /// 列レプリカ機能が無効なら空扱い(`available=false`)。
+    async fn htap_replicas(
+        &self,
+        ctx: &Context<'_>,
+        table: String,
+        prune_column: Option<String>,
+        prune_op: Option<String>,
+        prune_value: Option<String>,
+    ) -> Result<HtapReplicaStatusGql> {
+        let a = admin(ctx)?;
+        let Some(columnar) = a.columnar.clone() else {
+            return Ok(HtapReplicaStatusGql {
+                table,
+                available: false,
+                progress: 0.0,
+                columnar_block_count: 0,
+                columnar_live_row_count: 0,
+                deletion_vector_positions: 0,
+                applied_index: 0,
+                applied_commit_seq: 0,
+                replication_count: 0,
+                prune: None,
+            });
+        };
+
+        let blocks = columnar.latest_blocks(&table).unwrap_or_default();
+        let dv: usize = blocks.iter().map(|b| b.deletion_vector.len()).sum();
+
+        let prune = match (prune_column, prune_value) {
+            (Some(col), Some(val)) => {
+                let op = prune_op.unwrap_or_else(|| "eq".to_string());
+                let preview = if op.eq_ignore_ascii_case("eq") {
+                    columnar.prune_equality_preview(&table, &col, &val)
+                } else {
+                    let range_op = match op.to_ascii_lowercase().as_str() {
+                        "gt" => aruaru_backup::table_format::RangeOp::Gt,
+                        "ge" => aruaru_backup::table_format::RangeOp::Ge,
+                        "lt" => aruaru_backup::table_format::RangeOp::Lt,
+                        "le" => aruaru_backup::table_format::RangeOp::Le,
+                        other => {
+                            return Err(async_graphql::Error::new(format!(
+                                "unknown prune_op '{other}' (want gt|ge|lt|le|eq)"
+                            )))
+                        }
+                    };
+                    let v: f64 = val.parse().map_err(|_| {
+                        async_graphql::Error::new("prune_value must be a number for range ops")
+                    })?;
+                    columnar.prune_range_preview(&table, &col, range_op, v)
+                };
+                preview.map(|p| HtapPrunePreviewGql {
+                    column: col,
+                    op,
+                    value: val,
+                    total_blocks: p.total_blocks as i32,
+                    kept_blocks: p.kept_blocks as i32,
+                    skipped_blocks: p.skipped_blocks as i32,
+                    kept_live_rows: p.kept_live_rows as i64,
+                })
+            }
+            _ => None,
+        };
+
+        Ok(HtapReplicaStatusGql {
+            table: table.clone(),
+            available: columnar.replica_available(&table),
+            progress: columnar.replication_progress(&table).unwrap_or(0.0),
+            columnar_block_count: blocks.len() as i32,
+            columnar_live_row_count: columnar.latest_live_row_count(&table).unwrap_or(0) as i64,
+            deletion_vector_positions: dv as i64,
+            applied_index: columnar.applied_index() as i64,
+            applied_commit_seq: columnar.applied_commit_seq() as i64,
+            replication_count: columnar.replication_count() as i64,
+            prune,
         })
     }
 
@@ -1680,6 +1770,7 @@ mod cluster_propose_tests {
         // `test_backup_engine`が`engine`を消費するため、その後でも
         // `EngineApplier`用に使えるよう先に複製しておく。
         let engine_for_multi_raft = engine.clone();
+        let engine_for_columnar = engine.clone();
         AdminCtx {
             engine: engine.clone(),
             registry: aruaru_registry::Registry::new(),
@@ -1714,6 +1805,7 @@ mod cluster_propose_tests {
                 aruaru_dist::EngineApplier::new(engine_for_multi_raft),
             ))),
             hlc: Some(Arc::new(aruaru_dist::Hlc::new())),
+            columnar: Some(Arc::new(aruaru_dist::ColumnarApplier::observing(engine_for_columnar))),
         }
     }
 
@@ -2264,6 +2356,65 @@ mod cluster_propose_tests {
         let p = resp.data.into_json().unwrap();
         assert_eq!(p["planFollowerRead"]["plan"], "route_to_leaseholder");
         assert!(p["planFollowerRead"]["reason"].as_str().unwrap().len() > 0);
+    }
+
+    /// 【2026-09-02 続き23】`htapReplicas` query が同居 `ColumnarApplier` の
+    /// 同期状態(TiFlash PROGRESS/AVAILABLE 相当)+ 枝刈り込みプレビューを
+    /// 返すこと。行ストア(共有 `QueryEngine`)へ書き込み → `observe_table` で
+    /// 追従 → GraphQL から観測、という同居モードの一連を検証する。
+    #[tokio::test]
+    async fn htap_replicas_query_reports_columnar_replica_progress_and_pruning() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let mut ctx = admin_ctx(engine.clone(), None);
+        // admin_ctx の既定 columnar を、この engine を共有するインスタンスへ
+        // 差し替えて手元にも保持する(観測を明示的に駆動するため)。
+        let columnar = Arc::new(aruaru_dist::ColumnarApplier::observing(engine.clone()));
+        ctx.columnar = Some(columnar.clone());
+        let schema = build_schema(engine.clone(), ctx);
+
+        // 行ストアへ書き込み(v = 10, 20, 30)。
+        engine.execute("CREATE TABLE m (id INT PRIMARY KEY, v INT)").unwrap();
+        columnar.observe_table("m").unwrap();
+        for i in 1..=3 {
+            engine
+                .execute(&format!("INSERT INTO m (id, v) VALUES ({i}, {})", i * 10))
+                .unwrap();
+            // 同居オブザーバの追従を明示的に駆動(本番は set_columnar_observer
+            // の通知が INSERT ごとに来るのと同じ)。各 INSERT が単一行の
+            // delta block を1つ足す。
+            columnar.observe_table("m").unwrap();
+        }
+
+        let resp = schema
+            .execute(authorized_request(
+                r#"query { htapReplicas(table: "m", pruneColumn: "v", pruneOp: "gt", pruneValue: "15") {
+                    table available progress columnarLiveRowCount replicationCount
+                    prune { totalBlocks keptBlocks skippedBlocks keptLiveRows }
+                } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let d = resp.data.into_json().unwrap();
+        let r = &d["htapReplicas"];
+        assert_eq!(r["table"], "m");
+        assert_eq!(r["available"], true);
+        assert_eq!(r["progress"], 1.0, "3/3 rows replicated");
+        assert_eq!(r["columnarLiveRowCount"], 3);
+        assert!(r["replicationCount"].as_i64().unwrap() >= 1);
+        // v > 15 → v=10 の delta は必ず読み飛ばせる。
+        assert!(r["prune"]["skippedBlocks"].as_i64().unwrap() >= 1);
+        assert_eq!(r["prune"]["keptLiveRows"], 2);
+
+        // 未知テーブルは available=false。
+        let resp = schema
+            .execute(authorized_request(r#"query { htapReplicas(table: "nope") { available progress } }"#))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let d = resp.data.into_json().unwrap();
+        assert_eq!(d["htapReplicas"]["available"], false);
     }
 
     /// 【2026-09-02 HLC 再設計 P-HLC-2】`nowNanos` 省略時、`AdminCtx.hlc`
