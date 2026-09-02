@@ -25,6 +25,19 @@
 > (A.6-4段階1、`prune_range`/`prune_equality`への配線込み)を実装。
 > 詳細・進捗・復活用メッセージは[`CLAUDE.md`](CLAUDE.md)冒頭
 > 「🔄 セッション再開用メモ」と同日HANDOFF(続き13〜18)。
+> **2026-09-02(続き20〜22)**: **A.6-4 段階2 = base+delta の Merge-on-Read**
+> (`ColumnarApplier` を都度フル再構築から delta 蓄積+閾値 compaction へ格上げ、
+> DELETE/UPDATE で deletion vector を書き込み)、**HLC 再設計**
+> (`as_nanos()` の `pt<<16` u64 オーバーフローを案B〈物理を 65µs 粒度へ
+> 切り捨て下位 16bit に論理を収める〉で修正、`closed_ts` 系へ配線)を実装。
+> 続いて**次フェーズ一括(ビルドまで)**: `aruaru.yaml: htap` セクション、
+> `Query.htapReplicas` 相当の枝刈り込み観測 API
+> (`ColumnarApplier::prune_range_preview`/`prune_equality_preview` +
+> `GET /columnar/:table/prune`)、**A.6-3**(`Applier::apply_at` で
+> Raft index + MVCC〈commit 通し番号〉を記録、`read_at_index` で staleness
+> 検証、未達なら 409)、**HLC `max_offset`**(`try_update`/
+> `try_observe_ordinal`、`follower_read.max_offset_ms`)を実装。
+> HLC 案A 全面移行は `docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3 として将来。
 
 > 📌 保留タスク(2026-08-06): 東芝SBM・DeepSeek技術の組み込み構想あり。詳細は[CLAUDE.md](CLAUDE.md)参照。
 

@@ -238,14 +238,34 @@
 >    `closed_ts` 系の「now 既定値」を HLC ordinal へ配線
 >    (`AdminState`/`AdminCtx` 共有、`closed_ts_receive` で
 >    `observe_ordinal`)、実HTTP E2E で `closedTsAdvance` が実 Unix
->    ナノ秒スケールの単調 ordinal を返すことを確認。**残り**:
->    (a) `aruaru.yaml: htap` セクション(§5・A.7)実装 +
->    `--columnar-learner` を宣言的設定経由の起動へ統合、
->    (b) `ColumnarApplier` の block を `prune_range`/`prune_equality` へ
->    流す枝刈り込み観測 API(`Query.htapReplicas` 相当)、
->    (c) A.6-3(読み取り時の Raft index + MVCC による SI 検証)、
->    (d) HLC の案A全面移行・`max_offset` スキュー上限
->    (`docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3、将来)。
+>    ナノ秒スケールの単調 ordinal を返すことを確認。
+>    **続き22(2026-09-02、ビルドまで)で (a)〜(d) 前半まで完了**:
+>    (a) ✅ `config::HtapConfig`(`columnar_replicas`/`read_consistency`/
+>    `delta.compaction_threshold`、static 扱い)+ `ColumnarApplier::
+>    with_compaction_threshold` + `--columnar-learner` を `--config` 経由の
+>    `htap.delta.compaction_threshold` へ統合、`aruaru.example.yaml` に
+>    `htap:` ブロック。
+>    (b) ✅ `ColumnarApplier::prune_range_preview`/`prune_equality_preview`
+>    (MoR ビューを `disproves`/bloom へ流し `HtapPrunePreview` を返す、
+>    全行論理削除 block も skip)+ `GET /columnar/:table/prune?column&op&value`。
+>    (c) ✅ `Applier::apply_at(index, cmd)`(既定は `apply` 委譲)を追加、
+>    `ColumnarApplier` が `applied_index`/`applied_commit_seq` を記録
+>    (失敗エントリでは前進しない)。`read_at_index(table, required_index,
+>    required_commit_seq)` が未達なら `Err(StaleRead)`、達していれば
+>    `HtapReplicaView`。`GET /columnar/:table` に `appliedIndex`/
+>    `appliedCommitSeq`、`?required_index=&required_commit_seq=` 指定時は
+>    未達で 409 CONFLICT。
+>    (d) ✅ `Hlc::max_offset_nanos`(0=無効)+ `try_update`/
+>    `try_observe_ordinal`(壁時計+max_offset を超えたリモートは
+>    `Err(ClockSkew)`、permissive `update` はリモート無視でローカル進行のみ)。
+>    `config::follower_read.max_offset_ms`(動的、reconcile で HLC へ反映)、
+>    `admin.rs::closed_ts_receive` が `try_observe_ordinal` で遠すぎる
+>    リモート closed-ts を拒否。**案A(2フィールド全面移行)は
+>    `docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3 として引き続き将来課題**。
+>    検証: `cargo test -p aruaru-dist -p aruaru-server` 失敗0
+>    (aruaru-dist 101→、hlc 15 / columnar_applier 14)、`cargo build
+>    --workspace` 成功(既存 `build_cluster`/`propose_commit` 警告のみ)。
+>    実プロセス HTTP E2E はユーザー指示「ビルドまでで記録」により未実施。
 > 5. `disaster_backup.email` の reconcile(`feature = "disaster_email_backup"`
 >    ゲート。config スキーマは 7 フィールドへ拡張済み)。
 > 6. Tauri(`admin/src-tauri`、ワークスペース外・この環境ではビルド不可)
@@ -5688,3 +5708,102 @@ ordinal 重複ゼロ)。
 観測 API、A.6-3(読み取り時の Raft index + MVCC による SI 検証)。
 HLC の案A 全面移行・`max_offset` スキュー上限は
 `docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3 として将来検討。
+
+## HANDOFF追記(2026-09-02続き22) 次フェーズ一括: htap 宣言的設定・
+枝刈り込み観測 API・A.6-3 SI 検証・HLC max_offset(ビルドまで)
+
+**位置づけ**: 「🛑 復活用メッセージ」項目4 の残り (a)〜(d) を一括で実装。
+ユーザー指示「ビルドまでで記録」に従い、`cargo test` / `cargo build
+--workspace` の成功までを検証範囲とし、実プロセス HTTP E2E は未実施。
+
+### (a) `aruaru.yaml: htap` セクション
+- `crates/aruaru-server/src/config/mod.rs`: `AruaruConfig` に
+  `pub htap: HtapConfig`。`HtapConfig`(`columnar_replicas: bool` /
+  `read_consistency: String` / `delta: HtapDeltaConfig`)・
+  `HtapDeltaConfig`(`compaction_threshold: usize`、既定 8)。いずれも
+  `#[serde(default, deny_unknown_fields)]` + `Default` impl。
+- `crates/aruaru-server/src/config/reconcile.rs`: 静的セクション差分検知
+  配列に `("htap", prev.htap != new.htap)` を追加(構築時固定 =
+  restart_required 扱い)。
+- `crates/aruaru-dist/src/columnar_applier.rs`:
+  `const COMPACTION_THRESHOLD` → `pub const DEFAULT_COMPACTION_THRESHOLD`、
+  `compaction_threshold: usize` フィールド + `pub fn
+  with_compaction_threshold(n)`(`0` は既定へフォールバック)。
+- `crates/aruaru-server/src/main.rs`: `--columnar-learner` 起動フローで
+  `--config` があれば `AruaruConfig::load` して
+  `htap.delta.compaction_threshold` を `with_compaction_threshold` へ渡す。
+- `aruaru.example.yaml` に `htap:` ブロックを追記。
+- テスト: `with_compaction_threshold_overrides_the_default`。
+
+### (b) `Query.htapReplicas` 相当の枝刈り込み観測 API
+- `ColumnarApplier::prune_range_preview(table, column, RangeOp, value)` /
+  `prune_equality_preview(table, column, key)` を新設。`replica_state` の
+  MoR ビュー(base+delta、deletion vector 込み)の block を、
+  `table_format` の `prune_range`/`prune_equality` と同じ
+  `ColumnStats::disproves` / `BloomFilter::may_contain` ロジックへ流し、
+  `HtapPrunePreview { total_blocks, kept_blocks, skipped_blocks,
+  kept_live_rows }` を返す(全行論理削除 block も skip)。
+- `crates/aruaru-server/src/columnar_pod.rs`: `GET /columnar/:table/prune
+  ?column=<c>&op=<gt|ge|lt|le|eq>&value=<v>`(`eq` は bloom 等値枝刈り)。
+- テスト: `prune_range_preview_skips_delta_blocks_that_cannot_match`,
+  `prune_equality_preview_uses_the_pk_bloom_filter`。
+
+### (c) A.6-3: 読み取り時の Raft index + MVCC SI 検証
+- `Applier` trait に `fn apply_at(&self, index: u64, cmd: &Command)
+  -> CommandResponse`(既定は `apply` へ委譲、`Arc<A>` blanket impl も
+  追加。既存の全 `Applier` 実装は無変更)。`RaftNode::apply_committed` が
+  `apply_at(idx, cmd)` を呼ぶ。
+- `ColumnarApplier` が `apply_at` を override し
+  `applied_index: AtomicU64` / `applied_commit_seq: AtomicU64` を記録
+  (`resp.ok` の場合のみ前進、`fetch_max`。`Command::Commit` で seq++)。
+- `read_at_index(table, required_index, required_commit_seq)`:
+  どちらか未達なら `Err(StaleRead { applied_*, required_* })`、
+  達していれば `HtapReplicaView { blocks, live_row_count, applied_* }`。
+  `0` を渡せばその条件は無条件(TiKV safe-ts / TiFlash の SI 検証相当)。
+- `columnar_pod.rs`: `GET /columnar/:table` に `appliedIndex` /
+  `appliedCommitSeq` を追加。`?required_index=&required_commit_seq=`
+  指定時は staleness 検証し、未達なら **409 CONFLICT** + stale 詳細。
+- テスト: `read_at_index_gates_on_applied_raft_index_and_commit_seq`。
+
+### (d) HLC `max_offset` クロックスキュー上限
+- `crates/aruaru-dist/src/hlc.rs`: `Hlc` に `max_offset_nanos: AtomicU64`
+  (`0` = 無効、既定)。`with_max_offset_nanos` / `set_max_offset_nanos` /
+  `max_offset_nanos()` アクセサ。
+- `try_update(remote, wall)` / `try_observe_ordinal(ord, wall)`:
+  `bucket(remote.pt) > bucket(wall) + max_offset` なら `Err(ClockSkew)`
+  (`Display` 実装あり)。permissive な `update` は上限超過リモートを
+  **無視してローカル進行のみ**(`self.now(wall)`、クロックを汚染しない)+
+  `tracing::warn!`。
+- `config::FollowerReadConfig` に `max_offset_ms: u64`(既定 0、動的)。
+  `reconcile.rs` の follower_read ブロックで
+  `state.hlc_handle().set_max_offset_nanos(ms * 1e6)` を反映。
+- `admin.rs::closed_ts_receive` が `observe_ordinal` →
+  `try_observe_ordinal` へ。遠すぎるリモート closed-ts は拒否 + warn。
+- `aruaru.example.yaml` の `follower_read` に `max_offset_ms: 0` を追記。
+- テスト: `max_offset_rejects_a_remote_timestamp_from_the_far_future`,
+  `max_offset_zero_disables_the_check_backward_compatible`。
+- **案A(パックをやめ物理/論理を 2 フィールドで運ぶ全面移行)は
+  `docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3 として引き続き将来課題**
+  (P3 で GraphQL 化したばかりの API を再全面変更するため過大)。
+
+### 検証(ビルドまで)
+- `cargo test -p aruaru-dist -p aruaru-server` 失敗0
+  (aruaru-dist: hlc 15 / columnar_applier 14、aruaru-server: config 系
+  含め 13 passed / 1 ignored)。
+- `cargo test -p aruaru-graphql` 19 passed(`Applier` trait 変更の回帰無し)。
+- `cargo build --workspace` 成功(既存 `build_cluster`/`propose_commit`
+  未使用警告2件のみ、無関係)。
+- 実プロセス HTTP E2E はユーザー指示「ビルドまでで記録」により未実施
+  ——次回、`--columnar-learner` 2プロセス構成で `GET /columnar/:table
+  /prune`・`?required_index=` の 409・`follower_read.max_offset_ms` を
+  設定した `closed_ts_receive` 拒否を実 HTTP で確認する。
+
+### 復活用メッセージ(次回セッション・別アカウント向け)
+続き22 で「🛑 復活用メッセージ」項目4 の (a)〜(d) は**コード実装+
+ビルド/ユニットテストまで完了**。次にやること:
+1. 上記「実プロセス HTTP E2E」(未実施分)。
+2. `Query.htapReplicas` を GraphQL(`AdminCtx`)へ正式公開する
+   (現状は `--columnar-learner` 専用 `columnar_pod.rs` の HTTP のみ)。
+3. 復活用メッセージ項目5(`disaster_backup.email` reconcile、feature
+   ゲート)・項目6(Tauri)・項目7(P4〜P6)。
+4. HLC 案A 全面移行(P-HLC-3)は引き続き将来。
