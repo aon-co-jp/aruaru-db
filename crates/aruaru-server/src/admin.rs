@@ -128,6 +128,13 @@ pub struct AdminState {
     /// 検証する。詳細は`aruaru_dist::keyring`モジュールdoc参照
     /// (2026-08-29(続き)、GraphQL側と共有できるよう`aruaru-dist`へ移設)。
     pub keyring: Arc<aruaru_dist::keyring::KeyGuardian>,
+    /// 【2026-09-02 HLC 再設計 P-HLC-2】Hybrid Logical Clock。
+    /// `closed_ts` へ渡す「now」を単調な HLC ordinal で生成し、
+    /// side transport 受信時(`closed_ts_receive`)にはリモートの
+    /// closed-ts を `observe_ordinal` でローカル HLC へ取り込む。
+    /// `hlc_handle()` で GraphQL(`AdminCtx.hlc`)へ同一インスタンスを注入。
+    /// 正本: `docs/HLC_TIMESTAMP_REDESIGN.md`。
+    hlc: Arc<aruaru_dist::Hlc>,
 }
 
 impl AdminState {
@@ -162,6 +169,7 @@ impl AdminState {
                 1,
             )),
             keyring: Arc::new(aruaru_dist::keyring::KeyGuardian::new()),
+            hlc: Arc::new(aruaru_dist::Hlc::new()),
         })
     }
 
@@ -201,6 +209,12 @@ impl AdminState {
     /// アクセサ。
     pub fn closed_ts_coordinator(&self) -> Arc<aruaru_dist::ClosedTimestampCoordinator> {
         self.closed_ts.clone()
+    }
+
+    /// 【2026-09-02 HLC 再設計】GraphQL側(`AdminCtx.hlc`)へ同一の HLC
+    /// インスタンスを共有するためのアクセサ。
+    pub fn hlc_handle(&self) -> Arc<aruaru_dist::Hlc> {
+        self.hlc.clone()
     }
 
     /// 【2026-08-29新設】GraphQL側(`aruaru_graphql::AdminCtx`)へ同一の
@@ -1219,6 +1233,16 @@ fn closed_ts_receive(state: Data<&Arc<AdminState>>, Json(req): Json<ClosedTsRece
     let updates: Vec<(u64, aruaru_dist::Timestamp)> =
         req.updates.iter().map(|u| (u.range_id, u.closed_timestamp)).collect();
     let advanced = state.closed_ts.apply_closed_timestamp_updates(&updates);
+    // 【2026-09-02 HLC 再設計 P-HLC-2】リモートから届いた closed timestamp の
+    // 最大値でローカル HLC を前進させる(送信時に相乗り・受信時に update、
+    // という HLC の因果伝播。ここでの「時刻」は closed_ts の u64 ordinal)。
+    if let Some(max_closed) = updates.iter().map(|(_, ts)| *ts).max() {
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        state.hlc.observe_ordinal(max_closed, wall);
+    }
     Json(json!({
         "success": true,
         "received": updates.len(),

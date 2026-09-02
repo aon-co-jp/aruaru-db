@@ -102,14 +102,23 @@ pub struct AdminCtx {
     /// `Mutation.multiRaftSplit`/`multiRaftMerge`・
     /// `Query.multiRaftScatterQuery`が唯一の経路。
     pub multi_raft: Option<Arc<aruaru_dist::MultiRaftCluster<aruaru_dist::EngineApplier>>>,
+    /// 【2026-09-02 HLC 再設計 P-HLC-2】REST(`AdminState.hlc`)と**同一**の
+    /// Hybrid Logical Clock。`closed_ts` へ渡す「now」既定値の生成に使う
+    /// (`now_unix_nanos()` の生の `SystemTime` ではなく、単調性を保証する
+    /// HLC ordinal)。正本: `docs/HLC_TIMESTAMP_REDESIGN.md`。
+    pub hlc: Option<Arc<aruaru_dist::Hlc>>,
 }
 
-/// UNIX epoch からの現在時刻(論理ナノ秒)。closed timestamp の `now` 既定値。
-fn now_unix_nanos() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+/// closed timestamp の `now` 既定値。`AdminCtx.hlc` があれば HLC ordinal
+/// (単調保証)、無ければ生の UNIX epoch ナノ秒へフォールバック。
+fn now_default_nanos(ctx: &AdminCtx) -> u64 {
+    match &ctx.hlc {
+        Some(hlc) => hlc.now_ordinal(),
+        None => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+    }
 }
 
 /// GraphQL の String 引数を u64 へ(タイムスタンプ・LSN は精度保持のため
@@ -648,7 +657,7 @@ impl AdminQuery {
         let ids: Vec<u64> = range_ids.iter().map(|&x| x as u64).collect();
         let now = match now_nanos {
             Some(s) => parse_u64(&s, "nowNanos")?,
-            None => now_unix_nanos(),
+            None => now_default_nanos(a),
         };
         let staleness = match staleness_nanos {
             Some(s) => parse_u64(&s, "stalenessNanos")?,
@@ -1342,7 +1351,7 @@ impl AdminMutation {
             .ok_or_else(|| async_graphql::Error::new("closed timestamp coordinator is not configured"))?;
         let now = match now_nanos {
             Some(s) => parse_u64(&s, "nowNanos")?,
-            None => now_unix_nanos(),
+            None => now_default_nanos(a),
         };
         Ok(coord
             .advance_all(now)
@@ -1704,6 +1713,7 @@ mod cluster_propose_tests {
                 "127.0.0.1:5432".to_string(),
                 aruaru_dist::EngineApplier::new(engine_for_multi_raft),
             ))),
+            hlc: Some(Arc::new(aruaru_dist::Hlc::new())),
         }
     }
 
@@ -2254,6 +2264,40 @@ mod cluster_propose_tests {
         let p = resp.data.into_json().unwrap();
         assert_eq!(p["planFollowerRead"]["plan"], "route_to_leaseholder");
         assert!(p["planFollowerRead"]["reason"].as_str().unwrap().len() > 0);
+    }
+
+    /// 【2026-09-02 HLC 再設計 P-HLC-2】`nowNanos` 省略時、`AdminCtx.hlc`
+    /// 由来の HLC ordinal(単調保証)で advance すること。2 連続で
+    /// closed timestamp が厳密増加し、実 Unix ナノ秒スケール(> 10¹⁸)へ
+    /// 到達している(旧 `pt<<16` のオーバーフロー由来の壊れた値ではない)。
+    #[tokio::test]
+    async fn closed_ts_advance_without_now_uses_monotonic_hlc_ordinal() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+        let engine = Arc::new(QueryEngine::new());
+        let schema = build_schema(engine.clone(), admin_ctx(engine.clone(), None));
+
+        schema
+            .execute(authorized_request("mutation { closedTsRegisterRange(rangeId: 1) { rangeId } }"))
+            .await;
+
+        let read_closed = |resp: async_graphql::Response| -> u64 {
+            resp.data.into_json().unwrap()["closedTsAdvance"][0]["closedTimestamp"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        let a = read_closed(
+            schema.execute(authorized_request("mutation { closedTsAdvance { rangeId closedTimestamp } }")).await,
+        );
+        let b = read_closed(
+            schema.execute(authorized_request("mutation { closedTsAdvance { rangeId closedTimestamp } }")).await,
+        );
+        assert!(b >= a, "HLC-driven advance must be monotonic: {a} -> {b}");
+        // HLC ordinal は実 Unix ナノ秒スケール(2026 年 ≈ 1.7e18)。
+        // 旧実装は pt<<16 でここが u64 ラップして桁が壊れていた。
+        assert!(a > 1_000_000_000_000_000, "HLC ordinal should be at real-nanos scale, got {a}");
     }
 
     #[tokio::test]
