@@ -38,6 +38,15 @@
 > 検証、未達なら 409)、**HLC `max_offset`**(`try_update`/
 > `try_observe_ordinal`、`follower_read.max_offset_ms`)を実装。
 > HLC 案A 全面移行は `docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3 として将来。
+> **2026-09-02(続き23)**: `Query.htapReplicas` を GraphQL 単一サーフェスへ
+> **正式公開**。`aruaru.yaml: htap.columnar_replicas: true` で本番
+> `aruaru-server` が本番 `QueryEngine` を共有した**同居 `ColumnarApplier`**
+> (`QueryEngine::set_columnar_observer` の通知で追従)を立て、`htapReplicas`
+> が TiFlash `INFORMATION_SCHEMA.TIFLASH_REPLICA`(PROGRESS/AVAILABLE)相当の
+> 同期状態 + 枝刈り込みプレビューを返す。設計は TiFlash / CockroachDB の
+> レプリカ観測手法の WebSearch 調査を反映。実 HTTP `/graphql` E2E 済み
+> (`execSql` で書き込み→自動追従、prune/DELETE/未知テーブル/`max_offset`
+> リモート値拒否まで確認)。詳細は [`CLAUDE.md`](CLAUDE.md) HANDOFF(続き20〜23)。
 
 > 📌 保留タスク(2026-08-06): 東芝SBM・DeepSeek技術の組み込み構想あり。詳細は[CLAUDE.md](CLAUDE.md)参照。
 
