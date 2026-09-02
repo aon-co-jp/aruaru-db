@@ -30,6 +30,9 @@ pub struct ReconcileReport {
     /// 台数・シャード数が構築時固定で、稼働中の再構成は進行中状態を
     /// 失うため**意図的に静的扱い**とする(Cosmo の静的セクションと同じ)。
     pub restart_required: Vec<String>,
+    /// `disaster_backup.email` を稼働中の `RaftWriter` へ注入した
+    /// (`feature = "disaster_email_backup"` ビルドのみ)。
+    pub disaster_backup_changed: bool,
 }
 
 impl ReconcileReport {
@@ -38,6 +41,7 @@ impl ReconcileReport {
             || self.federation_changed
             || self.parallel_changed
             || self.follower_read_lag_changed
+            || self.disaster_backup_changed
     }
 }
 
@@ -171,7 +175,63 @@ pub fn reconcile(
         }
     }
 
+    // ── disaster_backup.email(feature = "disaster_email_backup" のみ) ──
+    // 宣言的設定で「メールアドレスひとつ」でディザスタ退避を有効化する。
+    // 稼働中の `RaftWriter`(pgwire/管理APIと同一インスタンス)へ注入し、
+    // Raft 過半数コミットが失敗した `Command` をメール退避できるようにする。
+    // クラスタ未構築(replicator None)なら保持のみ・warn。冪等: 前回適用
+    // 分と同じなら何もしない。
+    #[cfg(feature = "disaster_email_backup")]
+    {
+        let db = &new.disaster_backup;
+        let prev_db = previous.map(|p| &p.disaster_backup);
+        let changed = prev_db.map(|p| p != db).unwrap_or(db.enabled);
+        if changed {
+            if db.enabled {
+                match build_disaster_email_config(&db.email) {
+                    Ok(cfg) => {
+                        let backup =
+                            Arc::new(aruaru_dist::DisasterEmailBackup::new(cfg));
+                        if state.set_disaster_email_backup(backup) {
+                            tracing::info!("aruaru.yaml: disaster_backup.email を稼働中の RaftWriter へ注入しました");
+                        } else {
+                            tracing::warn!(
+                                "aruaru.yaml: disaster_backup.email を保持しましたが、Raftクラスタ未構築のため書き込み経路へ注入できません(--peers 未指定/構築失敗)"
+                            );
+                        }
+                        report.disaster_backup_changed = true;
+                    }
+                    Err(missing) => tracing::warn!(
+                        field = missing,
+                        "aruaru.yaml: disaster_backup.enabled=true だが必須フィールドが欠けています。無効のまま続行します"
+                    ),
+                }
+            } else if prev_db.map(|p| p.enabled).unwrap_or(false) {
+                tracing::warn!(
+                    "aruaru.yaml: disaster_backup.enabled が false になりましたが、稼働中の RaftWriter からの取り外しは未対応です(プロセス再起動で反映)"
+                );
+            }
+        }
+    }
+
     report
+}
+
+/// `DisasterBackupEmail`(全 Option)→ `DisasterEmailBackupConfig`(全必須)へ。
+/// 欠けた必須フィールド名を `Err` で返す。
+#[cfg(feature = "disaster_email_backup")]
+fn build_disaster_email_config(
+    e: &super::DisasterBackupEmail,
+) -> Result<aruaru_dist::DisasterEmailBackupConfig, &'static str> {
+    Ok(aruaru_dist::DisasterEmailBackupConfig::from_parts(
+        e.smtp_host.clone().ok_or("smtp_host")?,
+        e.smtp_port.ok_or("smtp_port")?,
+        e.smtp_username.clone().ok_or("smtp_username")?,
+        e.smtp_password_env.clone().ok_or("smtp_password_env")?,
+        e.from_address.clone().ok_or("from_address")?,
+        e.to_address.clone().ok_or("to_address")?,
+        e.allow_plaintext_for_testing,
+    ))
 }
 
 fn tls_eq(a: &super::TlsConfig, b: &super::TlsConfig) -> bool {
@@ -256,6 +316,39 @@ federation:
         let r = reconcile(&without, Some(&with), &st);
         assert!(r.federation_changed);
         assert!(st.federation_handle().lock().is_empty());
+    }
+
+    #[cfg(feature = "disaster_email_backup")]
+    #[test]
+    fn disaster_backup_email_reconcile_wires_config_and_is_idempotent() {
+        let st = state();
+        let yaml = r#"
+disaster_backup:
+  enabled: true
+  email:
+    smtp_host: "smtp.example.com"
+    smtp_port: 587
+    smtp_username: "backup@example.com"
+    smtp_password_env: "DISASTER_SMTP_PW"
+    from_address: "backup@example.com"
+    to_address: "admin@example.com"
+    allow_plaintext_for_testing: true
+"#;
+        let cfg = cfg_from(yaml);
+        // 初回: 設定が構築され保管される(この test AdminState には replicator が
+        // 無いので稼働中経路への注入は false だが、report は changed)。
+        let r1 = reconcile(&cfg, None, &st);
+        assert!(r1.disaster_backup_changed);
+        assert!(st.replicator().is_none(), "test state has no live RaftWriter");
+
+        // 冪等: 同じ config を再適用しても変更なし。
+        let r2 = reconcile(&cfg, Some(&cfg), &st);
+        assert!(!r2.disaster_backup_changed);
+
+        // 必須フィールド欠落: enabled=true でも warn のみ、changed にはしない。
+        let broken = cfg_from("disaster_backup:\n  enabled: true\n  email:\n    smtp_host: \"h\"\n");
+        let r3 = reconcile(&broken, Some(&cfg_from("{}")), &st);
+        assert!(!r3.disaster_backup_changed);
     }
 
     #[test]

@@ -80,8 +80,11 @@ htap:
   delta:
     compaction_threshold: 8         # delta ブロックが N 個たまったら base へ畳み込む(0 = 既定値 8)
 
-# disaster_backup:       # feature = "disaster_email_backup" ビルドのみ。P3 で reconcile 接続予定
-#   enabled: false
+# disaster_backup:       # feature = "disaster_email_backup" ビルドのみ。
+#   enabled: false        # true にすると reconcile が下記 email 設定から
+#                         # DisasterEmailBackup を構築し、稼働中の RaftWriter へ注入する
+#                         # (Raft 過半数コミット失敗時に Command をメール退避)。
+#                         # 必須フィールドが欠けていると warn を出して無効のまま続行。
 #   email:                # EmailBackupTargetConfig と同じ7項目
 #     smtp_host: "smtp.example.com"
 #     smtp_port: 587

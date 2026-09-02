@@ -47,6 +47,34 @@ pub struct DisasterEmailBackupConfig {
     pub email: EmailBackupTargetConfig,
 }
 
+impl DisasterEmailBackupConfig {
+    /// 宣言的設定(`aruaru.yaml: disaster_backup.email`)からの構築ヘルパー。
+    /// 呼び出し側が `open_raid_z_core::offsite_backup::EmailBackupTargetConfig`
+    /// を直接名前で参照せずに済むようにする。
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        smtp_host: String,
+        smtp_port: u16,
+        smtp_username: String,
+        smtp_password_env: String,
+        from_address: String,
+        to_address: String,
+        allow_plaintext_for_testing: bool,
+    ) -> Self {
+        Self {
+            email: EmailBackupTargetConfig {
+                smtp_host,
+                smtp_port,
+                smtp_username,
+                smtp_password_env,
+                from_address,
+                to_address,
+                allow_plaintext_for_testing,
+            },
+        }
+    }
+}
+
 /// 分散レイヤーから独立して使えるスタンドアロンのメール退避ラッパー。
 /// `ClusterTopology`/`multi_raft`/`snapshot_pairing`の登録有無に一切
 /// 依存しない。
