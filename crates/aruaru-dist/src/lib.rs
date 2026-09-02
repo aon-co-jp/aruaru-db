@@ -47,7 +47,7 @@ pub use engine_applier::EngineApplier;
 pub use columnar_applier::{
     ColumnarApplier, HtapPrunePreview, HtapReplicaView, StaleRead,
 };
-pub use hlc::{Hlc, HlcTimestamp};
+pub use hlc::{ClockSkew, Hlc, HlcTimestamp};
 pub use closed_ts::{
     ClosedTimestampCoordinator, ClosedTimestampTracker, ReadPlan, Timestamp,
     DEFAULT_MAX_STALENESS_NANOS, DEFAULT_TARGET_LAG_NANOS,
