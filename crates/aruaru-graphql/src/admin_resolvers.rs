@@ -128,6 +128,29 @@ fn now_default_nanos(ctx: &AdminCtx) -> u64 {
     }
 }
 
+/// 1テーブルぶんの HTAP 列レプリカ同期状態を組み立てる(`htapReplicas` と
+/// `htapReplicasAll` の共通ヘルパー)。TiFlash `TIFLASH_REPLICA` 相当。
+fn htap_status_for(
+    columnar: &aruaru_dist::ColumnarApplier,
+    table: &str,
+    prune: Option<HtapPrunePreviewGql>,
+) -> HtapReplicaStatusGql {
+    let blocks = columnar.latest_blocks(table).unwrap_or_default();
+    let dv: usize = blocks.iter().map(|b| b.deletion_vector.len()).sum();
+    HtapReplicaStatusGql {
+        table: table.to_string(),
+        available: columnar.replica_available(table),
+        progress: columnar.replication_progress(table).unwrap_or(0.0),
+        columnar_block_count: blocks.len() as i32,
+        columnar_live_row_count: columnar.latest_live_row_count(table).unwrap_or(0) as i64,
+        deletion_vector_positions: dv as i64,
+        applied_index: columnar.applied_index() as i64,
+        applied_commit_seq: columnar.applied_commit_seq() as i64,
+        replication_count: columnar.replication_count() as i64,
+        prune,
+    }
+}
+
 /// GraphQL の String 引数を u64 へ(タイムスタンプ・LSN は精度保持のため
 /// String で受け渡す)。
 fn parse_u64(s: &str, field: &str) -> Result<u64> {
@@ -858,9 +881,6 @@ impl AdminQuery {
             });
         };
 
-        let blocks = columnar.latest_blocks(&table).unwrap_or_default();
-        let dv: usize = blocks.iter().map(|b| b.deletion_vector.len()).sum();
-
         let prune = match (prune_column, prune_value) {
             (Some(col), Some(val)) => {
                 let op = prune_op.unwrap_or_else(|| "eq".to_string());
@@ -896,18 +916,24 @@ impl AdminQuery {
             _ => None,
         };
 
-        Ok(HtapReplicaStatusGql {
-            table: table.clone(),
-            available: columnar.replica_available(&table),
-            progress: columnar.replication_progress(&table).unwrap_or(0.0),
-            columnar_block_count: blocks.len() as i32,
-            columnar_live_row_count: columnar.latest_live_row_count(&table).unwrap_or(0) as i64,
-            deletion_vector_positions: dv as i64,
-            applied_index: columnar.applied_index() as i64,
-            applied_commit_seq: columnar.applied_commit_seq() as i64,
-            replication_count: columnar.replication_count() as i64,
-            prune,
-        })
+        Ok(htap_status_for(&columnar, &table, prune))
+    }
+
+    /// 【2026-09-02 続き24】`htapReplicas` の全テーブル版。TiFlash の
+    /// `INFORMATION_SCHEMA.TIFLASH_REPLICA` が全 (db, table) 行を返すのと
+    /// 同じく、テーブル名を知らなくても全列レプリカの同期状態を一覧できる。
+    /// 枝刈り込みプレビューは含めない(per-table `htapReplicas` を使う)。
+    /// 列レプリカ機能が無効なら空配列。
+    async fn htap_replicas_all(&self, ctx: &Context<'_>) -> Result<Vec<HtapReplicaStatusGql>> {
+        let a = admin(ctx)?;
+        let Some(columnar) = a.columnar.clone() else {
+            return Ok(Vec::new());
+        };
+        Ok(columnar
+            .replicated_tables()
+            .iter()
+            .map(|t| htap_status_for(&columnar, t, None))
+            .collect())
     }
 
     // ── マイグレーション: スキーマプレビュー ────────────────
@@ -2415,6 +2441,22 @@ mod cluster_propose_tests {
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         let d = resp.data.into_json().unwrap();
         assert_eq!(d["htapReplicas"]["available"], false);
+
+        // htapReplicasAll: 2 テーブル目を足すと一覧に両方が(ソート順で)出る。
+        engine.execute("CREATE TABLE a_first (id INT PRIMARY KEY)").unwrap();
+        engine.execute("INSERT INTO a_first (id) VALUES (1)").unwrap();
+        columnar.observe_table("a_first").unwrap();
+        let resp = schema
+            .execute(authorized_request(
+                r#"query { htapReplicasAll { table available columnarLiveRowCount } }"#,
+            ))
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let all = resp.data.into_json().unwrap()["htapReplicasAll"].as_array().unwrap().clone();
+        assert_eq!(all.len(), 2, "both replicated tables listed: {all:?}");
+        assert_eq!(all[0]["table"], "a_first", "sorted by table name");
+        assert_eq!(all[1]["table"], "m");
+        assert!(all.iter().all(|r| r["available"] == true));
     }
 
     /// 【2026-09-02 HLC 再設計 P-HLC-2】`nowNanos` 省略時、`AdminCtx.hlc`
