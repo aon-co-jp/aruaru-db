@@ -44,7 +44,7 @@ pub use shard::{
 };
 pub use multi_raft::MultiRaftCluster;
 pub use engine_applier::EngineApplier;
-pub use columnar_applier::ColumnarApplier;
+pub use columnar_applier::{ColumnarApplier, HtapPrunePreview};
 pub use hlc::{Hlc, HlcTimestamp};
 pub use closed_ts::{
     ClosedTimestampCoordinator, ClosedTimestampTracker, ReadPlan, Timestamp,
