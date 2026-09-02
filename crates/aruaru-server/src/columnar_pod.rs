@@ -64,11 +64,21 @@ async fn columnar_status(
         .snapshot_table(&table)
         .map(|(_, pks, _)| pks.len())
         .unwrap_or(0);
+    // A.6-4 段階2 の観測: base+delta の block 数、MoR 実効行数、
+    // deletion vector にマークされた行位置の総数(DELETE/UPDATE が
+    // 実際に deletion vector を立てていることを別プロセスから確認できる)。
+    let blocks = applier.latest_blocks(&table).unwrap_or_default();
+    let block_count = blocks.len();
+    let deletion_vector_positions: usize =
+        blocks.iter().map(|b| b.deletion_vector.len()).sum();
     Json(serde_json::json!({
         "table": table,
         "snapshotId": snapshot_id,
         "replicationCount": applier.replication_count(),
         "rowCount": row_count,
+        "columnarBlockCount": block_count,
+        "columnarLiveRowCount": applier.latest_live_row_count(&table),
+        "columnarDeletionVectorPositions": deletion_vector_positions,
     }))
     .into_response()
 }
