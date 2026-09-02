@@ -176,9 +176,12 @@
 > (parallel・follower_read)/**P3(`closed-timestamp`・`wal-service`・
 > `sharded-store`・`ephemeral-query`・`multi-raft`、全て GraphQL 化+
 > 該当 REST ルート撤廃)まで完了**。実プロセス HTTP E2E も全スライスで
-> 完了済み(続き11〜13)。**次は要求③の実装トラック
-> (A.6-2 `ColumnarApplier` 等)**。`git log --oneline -25` で
-> `再設計 P1〜P3`・`付録A` のコミット群を確認。
+> 完了済み(続き11〜13)。**要求③の実装トラック**: A.6-2 `ColumnarApplier`
+> 本体(続き15)・実プロセス配線(続き16)・**A.6-4 段階2 = base+delta の
+> Merge-on-Read + deletion vector 書き込み側配線(続き20)まで完了**。
+> **次は A.6-1 HLC の配線・`aruaru.yaml: htap` セクション**(下記
+> 「🛑 復活用メッセージ」項目4 参照)。`git log --oneline -25` で
+> `再設計 P1〜P3`・`付録A`・`A.6-x` のコミット群を確認。
 >
 > **ユーザーの不変の要求(肝に銘じること)**:
 > 1. **REST API は SET(RPoem + aruaru-db)全体から例外なく完全撤廃**。
@@ -225,9 +228,18 @@
 >    旧 REST パス(`/admin/closed-timestamp`等)はトークン付きで `404`
 >    (真の削除、トークン無しの `401` に惑わされないこと)を確認。
 >    残置 REST(`/admin/cluster` 等)は `200` のまま(非破壊)を確認。
-> 4. **⏳ 要求③の実装トラック**: 付録 A.6-2「Raft-Learner 上の 行→列 非同期
->    変換レプリカ(`ColumnarApplier`)」が本命。A.6-1 HLC、A.6-4 deletion
->    vector も。`aruaru.yaml: htap` セクション(§5・A.7)を先に足す。
+> 4. **⏳ 要求③の実装トラック**: A.6-2 `ColumnarApplier` 本体は続き15、
+>    実プロセス配線は続き16、**A.6-4 段階2(base+delta の Merge-on-Read
+>    + deletion vector の書き込み側配線)は続き20 で完了**(8ユニット
+>    テスト green、2プロセス実HTTP E2E で DELETE/UPDATE が block を
+>    書き直さず deletion vector を立てることを実証)。**残り**:
+>    (a) A.6-1 HLC(続き14 で `hlc.rs` 実装済み・未配線)を
+>    `closed_ts`/`wal_service`/`multi_raft` のタイムスタンプ源へ配線、
+>    (b) `aruaru.yaml: htap` セクション(§5・A.7)実装 +
+>    `--columnar-learner` を宣言的設定経由の起動へ統合、
+>    (c) `ColumnarApplier` の block を `prune_range`/`prune_equality` へ
+>    流す枝刈り込み観測 API(`Query.htapReplicas` 相当)、
+>    (d) A.6-3(読み取り時の Raft index + MVCC による SI 検証)。
 > 5. `disaster_backup.email` の reconcile(`feature = "disaster_email_backup"`
 >    ゲート。config スキーマは 7 フィールドへ拡張済み)。
 > 6. Tauri(`admin/src-tauri`、ワークスペース外・この環境ではビルド不可)
@@ -5512,3 +5524,81 @@ HLC、deletion vector)自体はVPS上の単一ノード常駐運用では現状�
 加えて、VPS/ローカルのディレクトリ構成不整合(`open-raid-z`のパス)が
 今後同種のビルド失敗を再発させ得るため、次回VPSでこの種のエラーに
 遭遇したら本エントリの`ln -sf`対応を参照すること。
+
+## HANDOFF追記(2026-09-02続き20) A.6-4 段階2「base+delta の Merge-on-Read」実装完了 — deletion vector の書き込み側配線(続き18 の残課題)を解消
+
+**位置づけ**: 「🛑 復活用メッセージ」項目4=要求③実装トラックの本命
+(A.6-2 `ColumnarApplier`)を、続き18 が「まだ残る配線(誇張しない)」と
+明記していた**書き込み側**(実際の DELETE/UPDATE 発生時に deletion
+vector を立てる経路)まで通した。
+
+**実装**(`crates/aruaru-dist/src/columnar_applier.rs`、`ColumnarApplier`
+を都度フル再構築方式から base+delta 方式へ格上げ):
+- `TableReplicaState`(プロセスメモリ上、これが MoR の権威ある表現)に
+  `blocks: Vec<BlockMeta>`(`[0]`=base、`[1..]`=delta)、
+  `locations: HashMap<pk, RowLoc{block_idx,row_pos,row_hash}>`
+  (生きている行の位置)、`deltas_since_base`、`base_generation` を保持。
+- `replicate_table` を差分反映へ:
+  1. **DELETE / 主キーを変える UPDATE**: 以前は生きていたが今は行ストアに
+     無い主キー → その行がいる block の `deletion_vector` へ位置を
+     `insert`(block 実体は書き直さない = 即時 rewrite 無しの MoR)。
+  2. **INSERT / 行内容が変わった UPDATE**: 行内容ハッシュで検出し、
+     新規行だけの小さな **delta block** を1つ足す。in-place UPDATE は
+     旧位置を deletion vector へ退避してから delta へ再登録。
+  3. **compaction**: delta が `COMPACTION_THRESHOLD`(8)たまったら
+     テーブル全体から base を作り直して畳み込む(TiFlash DeltaTree の
+     閾値 compaction 相当)。
+- **`ObjectTable` は append-only の segment ログ**(`commit_blocks` が
+  親の segment 一覧を引き継いで追記する既存設計)なので、その commit で
+  **新しく書いた block だけ**(delta、または compaction 時の fresh base)を
+  `object_table.commit_blocks()` へ渡して時間旅行のスナップショット連鎖を
+  進める。「マージ済みの現在の姿」は `replica_state` が保持する
+  (`latest_blocks`/`latest_live_row_count` はここを読む)。
+- `crates/aruaru-server/src/columnar_pod.rs` の `GET /columnar/:table` に
+  `columnarBlockCount` / `columnarLiveRowCount` / `columnarDeletionVector
+  Positions` を追加(別プロセスから MoR・deletion vector 書き込みを観測)。
+
+**正直な簡略化点(誇張しない)**: (1) 差分検出は「主キー + 行内容の
+ハッシュ」粒度(列単位の部分更新追跡はしない)。(2) block 実体
+(Parquet 相当)は書かない(`table_format` の既存制約を踏襲)。
+(3) deletion vector は `BTreeSet<u64>`(非圧縮、`table_format` 側の
+既知課題)。(4) A.6-3(Raft index + MVCC SI 検証)とは未接続。
+(5) `prune_range`/`prune_equality` は続き18 で deletion vector を尊重済み
+だが、`ColumnarApplier` の block を実際に prune へ流し込む配線(観測 API
+経由の枝刈り込み読み取り)は未実施。
+
+**検証(実測)**:
+- `cargo test -p aruaru-dist columnar_applier` → **8 passed / 0 failed**
+  (新規5: 2回目 INSERT が delta を足す〈フル再構築でない〉/ DELETE が
+  block を書き直さず deletion vector を立てる / in-place UPDATE が旧位置を
+  退避し二重計上しない / 閾値で base へ compaction / compaction 後も
+  delta を足せる)。
+- `cargo test -p aruaru-dist -p aruaru-backup` → aruaru-dist **91 passed**・
+  aruaru-backup **45 passed**、失敗0(リグレッション無し)。
+- `cargo build --workspace` → 成功(既存の `build_cluster`/`propose_commit`
+  未使用警告2件のみ、無関係)。
+- **実プロセス 2 プロセス E2E**(型チェック・単体テストだけで終わらせない):
+  leader(`--raft-id 1 --gql-port 15180 --learner-peers "2@127.0.0.1:15181"`)
+  + columnar learner(`--raft-id 2 --raft-role learner --peers
+  "1@127.0.0.1:15180" --columnar-learner --gql-port 15181`)を実起動。
+  leader へ `POST /admin/cluster/propose` で CREATE→INSERT×3→
+  `UPDATE ... WHERE id='2'`→`DELETE ... WHERE id='1'` を流し、別プロセスの
+  learner へ `GET /columnar/items` を実 HTTP:
+  - 3 INSERT 後: `columnarBlockCount:4`(空 base + 3 delta)、
+    `columnarLiveRowCount:3`、`columnarDeletionVectorPositions:0`。
+  - in-place UPDATE 後: `blockCount:5`(delta 追加)、`liveRowCount:3`
+    (二重計上なし)、**`deletionVectorPositions:1`**(旧行位置をマーク)。
+  - DELETE 後: `blockCount:5`(**書き直しなし**)、`liveRowCount:2`、
+    **`deletionVectorPositions:2`**。
+  → バイナリ Raft 経由で learner へ複製された commit が、実際に
+  deletion vector を立てて MoR を維持していることを別プロセス実 HTTP で
+  実証した。
+
+**次にやること(要求③実装トラックの残り)**: (1) HLC(続き14 で
+`hlc.rs` 実装済み・未配線)を `closed_ts`/`wal_service`/`multi_raft` の
+タイムスタンプ源へ実配線(A.6-3 の SI 検証と合わせて設計するのが自然)、
+(2) `aruaru.yaml: htap` セクション(§5・A.7、`columnar_replicas`/
+`read_consistency`/`delta`)を実装し、`--columnar-learner` を宣言的設定
+経由の起動へ統合、(3) `ColumnarApplier` の block を `prune_range`/
+`prune_equality` へ流す枝刈り込み観測 API(`Query.htapReplicas` 相当)、
+(4) A.6-3(読み取り時の Raft index + MVCC による SI 検証)。
