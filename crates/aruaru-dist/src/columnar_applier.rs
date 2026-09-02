@@ -73,7 +73,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
-use aruaru_backup::table_format::{BlockMeta, MetaService, ObjectStore, ObjectTable, TableFormatError};
+use aruaru_backup::table_format::{
+    BlockMeta, MetaService, ObjectStore, ObjectTable, RangeOp, TableFormatError,
+};
 use aruaru_core::catalog::ColumnType;
 use aruaru_query::parser::{self, Statement};
 use aruaru_query::QueryEngine;
@@ -186,6 +188,22 @@ fn build_block(
         block = block.with_bloom("__pk__", pk_strings.iter().map(|s| s.as_str()));
     }
     block
+}
+
+/// `Query.htapReplicas` 相当の枝刈り込み観測 API の結果。
+/// MoR ビュー(base+delta、deletion vector 込み)の block を
+/// `prune_range`/`prune_equality` と同じロジックに流したときに、
+/// 実際に読む必要のある block がどれだけに絞られるかを報告する。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HtapPrunePreview {
+    /// MoR ビューの全 block 数(base + delta)。
+    pub total_blocks: usize,
+    /// 述語で読み飛ばせなかった(=読む必要がある)block 数。
+    pub kept_blocks: usize,
+    /// 述語 or 全行論理削除で読み飛ばせた block 数。
+    pub skipped_blocks: usize,
+    /// 残った block の実効行数合計(deletion vector 差し引き後)。
+    pub kept_live_rows: u64,
 }
 
 /// Raft learner 用の行→列変換 `Applier`。
@@ -431,6 +449,77 @@ impl ColumnarApplier {
             .map(|st| st.blocks.iter().map(|b| b.live_row_count()).sum())
     }
 
+    /// 範囲述語 `column op value` を MoR ビューへ流した枝刈り観測。
+    /// テーブルが未レプリケートなら `None`。
+    pub fn prune_range_preview(
+        &self,
+        table_name: &str,
+        column: &str,
+        op: RangeOp,
+        value: f64,
+    ) -> Option<HtapPrunePreview> {
+        let states = self.replica_state.lock();
+        let st = states.get(table_name)?;
+        let mut kept = 0usize;
+        let mut skipped = 0usize;
+        let mut kept_live_rows = 0u64;
+        for b in &st.blocks {
+            if b.row_count > 0 && b.live_row_count() == 0 {
+                skipped += 1;
+                continue;
+            }
+            if b.column_stats.get(column).is_some_and(|s| s.disproves(op, value)) {
+                skipped += 1;
+                continue;
+            }
+            kept += 1;
+            kept_live_rows += b.live_row_count();
+        }
+        Some(HtapPrunePreview {
+            total_blocks: st.blocks.len(),
+            kept_blocks: kept,
+            skipped_blocks: skipped,
+            kept_live_rows,
+        })
+    }
+
+    /// 等値述語 `column = key` を MoR ビューへ bloom filter で流した
+    /// 枝刈り観測。bloom を持たない block は安全側に残す。
+    pub fn prune_equality_preview(
+        &self,
+        table_name: &str,
+        column: &str,
+        key: &str,
+    ) -> Option<HtapPrunePreview> {
+        let states = self.replica_state.lock();
+        let st = states.get(table_name)?;
+        let mut kept = 0usize;
+        let mut skipped = 0usize;
+        let mut kept_live_rows = 0u64;
+        for b in &st.blocks {
+            if b.row_count > 0 && b.live_row_count() == 0 {
+                skipped += 1;
+                continue;
+            }
+            let keep = match b.bloom.get(column) {
+                Some(f) => f.may_contain(key.as_bytes()),
+                None => true,
+            };
+            if keep {
+                kept += 1;
+                kept_live_rows += b.live_row_count();
+            } else {
+                skipped += 1;
+            }
+        }
+        Some(HtapPrunePreview {
+            total_blocks: st.blocks.len(),
+            kept_blocks: kept,
+            skipped_blocks: skipped,
+            kept_live_rows,
+        })
+    }
+
     /// 累計レプリケーション回数(observability用)。
     pub fn replication_count(&self) -> u64 {
         self.replication_count.load(std::sync::atomic::Ordering::Relaxed)
@@ -664,6 +753,48 @@ mod tests {
         // 0 は既定値へフォールバック。
         let a0 = ColumnarApplier::with_in_memory_store(Arc::new(QueryEngine::new())).with_compaction_threshold(0);
         assert_eq!(a0.compaction_threshold, DEFAULT_COMPACTION_THRESHOLD);
+    }
+
+    #[test]
+    fn prune_range_preview_skips_delta_blocks_that_cannot_match() {
+        let applier = new_applier();
+        applier.apply(&Command::Exec(
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT)".into(),
+        ));
+        // 各 INSERT が単一行の delta を1つ足す(v = 10, 20, 30)。
+        applier.apply(&Command::Exec("INSERT INTO t (id, v) VALUES (1, 10)".into()));
+        applier.apply(&Command::Exec("INSERT INTO t (id, v) VALUES (2, 20)".into()));
+        applier.apply(&Command::Exec("INSERT INTO t (id, v) VALUES (3, 30)".into()));
+
+        // v > 15 → v=10 の delta は絶対に一致しない(統計 max=10 <= 15)。
+        let p = applier
+            .prune_range_preview("t", "v", RangeOp::Gt, 15.0)
+            .expect("table replicated");
+        assert_eq!(p.total_blocks, 4, "empty base + 3 single-row deltas");
+        assert_eq!(p.skipped_blocks, 1, "the v=10 delta cannot match v > 15");
+        assert_eq!(p.kept_blocks, 3, "empty base (no v stats) + v=20 + v=30 deltas");
+        assert_eq!(p.kept_live_rows, 2, "v=20 and v=30 rows survive pruning");
+    }
+
+    #[test]
+    fn prune_equality_preview_uses_the_pk_bloom_filter() {
+        let applier = new_applier();
+        applier.apply(&Command::Exec(
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT)".into(),
+        ));
+        applier.apply(&Command::Exec("INSERT INTO t (id, v) VALUES (1, 10)".into()));
+        applier.apply(&Command::Exec("INSERT INTO t (id, v) VALUES (2, 20)".into()));
+
+        let hit = applier
+            .prune_equality_preview("t", "__pk__", "1")
+            .expect("table replicated");
+        assert!(hit.kept_blocks >= 1, "the delta holding pk=1 must be kept");
+        assert!(
+            hit.kept_blocks < hit.total_blocks,
+            "at least one block (the pk=2 delta or empty base) is pruned"
+        );
+
+        assert!(applier.prune_range_preview("missing", "v", RangeOp::Gt, 0.0).is_none());
     }
 
     #[test]
