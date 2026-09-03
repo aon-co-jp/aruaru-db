@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aruaru-db"
+version = "0.1.0"
+description = "Thin official Python connector for aruaru-db: standard asyncpg / psycopg + Git-on-SQL helpers (commit / AS OF COMMIT)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+
+# asyncpg / psycopg は必須にしない ——使う方だけ入れる。
+# is_safe_commit_id 等のネットワーク不要な関数はドライバ無しで動く。
+dependencies = []
+
+[project.optional-dependencies]
+async = ["asyncpg>=0.29"]   # FastAPI などの非同期アプリ
+sync = ["psycopg[binary]>=3.1"]  # Django / Flask などの同期アプリ
+
+[tool.setuptools]
+packages = ["aruaru_db"]

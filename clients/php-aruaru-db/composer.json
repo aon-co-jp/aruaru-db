@@ -1,0 +1,14 @@
+{
+  "name": "aruaru/db",
+  "description": "Thin official PHP connector for aruaru-db: standard PDO(pgsql) + Git-on-SQL helpers (commit / AS OF COMMIT)",
+  "type": "library",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.1",
+    "ext-pdo": "*",
+    "ext-pdo_pgsql": "*"
+  },
+  "autoload": {
+    "psr-4": { "Aruaru\\Db\\": "src/" }
+  }
+}

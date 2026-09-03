@@ -6425,3 +6425,65 @@ no Git-on-SQL). Share `Arc<AruaruDb>` via closure capture (RPoem has no
 `Data<T>` extractor). pgwire is PostgreSQL-compatible incl. the extended
 protocol, so `tokio-postgres`/`sqlx` work as-is — no new development
 required.
+
+## HANDOFF追記(2026-09-03続き30) 公式「薄いコネクタ」を Python / Node / PHP / COBOL へ拡張
+
+続き29(Rust `aruaru-db-connector`)に続き、ユーザー指示「Rust Axum・
+Python FastAPI/Django/Flask・PHP Laravel など主要言語・FW をほとんど対応」
+「Windows/Mac/Linux/UNIX/メインフレームの COBOL も」への対応。**いずれも
+独自ドライバではなく各言語の標準 PostgreSQL クライアントの薄いラッパー**
+(`commit()` / `query_as_of()` + commit_id 検証で SQLi 防止)。
+
+### 新規(`clients/`)
+- **`python-aruaru-db/`** — PyPI `aruaru-db`。`AruaruDb`(asyncpg、
+  FastAPI 向け)+ `AruaruDbSync`(psycopg v3、Django/Flask 向け)。
+  `is_safe_commit_id`(regex `[A-Za-z0-9_-]{1,128}`)。asyncpg/psycopg は
+  optional-dependencies(未導入でも `is_safe_commit_id` は動く)。
+  **`python -m unittest` = 4 passed(ネットワーク不要ぶん、Python 3.14
+  で実行確認)**。
+- **`node-aruaru-db/`** — npm `@aruaru/db`。`pg`(node-postgres)の
+  peerDependency。`AruaruDb` / `isSafeCommitId` / `.d.ts`。
+  **`node test.js` = 4 passed**。
+- **`php-aruaru-db/`** — Composer `aruaru/db`。`PDO`(pdo_pgsql)の薄い
+  ラッパー。`AruaruDb::fromPdo(DB::connection()->getPdo())` で Laravel の
+  PDO を再利用可。**未検証**(この環境に PHP なし)。
+- **`cobol/ARUARU.cob` + README** — 埋め込み SQL(`EXEC SQL`)参照実装。
+  aruaru-db は pgwire なので COBOL からは (1) **ODBC**(psqlODBC を DSN
+  登録 + Micro Focus / OpenCOBOL ESQL、Windows/Linux/UNIX/**z/OS USS**)、
+  (2) **libpq 直呼び**(GnuCOBOL `CALL "PQexec"`)、(3) **OCESQL**
+  (`ocesql` → libpq)のいずれかで繋がる。`aruaru_commit(:msg) INTO :h` /
+  `... AS OF COMMIT :h` はホスト変数バインドだけ。**未検証**(COBOL
+  環境なし)。
+
+### `docs/CLIENTS.md` 更新
+§0.2「公式薄いコネクタパッケージ」表(Rust/Python/Node/PHP、テスト状況
+込み)、§1 マトリクスに COBOL 行、§3.8b(RPoem/Poem)は続き29 で追加済み、
+§3.8c(COBOL の 3 経路)、§4 OS 表に COBOL 行(全 OS + メインフレーム)。
+
+### 検証
+Rust `cargo test`(続き29)/ Python `unittest` 4 / Node `test.js` 4 =
+いずれもネットワーク不要ぶん green。実サーバ往復は各 README に「未検証」
+明記(この環境に稼働 server / 各言語ドライバ未導入)。PHP/COBOL は
+コンパイル・実行環境がこの開発機に無く静的作成のみ。
+
+### 次
+Go(`aruaru-db-go`)/ Java(`aruaru/db` Maven)/ .NET(`Aruaru.Db`
+NuGet)/ Ruby(`aruaru_db` gem)の同種薄ラッパー(現状は `docs/CLIENTS.md`
+§3 に生ドライバのレシピのみ)。稼働 aruaru-server を立てての各言語
+ライブ往復検証。
+
+**English**: Extended the official thin connectors (standard driver +
+`commit()` / `query_as_of()` with commit-id validation to block SQLi) to
+**Python** (PyPI `aruaru-db`: `AruaruDb` on asyncpg for FastAPI,
+`AruaruDbSync` on psycopg v3 for Django/Flask; `unittest` 4 passed),
+**Node** (npm `@aruaru/db` over `pg`; `node test.js` 4 passed), **PHP**
+(Composer `aruaru/db` over PDO; `AruaruDb::fromPdo(...)` reuses Laravel's
+PDO; not run — no PHP here), and **COBOL** (`clients/cobol/ARUARU.cob` —
+embedded `EXEC SQL`; aruaru-db is pgwire so COBOL connects via psqlODBC
+(unixODBC / Windows ODBC / **z/OS USS**), libpq `CALL`, or OCESQL;
+`aruaru_commit(:msg) INTO :h` and `AS OF COMMIT :h` are just host-var
+binds; not run — no COBOL toolchain here). `docs/CLIENTS.md` updated:
+§0.2 package table, COBOL rows in the language matrix and the per-OS
+table, §3.8c COBOL paths. Next: Go / Java / .NET / Ruby thin wrappers
+(currently only raw-driver recipes in §3), and live round-trips against
+a running server.
