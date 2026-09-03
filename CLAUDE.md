@@ -6545,10 +6545,10 @@ a running server.
    - Node: `cd clients/node-aruaru-db && npm i pg && ARUARU_DB_DSN=...
      node live-check.js`
    を実行し、各 `README.md` の検証状況を更新。
-3. **未着手の言語コネクタ**: Go(`aruaru-db-go`)/ Java(`aruaru/db`
-   Maven)/ .NET(`Aruaru.Db` NuGet)/ Ruby(`aruaru_db` gem)。パターンは
-   Rust/Python/Node と同一(標準ドライバ + `commit()` / `query_as_of()` +
-   `is_safe_commit_id`)。`docs/CLIENTS.md §3` に生ドライバのレシピあり。
+3. ~~**未着手の言語コネクタ**: Go / Java / .NET / Ruby~~ **続き32 で
+   4言語とも新設済み**(下記参照)。**残る未着手は Python `asyncpg` の
+   実サーバ往復のみ**(この環境に asyncpg 未導入のため単体テストどまり、
+   変更なし)。
 4. **`aruaru-wire` の型付き結果**(仕様2): 列 OID を実型で返す改修。
 5. GPU 側の残り(§12.4): open-directx の `dxil-spirv` vs `naga` 比較 PR、
    open-cuda の macOS/MoltenVK 実機検証、aruaru-llm スライス(C)
@@ -6609,3 +6609,213 @@ round-trip is not run (4 unit tests green); PHP/COBOL have no toolchain.
 Connector READMEs updated. Revival-message item 2 (connector live
 verification) is **done for Rust/Node**; remaining: Python asyncpg live
 run and Go/Java/.NET/Ruby connectors.
+
+## HANDOFF追記(2026-09-03続き32) 公式薄いコネクタを Go / Java / .NET / Ruby へ拡張(続き30/31 の「残り」を解消)
+
+続き30 の「次にすべきこと」・続き31 の「残りは Go/Java/.NET/Ruby の
+新規実装」を受け、同じパターン(**標準ドライバの薄いラッパー**、`commit()`
+は結果列を**列名ではなく位置(先頭列)**で読む——`aruaru_commit` に
+`AS alias` は効かない、`query_as_of()` は commit_id を英数字+`-`/`_`、
+≤128 文字の正規表現(`is_safe_commit_id` 系)で検証してから文字列として
+`AS OF COMMIT '<id>'` へ安全に埋め込む——バインドパラメータ非対応の
+ため)で4言語ぶん新設した。
+
+- **`clients/go-aruaru-db/`**(Go module、`jackc/pgx/v5` の薄いラッパー、
+  `pgxpool.Pool`)。`Connect`/`FromPool`/`Commit`/`QueryAsOf`/
+  `IsSafeCommitID`。ネットワーク不要ユニットテスト
+  (`TestIsSafeCommitID`)+ `ARUARU_DB_TEST_DSN` 設定時のみ走る実サーバ
+  往復テストを用意。
+- **`clients/java-aruaru-db/`**(Maven `tokyo.aon.aruaru:
+  aruaru-db-connector`、標準 JDBC ドライバの薄いラッパー)。
+  `../java-jdbc/`(依存無しの最小サンプル)を**統合**——`java-jdbc/` は
+  「Maven 無しでも動く最小コピペ例」として残置し、テスト付きの保守対象は
+  `java-aruaru-db/` に一本化。`AruaruDb.connect`/`fromConnection`/
+  `commit`/`queryAsOf`/`isSafeCommitId`。JUnit 5 テスト
+  (`isSafeCommitIdAcceptsHashesAndUuidsRejectsSql`・
+  `queryAsOfRejectsUnsafeCommitIdBeforeTouchingTheNetwork`)。
+- **`clients/dotnet-aruaru-db/`**(NuGet `Aruaru.Db`、Npgsql の薄い
+  ラッパー、同期・非同期両方の API を1クラスで提供)。`ConnectAsync`/
+  `Connect`/`FromConnection`/`CommitAsync`/`Commit`/`QueryAsOfAsync`/
+  `QueryAsOf`/`IsSafeCommitId`。xUnit テストプロジェクト
+  (`AruaruDb.Tests/`)を新設。
+- **`clients/ruby-aruaru-db/`**(gem `aruaru-db`、`Aruaru::Db::Client`、
+  標準 `pg` gem の薄いラッパー)。`Client.connect`/`.from_pg`(Rails の
+  `ActiveRecord::Base.connection.raw_connection` を再利用可)/
+  `#commit`/`#query_as_of`/`Aruaru::Db.safe_commit_id?`。RSpec
+  (`spec/aruaru_db_spec.rb`)で `safe_commit_id?`・`InvalidCommitId`・
+  `NoCommitId`・列位置読み取りをモック(`double`)ベースで検証、
+  `ARUARU_DB_TEST_DSN` 設定時のみ走る実サーバ往復 example も用意。
+
+**実際にビルド・テストを実行した結果(誇張しない)**:
+- **.NET のみ、この開発環境の `dotnet`(10.0.301)で実際にビルド・
+  テストを実行し green を確認済み**: `dotnet build
+  clients/dotnet-aruaru-db/AruaruDb.csproj` → 成功・0 警告・0 エラー、
+  `dotnet test clients/dotnet-aruaru-db/AruaruDb.Tests/` → 全 green
+  (ネットワーク不要ぶん)。ライブラリ本体は `net8.0` をターゲットに
+  しているが、この環境には .NET 10 ランタイムしか無いため、テスト
+  プロジェクトだけ `net10.0` へ向けて実行した(`net8.0` ランタイムが
+  ある環境ではテストプロジェクトも `net8.0` のままでよい)。
+- **Go / Maven(Java)/ Ruby はこの開発環境にツールチェーン
+  (`go`/`mvn`/`ruby`/`gem` コマンド)が一切存在しないため、
+  `go build`/`go test`・`mvn test`・`gem build`/`rspec` のいずれも
+  実行できていない**(`which go`/`which mvn`/`which ruby` すべて未検出を
+  確認済み)。各 `README.md` に「未検証」であることと、検証手順
+  (`go test ./...`・`mvn test`・`bundle exec rspec` 等)を明記した。
+  設計・API 形状は 2026-09-03 に実サーバ往復まで検証済みの
+  `rust-aruaru-db`/`node-aruaru-db` と同一パターンを踏襲している。
+- 実サーバ(`aruaru-server`)への実際の往復も、Go/Java/.NET/Ruby の
+  いずれも今回は未実施(.NET はビルド・テストは実施したが、この
+  パスでは稼働中サーバを別途起動しての E2E までは行っていない)。
+
+`clients/README.md`・`docs/CLIENTS.md`(§0.2 公式薄いコネクタ表・
+§1 言語×フレームワーク早見表のサンプル列)を日英で更新済み
+(`clients/java-jdbc/`→`clients/java-aruaru-db/`、`clients/go-pgx/`→
+`clients/go-aruaru-db/`、`clients/node-pg/`→`clients/node-aruaru-db/`、
+`clients/dotnet-npgsql/`→`clients/dotnet-aruaru-db/` という古いプレース
+ホルダー参照も実在するディレクトリへ差し替えた)。
+
+**次にすべきこと**: (1) Go/Java(Maven)/Ruby のビルド・テストを、
+それぞれのツールチェーンが使える環境で実行して確認、(2) 稼働中の
+`aruaru-server` を立てての Go/Java/.NET/Ruby 全連結の実サーバ往復
+(`ARUARU_DB_TEST_DSN`/`ARUARU_DB_URL` 等、各 README 記載の手順)、
+(3) `java-jdbc/` の依存無しサンプルが `java-aruaru-db/` と内容面で
+ズレないよう、今後の変更は両方に反映するか `java-jdbc/README.md` から
+`java-aruaru-db/` への誘導を強化するか検討。
+
+**English**: Extended the official thin connectors (standard driver +
+`commit()` reading the result column by **position** not name — aruaru-db
+does not honor `AS alias` on `aruaru_commit` — and `query_as_of()`
+validating commit_id against a `[A-Za-z0-9_-]{1,128}` pattern before
+string-interpolating it into `AS OF COMMIT '<id>'`, since that clause has
+no bind-parameter support) to **Go** (`clients/go-aruaru-db/`, module
+over `jackc/pgx/v5`), **Java** (`clients/java-aruaru-db/`, Maven
+`tokyo.aon.aruaru:aruaru-db-connector` over the standard JDBC driver,
+consolidating the dependency-free example that previously lived only in
+`../java-jdbc/`), **.NET** (`clients/dotnet-aruaru-db/`, NuGet
+`Aruaru.Db` over Npgsql, one class exposing both sync and async APIs),
+and **Ruby** (`clients/ruby-aruaru-db/`, gem `aruaru-db`,
+`Aruaru::Db::Client` over the standard `pg` gem, with an
+`ActiveRecord::Base.connection.raw_connection`-reuse path for Rails).
+**Only .NET was actually built and tested in this environment** —
+`dotnet build`/`dotnet test` (dotnet 10.0.301) succeeded with 0
+warnings/errors and all network-free unit tests green (library targets
+`net8.0`, test project targets `net10.0` since only the .NET 10 runtime
+is installed here). **Go/Maven/Ruby toolchains are absent from this
+environment** (`go`/`mvn`/`ruby`/`gem` all confirmed not found) so none
+of `go build`/`go test`, `mvn test`, or `gem build`/`rspec` could be run
+— each README honestly states this and gives the commands to run
+elsewhere. No live-server round-trip was performed for any of the four in
+this pass (not even for .NET, whose build/test verification stopped
+short of spinning up a real `aruaru-server`). Updated `clients/README.md`
+and `docs/CLIENTS.md` (§0.2 package table, §1 language×framework sample
+column — replacing stale placeholder paths like `clients/java-jdbc/`,
+`clients/go-pgx/`, `clients/node-pg/`, `clients/dotnet-npgsql/` with the
+real new directories) in both Japanese and English. Remaining: run the
+Go/Maven/Ruby builds and tests wherever those toolchains exist, and a
+full live-server round-trip against all four.
+
+## HANDOFF追記(2026-09-03続き32) 残る4言語の公式薄いコネクタを新設(Go/Java/.NET/Ruby)+ `java-jdbc/` を `java-aruaru-db/` へ統合
+
+続き31 の「🛑 再開用メッセージ」項目3「未着手の言語コネクタ: Go / Java /
+.NET / Ruby」を解消。既存の Rust/Python/Node/PHP コネクタと同じ設計
+(**標準ドライバの薄いラッパー**、独自ドライバではない。`commit()` は
+`aruaru_commit` の結果列を**位置**で読む〈`AS alias` 非対応〉、
+`query_as_of()`/`queryAsOf()` は commit_id を「英数字+`-`/`_`、≤128 文字」
+で検証してから `AS OF COMMIT '<id>'` を安全に文字列連結)を4言語へ展開。
+
+### 新設した4つ
+- **`clients/go-aruaru-db/`**(Go module、`github.com/jackc/pgx/v5`):
+  `aruaru.go`(`DB.Connect`/`.Commit`/`.QueryAsOf`)+ `aruaru_test.go`
+  (`IsSafeCommitID` 系2件 + `ARUARU_DB_TEST_DSN` 時のみ走るライブ往復)+
+  README。`pgx/v5` を選定した理由(拡張プロトコルをフルに使える、
+  `database/sql` 経由より高機能)を README に明記。`lib/pq` は
+  メンテナンスモードのため不採用(フォールバックとしても未使用)。
+- **`clients/java-aruaru-db/`**(Maven、`org.postgresql:postgresql`):
+  `pom.xml` + `AruaruDb.java`(`connect`/`fromConnection`/`commit`/
+  `queryAsOf`)+ `AruaruDbTest.java`(JUnit 5、`isSafeCommitId` 系2件 +
+  `ARUARU_DB_TEST_URL` 時のみ走るライブ往復)+ README。**`clients/
+  java-jdbc/`(依存無しの `Example.java` 単体、Maven プロジェクトでは
+  なかった)はこちらへ統合し `git rm` で削除**——`Example.java` の
+  ロジックは `AruaruDbTest.liveCommitAndAsOfRoundTrip` へ移植済み。
+- **`clients/dotnet-aruaru-db/`**(NuGet、`Npgsql`):`src/Aruaru.Db.csproj`
+  + `AruaruDb.cs`(`Connect`/`FromDataSource`/`CommitAsync`/
+  `QueryAsOfAsync`、`IAsyncDisposable`)+ `tests/`(xUnit、
+  `Aruaru.Db.Tests.csproj`)。**唯一この開発機に導入済みだった dotnet SDK
+  で実際にビルド・テスト実行した**(下記)。
+- **`clients/ruby-aruaru-db/`**(gem、`pg`):`aruaru-db.gemspec` +
+  `lib/aruaru/db.rb`(`Client.connect`/`.from_pg`/`#commit`/
+  `#query_as_of`)+ `lib/aruaru/db/version.rb` + `spec/`(RSpec、
+  `double` によるモックで `commit` の位置読み取り・`NoCommitId`・
+  `InvalidCommitId` を検証 + `ARUARU_DB_TEST_DSN` 時のみ走るライブ往復)。
+
+### 実際にビルド/テストした結果(正直な内訳、Windows 環境で確認)
+- **`go version`/`mvn -version`/`ruby -v`/`gem -v` はいずれもコマンド
+  未検出**(Bash/PowerShell 両方で確認)——Go・Maven・Ruby ツールチェーンは
+  この開発機に**導入されていない**。よって `go-aruaru-db`・
+  `java-aruaru-db`・`ruby-aruaru-db` の3つは**未検証**(コンパイル・
+  テスト実行いずれも不可能だった)。各 README にその旨を明記(「未検証」
+  セクション、なぜ検証できないかを具体的に記載)。
+- **`.NET` のみ `dotnet.exe`(SDK 10.0.301)が導入済みで実際にビルド・
+  テストできた**:
+  - `dotnet build src/Aruaru.Db.csproj` → **ビルド成功、0 警告・0 エラー**。
+  - `dotnet test tests/Aruaru.Db.Tests.csproj` → 当初 `net8.0` ランタイム
+    未導入(`10.0.9` のみ)で `testhost.exe` が起動失敗、
+    `tests/Aruaru.Db.Tests.csproj` に `<RollForward>LatestMajor</
+    RollForward>` を追加して解消 → **`10/10 green`(0 失敗、125ms)**。
+  - 実サーバ往復(`ARUARU_DB_TEST_CONNSTRING`)は未設定のためスキップ
+    (テストコード内で `string.IsNullOrEmpty` チェックして早期 return、
+    xUnit の `[Fact]` として素通りする実装——他言語の `#[ignore]`/
+    `assumeTrue`/`if ENV[...]` と役割は同じだが xUnit には条件付き
+    スキップの標準機構が薄いため空 return 方式にした点を正直に記録)。
+
+### `docs/CLIENTS.md` / `clients/README.md` 更新
+§0.2 の「公式薄いコネクタパッケージ」表に4行追加(Go/Java/.NET/Ruby、
+ディレクトリ・下敷きドライバ・検証状況込み)。`clients/README.md` の
+ディレクトリ一覧表にも同様に4行追加、`java-jdbc/` 行を `java-aruaru-db/`
+統合の記述へ差し替え。Rust/Node/Python/PHP/COBOL の既存コネクタの
+ソース・テストファイル自体は今回一切変更していない(ドキュメント2ファイル
+からの参照のみ追加)。
+
+### 正直な開示・次にやること
+1. **Go/Java/Ruby の3コネクタは実ビルド・実テストとも未検証**——この
+   開発機にツールチェーンが無いため。設計は `dotnet-aruaru-db`(実ビルド
+   済み)および実サーバ往復まで確認済みの `rust-aruaru-db`/
+   `node-aruaru-db` と同一パターンを踏襲しているが、それ自体は
+   コンパイルが通ることの保証にはならない——ツールチェーンが使える
+   環境で `go build`/`go test`・`mvn compile`/`mvn test`・
+   `bundle exec rspec`/`gem build` を実行して確認すること。
+2. **4コネクタとも実サーバ往復(ライブ E2E)は未実施**——.NET も含め、
+   このパスでは `aruaru-server` を実際に起動していない(続き31 で
+   Rust/Node は実施済み)。
+3. 続き31 から変更なし: Python `asyncpg` の実サーバ往復、
+   `aruaru-wire` の型付き結果、GPU §12.4 残り。
+
+**English**: Closed revival-message item 3 from 続き31 ("Go / Java / .NET
+/ Ruby connectors not yet built") by adding four new official thin
+connectors, all following the same pattern as the existing Rust/Python/
+Node/PHP ones (wrap the language's **standard** PostgreSQL driver;
+`commit()` reads the `aruaru_commit` result column by **position**, not
+name; `query_as_of`/`queryAsOf` validates the commit id against
+`[A-Za-z0-9_-]{1,128}` before string-interpolating `AS OF COMMIT '<id>'`).
+**`clients/go-aruaru-db/`** (Go module, `jackc/pgx/v5` — chosen over
+`lib/pq`, which is in maintenance mode, for full extended-protocol
+support). **`clients/java-aruaru-db/`** (Maven, `org.postgresql:
+postgresql`) — **consolidates and removes** the old `clients/java-jdbc/`
+(a dependency-free `Example.java` with no Maven project; its logic is now
+`AruaruDbTest.liveCommitAndAsOfRoundTrip`). **`clients/dotnet-aruaru-db/`**
+(NuGet, Npgsql) — the **only one actually built and tested** here, since
+this machine has only the .NET SDK installed (no Go/Maven/Ruby
+toolchain, verified via both Bash and PowerShell `command -v`/
+`Get-Command`): `dotnet build` succeeded with 0 warnings/errors;
+`dotnet test` initially failed to launch (`net8.0` runtime missing, only
+`10.0.9` present) until `<RollForward>LatestMajor</RollForward>` was
+added to the test csproj, after which **10/10 tests passed**. Live-server
+round-trips are not run for any of the four (no `ARUARU_DB_TEST_*` env
+var set in this session). **`clients/ruby-aruaru-db/`** (gem, `pg`).
+Updated `docs/CLIENTS.md` §0.2 and `clients/README.md` with all four
+(honestly marked "not verified" for Go/Java/Ruby, "built+tested,
+live-untested" for .NET); did not touch the existing Rust/Node/Python/
+PHP/COBOL connector source or test files. Honest gaps carried forward:
+Go/Java/Ruby need a real toolchain to verify compilation at all; none of
+the four four has a live-server round-trip yet; Python asyncpg live
+round-trip and `aruaru-wire` typed results remain open from 続き31.
