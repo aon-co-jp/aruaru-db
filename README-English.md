@@ -282,11 +282,22 @@ SELECT qty FROM items WHERE id = 'sword';                          -- 5 (latest)
 SELECT qty FROM items WHERE id = 'sword' AS OF COMMIT 'abc123...'; -- 1 (past)
 ```
 
-Current scope: single-row lookups only (a `WHERE` clause identifying the
-primary key is required); full-table-scan `AS OF` queries are not yet
-supported. This is not yet wired through pgwire for external callers
-(`open-runo`/`open-web-server`) — see this file's HANDOFF section for the
-honest scope boundary.
+**Fixed 2026-09-03**: `AS OF COMMIT` now honors **column projection** like
+a normal `SELECT` (previously it always returned the full row). `SELECT *`
+keeps the full row; listing columns returns those columns in that order;
+an unknown column errors. Both single-row and WHERE-less full-scan work.
+
+**Client connectivity** (Java / Rust+Axum・Poem・RPoem / Python+FastAPI・
+Django・Flask / PHP+Laravel / Go / Node / .NET / COBOL / IBM z/OS
+mainframe, …) is in [`docs/CLIENTS.md`](docs/CLIENTS.md): aruaru-db
+exposes only the two standard contracts — pgwire (:5433) and GraphQL/HTTP
+(:4001) — so **every language connects with its standard PostgreSQL
+driver**; no custom driver is needed. Optional thin official connectors
+that wrap Git-on-SQL idiomatically live in [`clients/`](clients/)
+(`aruaru-db-connector` (Rust) / `aruaru-db` (PyPI) / `@aruaru/db` (npm) /
+`aruaru/db` (Composer)). **Current limitation**: result columns are all
+returned as `VARCHAR` (text) for now, so read them as strings and parse
+rather than using typed getters like `get::<i32>` (`docs/CLIENTS.md §5.1`).
 
 Branch diffs aren't exposed as a SQL function — use the `aruaru-graphql` API instead:
 
