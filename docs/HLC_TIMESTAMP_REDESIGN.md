@@ -334,9 +334,49 @@ impl HlcTimestamp {
    `try_update` は互換シグネチャで維持。新 `now_hlc`/`observe_hlc`/
    `uncertainty_upper`/`synthetic`。全既存テスト + 新規テスト。
 2. **P-HLC-3b**: GraphQL `Query.hlcNow` を追加(観測専用)。実 HTTP E2E。
-3. **P-HLC-3c(将来)**: `closed_ts` の follower read staleness 判定を
-   `uncertainty_upper` ベースへ(CockroachDB の uncertainty interval)。
-   今回はやらない(closed_ts の設計は別トラック)。
+3. **P-HLC-3c(2026-09-03 実施)**: `closed_ts` の follower read staleness
+   判定を uncertainty interval ベースへ。
+   - `ClosedTimestampTracker::can_serve_uncertainty_safe_read_at(read_ts,
+     max_offset)` = `closed_ts >= read_ts + max_offset`(uncertainty
+     interval `[read_ts, read_ts + max_offset]` の**全域**が閉じ済み)。
+   - `ClosedTimestampCoordinator::plan_uncertainty_safe_read(range_ids,
+     now, staleness, max_offset)` ——`max_offset == 0` なら
+     `plan_exact_staleness_read` へ委譲(後方互換)。
+   - GraphQL `planFollowerRead(mode: "uncertainty-safe")` で選択。
+     `max_offset` は共有 `AdminCtx.hlc` の `max_offset_nanos()` から取る。
+   - これを満たす follower read は **uncertainty restart が発生し得ない**
+     (CockroachDB の `follower_read_timestamp()` が `target_lag ≥
+     max_offset` を選ぶのと同じ保証を、明示的な判定として提供)。
+   - テスト: `uncertainty_safe_read_requires_closed_ts_to_cover_the_
+     uncertainty_interval`(dist)+ `plan_follower_read_uncertainty_safe_
+     mode_requires_covering_the_uncertainty_interval`(graphql)。
 
-これで「案A 全面移行」は完了扱いとする ——内部表現は完全に案A、
-外向き u64 は後方互換の射影、という実用的な移行。
+4. **P-HLC-3d(2026-09-03 実施)= 射影からシフト・パック・切り捨てを完全撤去**:
+   ユーザー指摘「シフト・パックが無い?」——P-HLC-3a まででも `as_ordinal()`
+   に案B の `& !0xFFFF` バケット射影が残っており、`advance_locked` も
+   「バケットが進んだか」で分岐していた(= 内部状態機械にシフト・パックの
+   残滓)。これを撤去した:
+   - **`as_ordinal()` = `wall_nanos.saturating_add(logical)`**。左シフトも
+     マスクもバケットも無い。`logical`(= 物理クロック停止中に発生した
+     同一ナノ秒内の追加イベント数、通常 0〜数個、`max_offset` で有界)を
+     ナノ秒空間へそのまま足し込むだけ。→ `closed_ts` 等が受け取る u64 は
+     **フル精度の Unix ナノ秒スケール**(§3「案B の代償」= 65µs 粒度は消滅)。
+   - **`advance_locked` はバケット概念を持たない**: `wall_now > st.wall_nanos`
+     なら `(wall_now, 0)`、そうでなければ `logical += 1` + `synthetic`
+     ——CockroachDB `hlc.go` `Now()` とビット単位で同じ。
+   - **`from_ordinal(o)` = `{ wall_nanos: o, logical: 0, synthetic: true }`**
+     (物理成分をそのまま復元。u64 経路で畳み込まれた `logical` 端数は失うが、
+     フル精度が要る所は `observe_hlc`)。
+   - u64 経路の**厳密単調**は従来どおり `Hlc.last_ordinal` クランプで保証
+     (`now_ordinal()` が `as_ordinal().max(last_ordinal + 1)`)。
+   - `ORDINAL_LOGICAL_BITS` / `ORDINAL_BUCKET_MASK` / `ordinal_bucket()` は削除。
+   - `now_ordinal` / `observe_ordinal` / `try_observe_ordinal` /
+     `closed_ts` / `wal_service` / GraphQL `closedTsAdvance` のシグネチャ・
+     配線は**一切変更なし**(u64 の意味が「65µs 射影」→「フル精度ナノ秒 +
+     logical 畳み込み」へ厳密化されただけ、persisted ordinal は無いので
+     互換性問題なし)。
+
+これで「案A 全面移行」は P-HLC-3a/b/c/d すべて完了 ——内部表現も外向き
+u64 射影も、シフト・パック・切り捨てが**一切無い**。u64 オーバーフローは
+構造的に不可能、物理分解能はナノ秒フル、uncertainty interval は
+CockroachDB 準拠。

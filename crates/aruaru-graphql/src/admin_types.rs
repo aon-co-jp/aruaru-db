@@ -469,7 +469,8 @@ pub struct HlcNowGql {
     pub logical: i32,
     /// wall_nanos が実際の物理クロック読み値より先行しているか。
     pub synthetic: bool,
-    /// 既存 API 互換の u64 ordinal(案B の 65µs 射影、String)。
+    /// `closed_ts` 等が受け取る u64 ordinal(= `wall_nanos + logical`、
+    /// P-HLC-3d でシフト・マスク撤去済み、フル精度 Unix ナノ秒スケール、String)。
     pub ordinal: String,
     /// 設定中のクロックスキュー上限(ミリ秒、0 = 無効)。
     pub max_offset_ms: i64,

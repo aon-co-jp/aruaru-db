@@ -694,8 +694,16 @@ impl AdminQuery {
             None => aruaru_dist::DEFAULT_MAX_STALENESS_NANOS,
         };
         let mode = mode.unwrap_or_else(|| "bounded".to_string());
+        // 【2026-09-03 P-HLC-3c】mode="uncertainty-safe" は closed_ts が
+        // read_ts の uncertainty interval 上端(read_ts + max_offset)まで
+        // 閉じ済みであることを要求する。max_offset は共有 HLC から取る
+        // (未設定/0 なら plan_exact_staleness_read と同じ挙動)。
         let plan = match mode.as_str() {
             "exact" => coord.plan_exact_staleness_read(&ids, now, staleness),
+            "uncertainty-safe" | "uncertainty_safe" => {
+                let max_offset = a.hlc.as_ref().map(|h| h.max_offset_nanos()).unwrap_or(0);
+                coord.plan_uncertainty_safe_read(&ids, now, staleness, max_offset)
+            }
             _ => coord.negotiate_bounded_staleness(&ids, now, staleness),
         };
         let (plan_kind, reason, read_ts, stale) = match &plan {
@@ -923,7 +931,8 @@ impl AdminQuery {
     /// 現在値を観測する。`SystemTime::now()` を読んで HLC を1ステップ進めた
     /// 値を返す(`closedTsAdvance` 等が `nowNanos` 省略時に使うのと同じ経路)。
     /// `wallNanos`(フル精度ナノ秒)/ `logical` / `synthetic` に加え、
-    /// 既存 API 互換の `ordinal`(案B 65µs 射影)も返す。
+    /// `closed_ts` 等が受け取る u64 `ordinal`(= `wallNanos + logical`、
+    /// P-HLC-3d でシフト・マスク撤去済み、フル精度)も返す。
     async fn hlc_now(&self, ctx: &Context<'_>) -> Result<HlcNowGql> {
         let a = admin(ctx)?;
         let hlc = a
@@ -2407,6 +2416,39 @@ mod cluster_propose_tests {
         assert!(p["planFollowerRead"]["reason"].as_str().unwrap().len() > 0);
     }
 
+    /// 【2026-09-03 P-HLC-3c】mode="uncertainty-safe" は closed_ts が
+    /// read_ts + max_offset(HLC 由来)まで閉じ済みであることを要求する。
+    #[tokio::test]
+    async fn plan_follower_read_uncertainty_safe_mode_requires_covering_the_uncertainty_interval() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+        let engine = Arc::new(QueryEngine::new());
+        let ctx = admin_ctx(engine.clone(), None);
+        ctx.hlc.as_ref().unwrap().set_max_offset_nanos(500_000_000); // 500ms
+        let schema = build_schema(engine.clone(), ctx);
+
+        // Range 1 を登録し advance(now=20s → closed = 20s - 3s target_lag = 17s)。
+        schema.execute(authorized_request("mutation { closedTsRegisterRange(rangeId: 1) { rangeId } }")).await;
+        schema.execute(authorized_request(r#"mutation { closedTsAdvance(nowNanos: "20000000000") { rangeId } }"#)).await;
+
+        // staleness=1s → read_ts=19s、uncertainty 上端 19.5s > closed 17s → leaseholder。
+        let r = schema.execute(authorized_request(
+            r#"query { planFollowerRead(rangeIds: [1], mode: "uncertainty-safe", nowNanos: "20000000000", stalenessNanos: "1000000000") { plan reason } }"#,
+        )).await;
+        assert!(r.errors.is_empty(), "errors: {:?}", r.errors);
+        let p = r.data.into_json().unwrap();
+        assert_eq!(p["planFollowerRead"]["plan"], "route_to_leaseholder");
+        assert!(p["planFollowerRead"]["reason"].as_str().unwrap().contains("uncertainty"));
+
+        // staleness=4s → read_ts=16s、上端 16.5s <= closed 17s → follower read。
+        let r = schema.execute(authorized_request(
+            r#"query { planFollowerRead(rangeIds: [1], mode: "uncertainty-safe", nowNanos: "20000000000", stalenessNanos: "4000000000") { plan readTimestamp } }"#,
+        )).await;
+        let p = r.data.into_json().unwrap();
+        assert_eq!(p["planFollowerRead"]["plan"], "follower_read");
+        assert_eq!(p["planFollowerRead"]["readTimestamp"], "16000000000");
+    }
+
     /// 【2026-09-02 続き23】`htapReplicas` query が同居 `ColumnarApplier` の
     /// 同期状態(TiFlash PROGRESS/AVAILABLE 相当)+ 枝刈り込みプレビューを
     /// 返すこと。行ストア(共有 `QueryEngine`)へ書き込み → `observe_table` で
@@ -2482,8 +2524,9 @@ mod cluster_propose_tests {
         assert!(all.iter().all(|r| r["available"] == true));
     }
 
-    /// 【2026-09-03 P-HLC-3b】`hlcNow` が案A(フル精度 2 フィールド)の
-    /// 現在値 + 案B 射影 ordinal を返す。連続呼び出しで ordinal が厳密増加。
+    /// 【2026-09-03 P-HLC-3b / 3d】`hlcNow` が案A(フル精度 2 フィールド)の
+    /// 現在値 + シフト・マスク無しの `ordinal`(= wall_nanos + logical)を返す。
+    /// 連続呼び出しで ordinal が厳密増加。
     #[tokio::test]
     async fn hlc_now_query_reports_full_precision_and_ordinal() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -2501,6 +2544,9 @@ mod cluster_propose_tests {
         let o1: u64 = d1["hlcNow"]["ordinal"].as_str().unwrap().parse().unwrap();
         let uu1: u64 = d1["hlcNow"]["uncertaintyUpperNanos"].as_str().unwrap().parse().unwrap();
         assert!(w1 > 1_700_000_000_000_000_000, "wall_nanos is real Unix nanos, not a truncated ordinal");
+        // P-HLC-3d: ordinal は wall_nanos に logical(通常 0〜数個)を足しただけ。
+        // 案B の `& !0xFFFF` 切り捨てが無いので両者はほぼ一致する。
+        assert!(o1 >= w1 && o1 - w1 < 4096, "ordinal == wall_nanos + logical, no 65us truncation: o1={o1} w1={w1}");
         assert_eq!(d1["hlcNow"]["maxOffsetMs"], 500);
         assert_eq!(uu1, w1 + 500_000_000, "uncertainty upper = wall + max_offset");
 

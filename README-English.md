@@ -105,6 +105,18 @@
 > `Query.hlcNow` / `now_hlc` / `uncertainty_upper`. Verified end-to-end
 > over real HTTP. See `CLAUDE.md` HANDOFF entries (continued 20–26).
 >
+> **cont. 27**: **P-HLC-3c / 3d**. 3c rebases the `closed_ts` follower-read
+> staleness check onto CockroachDB's uncertainty interval (the whole
+> `[read_ts, read_ts + max_offset]` must be closed); GraphQL
+> `planFollowerRead(mode: "uncertainty-safe")`. 3d **removes the last
+> shift/pack/truncation from the external u64 ordinal**: `as_ordinal()` is
+> now `wall_nanos + logical` (the `& !0xFFFF` bucket and the bucket branch
+> in `advance_locked` are gone — bit-for-bit CockroachDB `hlc.go`
+> `Now()`), so the u64 that `closedTsAdvance`/`closed_ts` carry is now
+> full-precision Unix-nanosecond scale and the case-B 65µs granularity
+> cost is gone. Real HTTP E2E confirms `hlcNow` returns `wallNanos ==
+> ordinal` exactly.
+>
 > Note: `open-cuda`/`open-directx` remain out of scope for this SET
 > policy for now (no HTTP surface), but this is a provisional call, not
 > permanent — revisit if `open-directx`'s DirectX work matures and

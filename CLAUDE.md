@@ -179,9 +179,13 @@
 > 完了済み(続き11〜13)。**要求③の実装トラック**: A.6-2 `ColumnarApplier`
 > 本体(続き15)・実プロセス配線(続き16)・**A.6-4 段階2 = base+delta の
 > Merge-on-Read + deletion vector 書き込み側配線(続き20)まで完了**。
-> **次は A.6-1 HLC の配線・`aruaru.yaml: htap` セクション**(下記
-> 「🛑 復活用メッセージ」項目4 参照)。`git log --oneline -25` で
-> `再設計 P1〜P3`・`付録A`・`A.6-x` のコミット群を確認。
+> **A.6-1 HLC・`aruaru.yaml: htap`・`Query.htapReplicas`(All)・
+> `disaster_backup.email` reconcile・別プロセス learner E2E は続き21〜25 で完了。
+> HLC 案A 全面移行(P-HLC-3a/b/c/d)は続き26〜27 で完了(内部フル精度 2
+> フィールド + 外向き u64 射影もシフト・パック・切り捨て一切無し、
+> `docs/HLC_TIMESTAMP_REDESIGN.md` §6)。次は Tauri 設定タブの `aruaru.yaml`
+> 編集 UI 化 / P4〜P6。**`git log --oneline -30` で
+> `再設計 P1〜P3`・`付録A`・`A.6-x`・`HLC P-HLC-3` のコミット群を確認。
 >
 > **ユーザーの不変の要求(肝に銘じること)**:
 > 1. **REST API は SET(RPoem + aruaru-db)全体から例外なく完全撤廃**。
@@ -6171,3 +6175,109 @@ clippy clean. Case-A migration is complete (internals fully case-A, the
 external u64 is a backward-compatible projection). Remaining: rebase the
 `closed_ts` follower-read staleness check onto `uncertainty_upper`
 (P-HLC-3c, a separate closed_ts track).
+
+## HANDOFF追記(2026-09-03続き27) P-HLC-3c(follower read staleness を uncertainty interval へ)+ P-HLC-3d(HLC 射影からシフト・パック・切り捨てを完全撤去)
+
+**位置づけ**: 続き26 が「残り」筆頭に挙げていた P-HLC-3c を実施。加えて
+ユーザー指摘「シフト・パックが無い?」——続き26 まででも `HlcTimestamp::
+as_ordinal()` に案B の `& !0xFFFF` バケット射影が残り、`advance_locked` も
+バケット分岐していた(内部状態機械にシフト・パックの残滓)——を受け
+**P-HLC-3d** としてこれを完全撤去した。正本 `docs/HLC_TIMESTAMP_REDESIGN.md`
+§6.5 に P-HLC-3c(2026-09-03 実施)・P-HLC-3d(同)を追記。
+
+### P-HLC-3c: `closed_ts` の follower read を uncertainty interval へ
+- **`crates/aruaru-dist/src/closed_ts.rs`**:
+  - `ClosedTimestampTracker::can_serve_uncertainty_safe_read_at(read_ts,
+    max_offset_nanos)` = `read_ts != 0 && read_ts + max_offset <=
+    closed_ts`。uncertainty interval `[read_ts, read_ts + max_offset]` の
+    **全域**が閉じ済みであることを要求 ——満たせば uncertainty restart が
+    構造的に発生し得ない(CockroachDB `follower_read_timestamp()` が
+    `target_lag >= max_offset` を選ぶのと同じ保証を明示判定に)。
+    `max_offset == 0` は `can_serve_read_at` と同値。
+  - `ClosedTimestampCoordinator::plan_uncertainty_safe_read(range_ids,
+    now, staleness, max_offset)` ——`read_ts = now - staleness` を先に
+    固定し全 Range が上記述語を満たすときだけ `FollowerRead`。
+    `max_offset == 0` は `plan_exact_staleness_read` へ**委譲**(後方互換、
+    `RouteToLeaseholder` の reason 文字列まで一致)。
+- **`crates/aruaru-graphql/src/admin_resolvers.rs`**: `planFollowerRead`
+  に `mode: "uncertainty-safe"`(別名 `uncertainty_safe`)を追加。
+  `max_offset` は共有 `AdminCtx.hlc` の `max_offset_nanos()` から取得。
+
+### P-HLC-3d: 射影からシフト・パック・切り捨てを撤去
+- **`as_ordinal()` = `wall_nanos.saturating_add(logical as u64)`**。
+  左シフトもマスクもバケットも無い。`logical`(物理停止中の同一ナノ秒内
+  追加イベント数、通常 0〜数個、`max_offset` で有界)をナノ秒空間へ
+  そのまま加算するだけ → `closed_ts` 等が受け取る u64 は**フル精度の
+  Unix ナノ秒スケール**(§3「案B の代償」= 65µs 粒度は消滅)。
+- **`advance_locked` はバケット概念を撤廃**: `wall_now > st.wall_nanos`
+  なら `(wall_now, 0)`、そうでなければ `logical += 1` + `synthetic`
+  ——CockroachDB `hlc.go` `Now()` とビット単位で同じ。
+- **`from_ordinal(o)` = `{ wall_nanos: o, logical: 0, synthetic: true }`**
+  (物理成分をそのまま復元。u64 経路で畳み込まれた `logical` 端数は失うが、
+  フル精度が要る所は `observe_hlc` = 構造体をそのまま渡す新 API)。
+- u64 の**厳密単調**は従来どおり `Hlc.last_ordinal` クランプで保証。
+- `ORDINAL_LOGICAL_BITS` / `ORDINAL_BUCKET_MASK` / `ordinal_bucket()` 削除。
+- `now_ordinal` / `observe_ordinal` / `try_observe_ordinal` / `closed_ts` /
+  `wal_service` / GraphQL `closedTsAdvance` のシグネチャ・配線は**無変更**
+  (u64 の意味が「65µs 射影」→「フル精度ナノ秒 + logical 畳み込み」へ
+  厳密化されただけ。persisted ordinal は無く互換性問題なし)。
+
+### 検証
+- `cargo test -p aruaru-dist hlc::` **21 passed**(P-HLC-3d に合わせて
+  `as_ordinal_*` / `now_*` 系テストを「ordinal == wall_nanos + logical、
+  シフト・マスク無し」へ書き換え)。`closed_ts::` **9 passed**(新規
+  `uncertainty_safe_read_requires_closed_ts_to_cover_the_uncertainty_interval`)。
+- `cargo test -p aruaru-dist -p aruaru-graphql -p aruaru-server`:
+  **dist 108 / graphql 22 / server 13 passed**、`cargo build --workspace`
+  成功(既存 `build_cluster`/`propose_commit` 警告のみ)。clippy は
+  hlc.rs / closed_ts.rs に新規指摘なし(既存の identity_op 等のみ)。
+- **実 HTTP E2E(release、`follower_read.max_offset_ms: 500`)**:
+  起動ログ `aruaru.yaml: follower_read.max_offset_ms を HLC へ反映しました
+  max_offset_ms=500`。
+  - `hlcNow` → `wallNanos == ordinal`(**完全一致**、`1788412243861359300`
+    の 17 桁。案B なら下位 16bit がマスクされ両者は乖離していた)、
+    `uncertaintyUpperNanos == wallNanos + 500_000_000`、`maxOffsetMs=500`。
+    2 連続で `ordinal` 厳密増加。
+  - `closedTsRegisterRange(1)` → `closedTsAdvance(nowNanos:"20000000000")`
+    → `closedTimestamp="17000000000"`(20s − 3s target_lag)。
+  - `planFollowerRead(rangeIds:[1], mode:"uncertainty-safe",
+    nowNanos:"20000000000", stalenessNanos:"1000000000")` → read_ts=19s、
+    uncertainty 上端 19.5s > closed 17s → `plan="route_to_leaseholder"`
+    (reason: "closed timestamp does not yet cover the read's uncertainty
+    interval")。
+  - `stalenessNanos:"4000000000"` → read_ts=16s、上端 16.5s <= 17s →
+    `plan="follower_read"`、`readTimestamp="16000000000"`。
+  - ログにエラー・パニック無し(無関係な DB-Engines クロール WARN のみ)。
+
+### 残り
+1. 復活用メッセージ項目5(Tauri 設定タブの `aruaru.yaml` 編集 UI 化)・
+   項目6・項目7(P4〜P6)。
+2. HLC `max_offset` スキュー上限を permissive `update` 全経路へ広げる検討
+   (現状は `try_update`/`try_observe_ordinal` のみ厳格、`update` は
+   リモート無視でローカル進行のみ)。
+
+**English summary**: **P-HLC-3c** — `ClosedTimestampTracker::
+can_serve_uncertainty_safe_read_at(read_ts, max_offset)` requires the
+**entire** uncertainty interval `[read_ts, read_ts + max_offset]` to be
+closed; `ClosedTimestampCoordinator::plan_uncertainty_safe_read` gates
+every range on it (`max_offset == 0` delegates to
+`plan_exact_staleness_read`, byte-for-byte backward compatible). GraphQL
+`planFollowerRead(mode: "uncertainty-safe")` reads `max_offset` from the
+shared HLC. **P-HLC-3d** — removed the last shift/pack from the ordinal
+projection (the user asked "no shift/pack?"): `as_ordinal()` is now
+`wall_nanos + logical` (no `<<`, no `& !0xFFFF`, no bucket concept in
+`advance_locked` — bit-for-bit CockroachDB `hlc.go` `Now()`), so the
+`u64` that `closed_ts`/`wal_service`/`closedTsAdvance` carry is now
+**full-precision Unix-nanosecond scale** — the case-B 65µs granularity
+cost is gone. `from_ordinal` = `{ wall_nanos: o, logical: 0, synthetic:
+true }`; strict monotonicity still comes from the `Hlc.last_ordinal`
+clamp; the `ORDINAL_*` constants and `ordinal_bucket()` are deleted; no
+signature or wiring changes anywhere else (no persisted ordinal, so no
+compat break). Tests: hlc 21 / closed_ts 9 / full sweep dist 108 /
+graphql 22 / server 13, `cargo build --workspace` OK, clippy no new
+findings. Real HTTP E2E (release, `max_offset_ms: 500`): `hlcNow` returns
+`wallNanos == ordinal` exactly (17-digit `1788412243861359300` — case-B
+would have masked the low 16 bits), `uncertaintyUpperNanos == wallNanos +
+500ms`; after `closedTsAdvance(now=20s)` (closed=17s),
+`stalenessNanos=1s` → `route_to_leaseholder` (uncertainty not covered),
+`stalenessNanos=4s` → `follower_read` `readTimestamp=16000000000`.
