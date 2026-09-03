@@ -6360,3 +6360,68 @@ the admin GUI installer output to `aruaru-db-admin-win-installer.exe`
 (fixed name, ecosystem rule); the main `aruaru-db-installer.exe` already
 follows the rule; open-cuda/open-directx/dream-os ship no Windows
 installer (libraries). No `cargo` changes.
+
+## HANDOFF追記(2026-09-03続き29) 公式 Rust コネクタ `aruaru-db-connector` を新設(コードあり・テスト green)+ RPoem/Poem での使い方
+
+ユーザー質問「実体のあるコネクタ層(Git-on-SQL の commit()/as_of() を
+慣用 API で薄くラップ)は作れるか」「RPoem で動かすデバイスドライバは
+Rust 用か Poem 用か」への対応。
+
+### 新規クレート `clients/rust-aruaru-db/`(独立、メインワークスペース外)
+`aruaru-db-connector` v0.1.0。**独自ドライバではない**——業界標準の
+`tokio-postgres` をそのまま使い、その上に薄い API を足すだけ:
+- `AruaruDb::connect(dsn)`(接続タスクを `tokio::spawn`)/ `from_client` /
+  `client()`(透過)/ `execute` / `query`(薄い透過)。
+- `commit(message) -> String` = `SELECT aruaru_commit($1)`。
+- `query_as_of(base_select, commit_id, params)` = `base_select` 末尾へ
+  ` AS OF COMMIT '<id>'` を**安全に**付与。`is_safe_commit_id`(英数字 +
+  `-` `_`、≤128 文字)で検証し、非安全なら `Error::InvalidCommitId`
+  (SQL インジェクション防止、ネットワークに触れる前に弾く)。
+  `query_as_of_opt` は 0/1 行版。
+- 依存は `tokio-postgres` + `tokio` のみ(オフラインビルド可)。
+- テスト: `safe_commit_id_accepts_hashes_and_uuids_rejects_sql` /
+  `query_as_of_rejects_unsafe_commit_id_before_touching_the_network` +
+  doctest。**`cargo test` = 2 passed / 1 ignored + doctest 1 passed**
+  (ネットワーク不要ぶんはこのセッションで green)。実サーバ往復
+  `live_commit_and_as_of_round_trip` は `ARUARU_DB_TEST_DSN` 指定時のみ
+  走る `#[ignore]`(この環境に稼働 server 無しで未実施)。
+
+### RPoem / Poem での「デバイスドライバ」
+**「Poem 用ドライバ」は存在しないし要らない。** RPoem
+(`open-runo-poem-compat`)は Web フレームワークで DB クライアントを指定
+しない。RPoem アプリ → aruaru-db は **Rust の非同期 PostgreSQL
+クライアント**で繋ぐ。選択肢(`docs/CLIENTS.md` §3.8b に表):
+- `aruaru-db-connector`(上記、Git-on-SQL を慣用 API で)
+- `tokio-postgres` 生 / `sqlx`(`postgres`,`runtime-tokio`、`PgPool`)
+- `open-runo-db::aruaru::AruaruDbBackend`(RPoem 同梱、put/get/delete/list
+  の**汎用 KV のみ**。`aruaru_commit`/`AS OF COMMIT` 未対応)
+RPoem は `Data<T>` 抽出子が無いので `Arc<AruaruDb>` をハンドラ登録
+クロージャで `Arc::clone` キャプチャ(2026-07-31 の aruaru-llm RPoem
+移行と同じ)。**互換性**: pgwire は拡張プロトコル込みで PostgreSQL 互換
+(`describe_portal` 2026-07-14 修正済み)なので `tokio-postgres`/`sqlx`
+はそのまま動く——**新規開発は不要**、`aruaru-db-connector` は「あると
+便利」層。
+
+### 次
+`aruaru-db-connector` の実サーバ往復検証(稼働 server を立てて
+`--ignored` を実行)、TLS 版(`tokio-postgres-rustls`)、他言語の
+同種の薄いラッパー(Python `aruaru_db` / Node `@aruaru/db` 等)を作るか
+の判断。
+
+**English**: Added `clients/rust-aruaru-db/` — `aruaru-db-connector`
+v0.1.0, a **thin wrapper** (not a custom driver) over standard
+`tokio-postgres` adding `commit(message) -> String`
+(`SELECT aruaru_commit($1)`) and `query_as_of(base_select, commit_id,
+params)` which safely appends ` AS OF COMMIT '<id>'` after validating the
+id with `is_safe_commit_id` (alnum + `-`/`_`, ≤128) — rejecting unsafe
+ids before any network call. Deps: `tokio-postgres` + `tokio` only.
+`cargo test`: 2 passed / 1 ignored + 1 doctest (network-free parts green
+this session; the live round-trip is `#[ignore]`, needs
+`ARUARU_DB_TEST_DSN`). For **RPoem/Poem** there is no "Poem driver" and
+none is needed: RPoem is a web framework; use a Rust async PG client —
+`aruaru-db-connector`, raw `tokio-postgres`, `sqlx` (`PgPool`), or
+RPoem's bundled `open-runo-db::aruaru::AruaruDbBackend` (plain KV only,
+no Git-on-SQL). Share `Arc<AruaruDb>` via closure capture (RPoem has no
+`Data<T>` extractor). pgwire is PostgreSQL-compatible incl. the extended
+protocol, so `tokio-postgres`/`sqlx` work as-is — no new development
+required.
