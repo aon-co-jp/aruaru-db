@@ -51,6 +51,10 @@ commit_id は全実装で「英数字 + `-` `_`、≤128 文字」を検証し�
 | `aruaru-db` (PyPI) | Python | `asyncpg`(async)/ `psycopg` v3(sync) | 両方(`AruaruDb` / `AruaruDbSync`) | `clients/python-aruaru-db/` | ✅ green(4) |
 | `@aruaru/db` (npm) | Node/TS | `pg`(node-postgres) | 非同期 | `clients/node-aruaru-db/` | ✅ green(4) |
 | `aruaru/db` (Composer) | PHP | `PDO`(pdo_pgsql) | 同期 | `clients/php-aruaru-db/` | 未検証(この環境に PHP なし) |
+| `aruaru-db-connector` (Go module) | Go | `jackc/pgx/v5` | 非同期(goroutine) | `clients/go-aruaru-db/` | 未検証(この環境に Go ツールチェーン無し) |
+| `aruaru-db-connector` (Maven) | Java | 標準 JDBC ドライバ | 同期 | `clients/java-aruaru-db/` | 未検証(この環境に Maven/JDK 無し) |
+| `Aruaru.Db` (NuGet) | .NET | Npgsql | 両方(`Connect`/`ConnectAsync`) | `clients/dotnet-aruaru-db/` | ✅ **`dotnet build`/`dotnet test` 実施済み・10/10 green(2026-09-03)** |
+| `aruaru-db` (gem) | Ruby | `pg`(libpq) | 同期 | `clients/ruby-aruaru-db/` | 未検証(この環境に Ruby 無し) |
 
 素の接続レシピ(パッケージを使わず標準ドライバだけ)は §3。COBOL は
 埋め込み SQL(`EXEC SQL`)で `clients/cobol/`。
@@ -89,13 +93,13 @@ commit_id は全実装で「英数字 + `-` `_`、≤128 文字」を検証し�
 
 | 言語 | 同期ドライバ | 非同期ドライバ | フレームワーク例 | サンプル |
 |---|---|---|---|---|
-| **Java** | JDBC (`org.postgresql:postgresql`) | R2DBC (`io.r2dbc:r2dbc-postgresql`) | Spring Boot / Quarkus / 素の JDBC | `clients/java-jdbc/` |
+| **Java** | JDBC (`org.postgresql:postgresql`) | R2DBC (`io.r2dbc:r2dbc-postgresql`) | Spring Boot / Quarkus / 素の JDBC | `clients/java-aruaru-db/` |
 | **Rust** | `postgres` (crate) | `tokio-postgres` / `sqlx` | Axum / Poem / RPoem | `clients/rust-axum/` |
 | **Python** | `psycopg` (v3, `psycopg[binary]`) | `asyncpg` / `psycopg` async | FastAPI / Django / Flask+SQLAlchemy | `clients/python-fastapi/` |
 | **PHP** | `PDO_pgsql` / `pgsql` 拡張 | (Swoole/AMPHP 経由) | Laravel (`pgsql` ドライバ) / Symfony | `clients/php-laravel/` |
-| **Go** | `database/sql` + `pgx` stdlib | `pgx` / `pgxpool` | net/http / Gin / Echo | `clients/go-pgx/` |
-| **Node / TS** | (なし。JS は基本非同期) | `pg` / `postgres.js` | Express / Fastify / NestJS | `clients/node-pg/` |
-| **.NET (C#)** | `Npgsql`(同期 API) | `Npgsql`(async API)/ EF Core | ASP.NET Core / Minimal API | `clients/dotnet-npgsql/` |
+| **Go** | `database/sql` + `pgx` stdlib | `pgx` / `pgxpool` | net/http / Gin / Echo | `clients/go-aruaru-db/` |
+| **Node / TS** | (なし。JS は基本非同期) | `pg` / `postgres.js` | Express / Fastify / NestJS | `clients/node-aruaru-db/` |
+| **.NET (C#)** | `Npgsql`(同期 API) | `Npgsql`(async API)/ EF Core | ASP.NET Core / Minimal API | `clients/dotnet-aruaru-db/` |
 | **Ruby** | `pg` gem | (async gem 経由) | Rails (`adapter: postgresql`) | — (下記レシピ参照) |
 | **COBOL** | 埋め込み SQL(`EXEC SQL`)経由の同期 | — | Micro Focus / GnuCOBOL(OCESQL / ODBC / libpq) | `clients/cobol/` |
 
@@ -447,13 +451,13 @@ installer. Any misspelling like
 
 | Language | Sync driver | Async driver | Frameworks | Example |
 |---|---|---|---|---|
-| Java | JDBC (`org.postgresql:postgresql`) | R2DBC (`io.r2dbc:r2dbc-postgresql`) | Spring Boot / Quarkus / plain JDBC | `clients/java-jdbc/` |
+| Java | JDBC (`org.postgresql:postgresql`) | R2DBC (`io.r2dbc:r2dbc-postgresql`) | Spring Boot / Quarkus / plain JDBC | `clients/java-aruaru-db/` |
 | Rust | `postgres` | `tokio-postgres` / `sqlx` | Axum / Poem / RPoem | `clients/rust-axum/` |
 | Python | `psycopg` v3 | `asyncpg` / `psycopg` async | FastAPI / Django / Flask+SQLAlchemy | `clients/python-fastapi/` |
 | PHP | `PDO_pgsql` | (via Swoole/AMPHP) | Laravel (`pgsql`) / Symfony | `clients/php-laravel/` |
-| Go | `database/sql` + `pgx` | `pgx` / `pgxpool` | net/http / Gin / Echo | `clients/go-pgx/` |
-| Node/TS | — (JS is async) | `pg` / `postgres.js` | Express / Fastify / NestJS | `clients/node-pg/` |
-| .NET | `Npgsql` (sync API) | `Npgsql` (async) / EF Core | ASP.NET Core | `clients/dotnet-npgsql/` |
+| Go | `database/sql` + `pgx` | `pgx` / `pgxpool` | net/http / Gin / Echo | `clients/go-aruaru-db/` |
+| Node/TS | — (JS is async) | `pg` / `postgres.js` | Express / Fastify / NestJS | `clients/node-aruaru-db/` |
+| .NET | `Npgsql` (sync API) | `Npgsql` (async) / EF Core | ASP.NET Core | `clients/dotnet-aruaru-db/` |
 | Ruby | `pg` gem | (via async gem) | Rails | recipe in §3.8 |
 
 GraphQL from any language is just `POST /graphql` over HTTP — no special

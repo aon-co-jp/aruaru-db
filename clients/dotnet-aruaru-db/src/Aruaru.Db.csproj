@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackageId>Aruaru.Db</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>aon-co-jp</Authors>
+    <Description>aruaru-db official .NET connector: a thin wrapper over Npgsql adding Git-on-SQL helpers (Commit/QueryAsOfAsync). Not a custom driver -- see docs/CLIENTS.md.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The one and only runtime dependency: the standard, audited
+         PostgreSQL .NET driver. aruaru-db ships no custom driver. -->
+    <PackageReference Include="Npgsql" Version="8.0.3" />
+  </ItemGroup>
+
+</Project>
