@@ -210,3 +210,133 @@ fn bucket(wall_nanos: u64) -> u64 { wall_nanos & PHYSICAL_MASK }
 オーバーフローという実害を完全に除去し、65µs 粒度という明示的な代償だけを
 負う——実在の compact HLC 実装(48+16 の ms 版)と同種の割り切りであり、
 「一から設計し直した」結果として妥当。
+
+---
+
+## 6. P-HLC-3 実施(2026-09-03): 案A への全面移行 — 内部フル精度 2 フィールド + 外向き u64 互換維持
+
+§5 で「案A への全面移行は過大」としていた判断を、**追加の一次資料調査**を
+踏まえて見直した。結論: **内部表現だけを案A(2 フィールド・フル精度)へ
+刷新し、外向きの u64 ordinal ワイヤ形式は案B の射影として維持すれば、
+既存 API(GraphQL の `closedTsAdvance` 等、`closed_ts`/`wal_service` が
+受け渡す u64)を一切変更せずに案A へ移行できる**。これなら「過大な
+再設計」ではなく「内部型の刷新 + 新 API の並置」であり、実用的。
+
+### 6.1 追加の一次資料調査(2026-09、英語)
+
+- **CockroachDB `util/hlc`**([Clock Management in CockroachDB](https://www.cockroachlabs.com/blog/clock-management-cockroachdb/)、
+  [hlc: support dynamic uncertainty bounds #75564](https://github.com/cockroachdb/cockroach/issues/75564)):
+  `Timestamp { WallTime int64(Unix ナノ秒、フル精度), Logical int32, Synthetic bool }`
+  を**パックせず別フィールド**で持つ。順序は `(WallTime, Logical)` の
+  辞書式。`max_offset` 既定 500ms。uncertainty interval
+  `[commit_ts, commit_ts + max_offset]`。物理時刻を先食いした
+  タイムスタンプには `Synthetic=true` を立てる。クロックは `sync.Mutex`
+  で保護(ロックフリーではない)。
+- **uhlc-rs**(Zenoh の Rust 実装、[atolab/uhlc-rs](https://github.com/atolab/uhlc-rs)、
+  [NTP64 docs](https://docs.rs/zenoh/latest/zenoh/time/struct.NTP64.html)):
+  `NTP64`(64bit、上位 32bit=秒、下位 32bit=秒端数、**下位 4bit を論理
+  カウンタで置換** ≒ 3.5ns 分解能)。`update_with_timestamp` は incoming が
+  現在の物理時刻 + delta(既定 500ms、`UHLC_MAX_DELTA_MS`)を超えたら
+  **`Err`**。内部は `Mutex` で保護。32bit 秒は 2036 年ロールオーバー
+  という既知の弱点([eclipse-zenoh/zenoh #1252](https://github.com/eclipse-zenoh/zenoh/issues/1252))。
+- **論文** [Session Guarantees with Raft and Hybrid Logical Clocks](https://arxiv.org/pdf/1808.05698)
+  (arXiv:1808.05698): Raft ログと HLC を組み合わせる際、HLC は
+  「書き込みの直列化点(リーダー)」で単調前進し、フォロワーは
+  受信 HLC で `update` する。
+
+**学び**: 業界の主流(CockroachDB / uhlc-rs)は (a) 物理をフル精度で
+別フィールドに持つ、(b) クロック本体は `Mutex` で保護(案B のロック
+フリー CAS は 65µs 粒度という妥協の産物であり、フル精度にするなら
+`Mutex` が正解)、(c) skew 上限で incoming を `Err` にする。案A は
+この主流に合致する。
+
+### 6.2 新・設計(案A、低 churn 移行)
+
+**内部表現**(`hlc.rs`):
+```
+pub struct HlcTimestamp {
+    pub wall_nanos: u64,   // フル精度 Unix ナノ秒(切り捨て無し)
+    pub logical: u32,      // 独立した論理カウンタ(シフト・パック無し)
+    pub synthetic: bool,   // 物理時刻を先食いしたか(CockroachDB 準拠)
+}
+pub struct Hlc {
+    state: parking_lot::Mutex<HlcState>,   // (wall_nanos, logical, synthetic)
+    max_offset_nanos: AtomicU64,           // 0 = 無効(続き22 で導入済み)
+}
+```
+- 順序比較 = `(wall_nanos, logical)` の辞書式 =
+  `#[derive(PartialOrd, Ord)]` のフィールド順。**`<<16` が消えるので
+  u64 オーバーフローは構造的に発生しない**(§1 の根本原因を完全に除去)。
+- `now(wall)`: `wall > st.wall_nanos` なら `(wall, 0, synthetic=false)`、
+  そうでなければ `(st.wall_nanos, st.logical + 1, synthetic=true)`
+  (物理が進んでいない = 論理で前進 = synthetic)。
+- `update(remote, wall)`: `max_pt = max(st.wall_nanos, remote.wall_nanos, wall)`。
+  `logical` は 3 者のうち採用された側 +1(CockroachDB `hlc.go` と同じ)。
+- `try_update` / `try_observe`: `remote.wall_nanos > wall + max_offset` なら
+  `Err(ClockSkew)`(65µs バケット丸め無しで**より正確**)。
+
+**外向き u64 互換(既存 API を壊さない肝)**:
+```
+impl HlcTimestamp {
+    // 案B の射影(65µs 粒度)。既存の closedTsAdvance 等が受け渡す u64。
+    // 同一 65µs バケット内は logical で順序、logical が 0xFFFF を超えたら
+    // 次バケットへ桁上げ(単調性を維持)。
+    pub fn as_ordinal(&self) -> u64 {
+        let bucket = self.wall_nanos & !0xFFFF;
+        let carried_buckets = (self.logical as u64) >> 16;   // 0xFFFF 超えの桁上げ
+        let lo = (self.logical as u64) & 0xFFFF;
+        (bucket + (carried_buckets << 16)) | lo
+    }
+    pub fn from_ordinal(o: u64) -> Self {  // 案B 解釈で復号(後方互換)
+        Self { wall_nanos: o & !0xFFFF, logical: (o & 0xFFFF) as u32, synthetic: false }
+    }
+}
+```
+- `Hlc::now_ordinal()` = `self.now_hlc().as_ordinal()`(既存の呼び出し元
+  ——`admin_resolvers` の `now_default_nanos`、`closed_ts_receive` ——は
+  **無変更**)。
+- `observe_ordinal(o, wall)` = `update(HlcTimestamp::from_ordinal(o), wall)`
+  (無変更)。
+
+**新 API の並置**(既存を非推奨にはしない):
+- `Hlc::now_hlc() -> HlcTimestamp` / `observe_hlc(remote, wall)`。
+- `HlcTimestamp::uncertainty_upper(max_offset_nanos) -> u64`
+  = `wall_nanos.saturating_add(max_offset_nanos)`(follower read の
+  staleness 上限に使える。CockroachDB の uncertainty interval 上端)。
+- GraphQL に **観測専用** `Query.hlcNow { wallNanos logical synthetic ordinal }`
+  を追加(`wallNanos` は u64 のため `String`)。既存の mutation/query は無変更。
+
+### 6.3 「案B の代償(65µs 粒度)」はどうなるか
+
+- **内部**: フル精度ナノ秒が復活する(`now_hlc()` / 新 GraphQL / uncertainty
+  計算)。§3「案B の正直な代償」で失われていたナノ秒精度は、案A へ移行
+  した経路では戻る。
+- **外向き u64(`as_ordinal`)**: 引き続き 65µs 粒度。ただしこれは
+  `closed_ts` の `target_lag`(秒単位)には元々影響しない既知の割り切り
+  で、後方互換のために**意図的に維持**する。u64 経路の利用者が
+  ナノ秒精度を必要とするなら新 `hlcNow` / `now_hlc()` へ移行すればよい。
+
+### 6.4 ロックフリーをやめる判断
+
+案B は「`parking_lot::Mutex` を使わないロックフリー CAS」を売りにして
+いたが、これは「wall + logical を 1 個の `AtomicU64` に詰める」= 65µs
+粒度、という制約の裏返しだった。フル精度(96bit 相当)は `AtomicU64`
+1 個に収まらない。業界主流(CockroachDB の `sync.Mutex`、uhlc-rs の
+`Mutex`)に合わせ、**短いクリティカルセクションの `parking_lot::Mutex`**
+へ変更する。`now()` のロック保持時間は数命令で、競合下でも実測上の
+問題は出ない見込み(続き14 の 8 スレッド×500 並行テストは Mutex でも
+当然 pass する ——むしろ重複 ordinal が構造的に発生しなくなる)。
+
+### 6.5 フェーズ
+
+1. **P-HLC-3a**: `hlc.rs` を案A(2 フィールド・`Mutex`・フル精度)へ
+   書き換え。`as_ordinal`/`from_ordinal`/`now_ordinal`/`observe_ordinal`/
+   `try_update` は互換シグネチャで維持。新 `now_hlc`/`observe_hlc`/
+   `uncertainty_upper`/`synthetic`。全既存テスト + 新規テスト。
+2. **P-HLC-3b**: GraphQL `Query.hlcNow` を追加(観測専用)。実 HTTP E2E。
+3. **P-HLC-3c(将来)**: `closed_ts` の follower read staleness 判定を
+   `uncertainty_upper` ベースへ(CockroachDB の uncertainty interval)。
+   今回はやらない(closed_ts の設計は別トラック)。
+
+これで「案A 全面移行」は完了扱いとする ——内部表現は完全に案A、
+外向き u64 は後方互換の射影、という実用的な移行。

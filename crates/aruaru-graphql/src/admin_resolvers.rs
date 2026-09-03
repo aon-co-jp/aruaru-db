@@ -919,6 +919,29 @@ impl AdminQuery {
         Ok(htap_status_for(&columnar, &table, prune))
     }
 
+    /// 【2026-09-03 続き26 / P-HLC-3b】HLC(案A、フル精度 2 フィールド)の
+    /// 現在値を観測する。`SystemTime::now()` を読んで HLC を1ステップ進めた
+    /// 値を返す(`closedTsAdvance` 等が `nowNanos` 省略時に使うのと同じ経路)。
+    /// `wallNanos`(フル精度ナノ秒)/ `logical` / `synthetic` に加え、
+    /// 既存 API 互換の `ordinal`(案B 65µs 射影)も返す。
+    async fn hlc_now(&self, ctx: &Context<'_>) -> Result<HlcNowGql> {
+        let a = admin(ctx)?;
+        let hlc = a
+            .hlc
+            .clone()
+            .ok_or_else(|| async_graphql::Error::new("HLC is not configured"))?;
+        let ts = hlc.now_hlc_sys();
+        let max_offset = hlc.max_offset_nanos();
+        Ok(HlcNowGql {
+            wall_nanos: ts.wall_nanos.to_string(),
+            logical: ts.logical as i32,
+            synthetic: ts.synthetic,
+            ordinal: ts.as_ordinal().to_string(),
+            max_offset_ms: (max_offset / 1_000_000) as i64,
+            uncertainty_upper_nanos: ts.uncertainty_upper(max_offset).to_string(),
+        })
+    }
+
     /// 【2026-09-02 続き24】`htapReplicas` の全テーブル版。TiFlash の
     /// `INFORMATION_SCHEMA.TIFLASH_REPLICA` が全 (db, table) 行を返すのと
     /// 同じく、テーブル名を知らなくても全列レプリカの同期状態を一覧できる。
@@ -2457,6 +2480,34 @@ mod cluster_propose_tests {
         assert_eq!(all[0]["table"], "a_first", "sorted by table name");
         assert_eq!(all[1]["table"], "m");
         assert!(all.iter().all(|r| r["available"] == true));
+    }
+
+    /// 【2026-09-03 P-HLC-3b】`hlcNow` が案A(フル精度 2 フィールド)の
+    /// 現在値 + 案B 射影 ordinal を返す。連続呼び出しで ordinal が厳密増加。
+    #[tokio::test]
+    async fn hlc_now_query_reports_full_precision_and_ordinal() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+        let engine = Arc::new(QueryEngine::new());
+        let ctx = admin_ctx(engine.clone(), None);
+        ctx.hlc.as_ref().unwrap().set_max_offset_nanos(500_000_000); // 500ms
+        let schema = build_schema(engine.clone(), ctx);
+
+        let q = r#"query { hlcNow { wallNanos logical synthetic ordinal maxOffsetMs uncertaintyUpperNanos } }"#;
+        let r1 = schema.execute(authorized_request(q)).await;
+        assert!(r1.errors.is_empty(), "errors: {:?}", r1.errors);
+        let d1 = r1.data.into_json().unwrap();
+        let w1: u64 = d1["hlcNow"]["wallNanos"].as_str().unwrap().parse().unwrap();
+        let o1: u64 = d1["hlcNow"]["ordinal"].as_str().unwrap().parse().unwrap();
+        let uu1: u64 = d1["hlcNow"]["uncertaintyUpperNanos"].as_str().unwrap().parse().unwrap();
+        assert!(w1 > 1_700_000_000_000_000_000, "wall_nanos is real Unix nanos, not a truncated ordinal");
+        assert_eq!(d1["hlcNow"]["maxOffsetMs"], 500);
+        assert_eq!(uu1, w1 + 500_000_000, "uncertainty upper = wall + max_offset");
+
+        let r2 = schema.execute(authorized_request(q)).await;
+        let d2 = r2.data.into_json().unwrap();
+        let o2: u64 = d2["hlcNow"]["ordinal"].as_str().unwrap().parse().unwrap();
+        assert!(o2 > o1, "ordinal must be strictly increasing across calls: {o2} !> {o1}");
     }
 
     /// 【2026-09-02 HLC 再設計 P-HLC-2】`nowNanos` 省略時、`AdminCtx.hlc`
