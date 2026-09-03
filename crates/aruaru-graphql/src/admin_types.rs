@@ -456,3 +456,23 @@ pub struct HtapPrunePreviewGql {
     pub skipped_blocks: i32,
     pub kept_live_rows: i64,
 }
+
+// ── HLC 観測(2026-09-03 続き26、P-HLC-3b、Query.hlcNow) ──
+// 案A(フル精度 2 フィールド)へ移行した HLC の現在値を観測する。
+// `closedTsAdvance` 等が受け渡す u64 ordinal(案B 射影)も併記。
+
+#[derive(SimpleObject, Clone)]
+pub struct HlcNowGql {
+    /// フル精度 Unix エポックからのナノ秒(u64 のため String)。
+    pub wall_nanos: String,
+    /// 論理カウンタ。
+    pub logical: i32,
+    /// wall_nanos が実際の物理クロック読み値より先行しているか。
+    pub synthetic: bool,
+    /// 既存 API 互換の u64 ordinal(案B の 65µs 射影、String)。
+    pub ordinal: String,
+    /// 設定中のクロックスキュー上限(ミリ秒、0 = 無効)。
+    pub max_offset_ms: i64,
+    /// uncertainty interval の上端 wall_nanos + max_offset(String)。
+    pub uncertainty_upper_nanos: String,
+}
