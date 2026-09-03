@@ -34,6 +34,7 @@ aruaru-db は **PostgreSQL ワイヤプロトコル(:5433)** と
 | `java-aruaru-db/` | **公式 Java コネクタ** `tokyo.aon.aruaru:aruaru-db-connector`(標準 JDBC ドライバの薄いラッパー。Spring Boot/Quarkus。`java-jdbc/` の依存無しサンプルを統合) | 同期 | 未検証(この環境に Maven/JDK 無し) |
 | `dotnet-aruaru-db/` | **公式 .NET コネクタ** `Aruaru.Db`(Npgsql の薄いラッパー。ASP.NET Core) | 両方 | **`dotnet build`/`dotnet test` = 2026-09-03 実施・10/10 green**(実サーバ往復は未実施) |
 | `ruby-aruaru-db/` | **公式 Ruby コネクタ** `aruaru-db` gem(`Aruaru::Db::Client`、`pg` の薄いラッパー。Rails/Sinatra) | 同期 | 未検証(この環境に Ruby 無し) |
+| `mojo-aruaru-db/` | **公式 Mojo コネクタ** `aruaru_db.mojo`(Python 相互運用〈`from python import Python`〉経由で公式 Python コネクタ `python-aruaru-db` を呼ぶ薄いラッパー。ネイティブ PostgreSQL ドライバが Mojo に無いための設計) | 同期既定(`raw()`経由で非同期も可) | 未検証(この環境に `mojo`/`magic` CLI 無し) |
 
 各サンプルの `README.md` に実行手順と、実際に往復検証したら結果を追記する。
 

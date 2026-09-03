@@ -55,6 +55,7 @@ commit_id は全実装で「英数字 + `-` `_`、≤128 文字」を検証し�
 | `aruaru-db-connector` (Maven) | Java | 標準 JDBC ドライバ | 同期 | `clients/java-aruaru-db/` | 未検証(この環境に Maven/JDK 無し) |
 | `Aruaru.Db` (NuGet) | .NET | Npgsql | 両方(`Connect`/`ConnectAsync`) | `clients/dotnet-aruaru-db/` | ✅ **`dotnet build`/`dotnet test` 実施済み・10/10 green(2026-09-03)** |
 | `aruaru-db` (gem) | Ruby | `pg`(libpq) | 同期 | `clients/ruby-aruaru-db/` | 未検証(この環境に Ruby 無し) |
+| `aruaru_db.mojo` | Mojo | Python 相互運用経由で `python-aruaru-db`(`asyncpg`/`psycopg`) | 同期既定(`raw()`経由で非同期も可) | `clients/mojo-aruaru-db/` | 未検証(この環境に `mojo`/`magic` 無し) |
 
 素の接続レシピ(パッケージを使わず標準ドライバだけ)は §3。COBOL は
 埋め込み SQL(`EXEC SQL`)で `clients/cobol/`。
@@ -102,6 +103,7 @@ commit_id は全実装で「英数字 + `-` `_`、≤128 文字」を検証し�
 | **.NET (C#)** | `Npgsql`(同期 API) | `Npgsql`(async API)/ EF Core | ASP.NET Core / Minimal API | `clients/dotnet-aruaru-db/` |
 | **Ruby** | `pg` gem | (async gem 経由) | Rails (`adapter: postgresql`) | — (下記レシピ参照) |
 | **COBOL** | 埋め込み SQL(`EXEC SQL`)経由の同期 | — | Micro Focus / GnuCOBOL(OCESQL / ODBC / libpq) | `clients/cobol/` |
+| **Mojo** | Python 相互運用経由 `psycopg`(同期) | Python 相互運用経由 `asyncpg`(`raw()`から) | (Web フレームワークは未成熟、ライブラリ利用が主) | `clients/mojo-aruaru-db/` |
 
 > **GraphQL** はどの言語でも「HTTP で `POST /graphql`」なので専用ドライバ
 > 不要(`reqwest` / `httpx` / `OkHttp` / `fetch` / `HttpClient` 等)。
@@ -459,6 +461,7 @@ installer. Any misspelling like
 | Node/TS | — (JS is async) | `pg` / `postgres.js` | Express / Fastify / NestJS | `clients/node-aruaru-db/` |
 | .NET | `Npgsql` (sync API) | `Npgsql` (async) / EF Core | ASP.NET Core | `clients/dotnet-aruaru-db/` |
 | Ruby | `pg` gem | (via async gem) | Rails | recipe in §3.8 |
+| Mojo | Python interop → `psycopg` (default) | Python interop → `asyncpg` (via `raw()`) | (young ecosystem, mostly library use) | `clients/mojo-aruaru-db/` |
 
 GraphQL from any language is just `POST /graphql` over HTTP — no special
 client.

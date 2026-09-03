@@ -6819,3 +6819,92 @@ PHP/COBOL connector source or test files. Honest gaps carried forward:
 Go/Java/Ruby need a real toolchain to verify compilation at all; none of
 the four four has a live-server round-trip yet; Python asyncpg live
 round-trip and `aruaru-wire` typed results remain open from 続き31.
+
+## HANDOFF追記(2026-09-03続き33) 公式「薄いコネクタ」を Mojo へ拡張(Python 相互運用経由、ネイティブドライバ非依存)
+
+ユーザー指示: 「Mojo(Modular)にも対応してほしい」。続き28〜32 と同じ
+「標準ドライバ + 薄いラッパー」哲学の踏襲。
+
+### 設計判断
+Mojo は 2026 年時点でも成熟したネイティブ PostgreSQL ドライバを持たない
+(若いシステムプログラミング言語、DB ドライバのエコシステムは Python ほど
+育っていない)。一方 Mojo は `from python import Python` による強力な
+Python 相互運用(CPython 埋め込み)を持つ。よって**独自ワイヤプロトコルは
+実装せず**、既存の公式 Python コネクタ `clients/python-aruaru-db/`
+(それ自体 `asyncpg`/`psycopg` の薄いラッパー)を Python 相互運用経由で
+そのまま呼び出す、という設計にした——存在しないネイティブ Mojo PostgreSQL
+ドライバを捏造しない、が今回の最重要判断。
+
+### 新設(`clients/mojo-aruaru-db/`)
+- **`aruaru_db.mojo`**: `is_safe_commit_id`(英数字+`-`/`_`、1〜128 文字)
+  を **Mojo ネイティブ**に実装(Python 相互運用を経由しない——他の全
+  コネクタと同じ「ネットワークに触れる前にローカル検証」設計)。
+  `AruaruDb` struct(`Python.import_module("aruaru_db").AruaruDbSync` を
+  内部に保持する薄いラッパー)に `connect`/`execute`/`commit`/
+  `query_as_of`/`query_as_of_val`/`raw()`。既定は同期(`AruaruDbSync`、
+  `psycopg` v3)——Mojo 自身の async/await ランタイムが発展途上のため、
+  Python `asyncio` イベントループとの相互運用よりも同期経路を既定に
+  する方が誠実と判断(非同期が要る場合は `raw()` 経由で `aruaru_db.
+  AruaruDb`〈asyncpg 版〉を直接使える)。
+- **`test_aruaru_db.mojo`**: ネットワーク不要のユニットテスト
+  (`is_safe_commit_id` の受理/拒否/過長ID拒否3件 + `query_as_of` の
+  ネットワーク到達前拒否1件)+ `ARUARU_DB_TEST_DSN` 設定時のみ走る実
+  サーバ往復テスト(Go の `os.Getenv` skip・.NET の早期 return と同じ
+  パターン)。
+- **`README.md`**: 設計判断の説明、セットアップ(Mojo が埋め込む Python
+  環境に `python-aruaru-db` + `psycopg[binary]` を pip install)、使用例、
+  **検証状況セクション**(下記)。
+
+### 検証状況(正直な開示)
+`which mojo` / `mojo --version` / `which magic` / `which modular` を
+すべて実行し、**この開発環境に Mojo コンパイラ/インタプリタも
+`magic`/`modular` CLI も一切導入されていない**ことを確認した(Go/Maven/
+Ruby ツールチェーン不在〈続き32〉と同じ状況)。したがって
+`aruaru_db.mojo`/`test_aruaru_db.mojo` は**この環境で一度もコンパイル・
+実行されていない**——Mojo の言語知識に基づき可能な限り正確に書いたが、
+構文エラー・API の記憶違いの可能性を否定しない。実サーバ往復は
+なおさら未実施。README.md に `clients/go-aruaru-db/`・
+`clients/java-aruaru-db/`・`clients/ruby-aruaru-db/` と同じ誠実さの
+基準で「未検証」と明記し、次にやるべき検証手順(`mojo build`→依存導入→
+`mojo run test_aruaru_db.mojo`→実サーバ往復)を記載した。
+
+### ドキュメント更新
+`docs/CLIENTS.md` §0.2(公式薄いコネクタ表に Mojo 行追加)・§1(言語×
+フレームワーク行列、日英両方に Mojo 行追加)、`clients/README.md`
+(ディレクトリ一覧表に Mojo 行追加)。既存の Rust/Python/Node/PHP/Go/
+Java/.NET/Ruby/COBOL コネクタのソース・テストファイル・ドキュメントは
+今回一切変更していない。
+
+### 次にすべきこと
+(1) `mojo`/`magic` が使える環境でのコンパイル確認、(2) Python 側依存
+(`aruaru_db`、`psycopg[binary]`)導入後のネットワーク不要テスト実行、
+(3) 実 `aruaru-server` を立てての実サーバ往復検証、(4) 続き32 から
+継続: Go/Java/Ruby の実ビルド確認・4コネクタ全ての実サーバ往復、
+Python `asyncpg` 実往復、`aruaru-wire` の型付き結果。
+
+**English**: Added `clients/mojo-aruaru-db/`, the official thin connector
+for Mojo (Modular). As of this writing Mojo has no mature native
+PostgreSQL driver ecosystem, so rather than fabricate a from-scratch
+wire-protocol implementation, this connector wraps the existing official
+Python connector (`clients/python-aruaru-db/`, itself a thin wrapper over
+standard `asyncpg`/`psycopg`) via Mojo's Python interop layer (`from
+python import Python`) — the same "standard driver, thin wrapper"
+philosophy as every other connector in this repo, just with one extra
+Python hop instead of a native PostgreSQL driver hop. `aruaru_db.mojo`
+implements `is_safe_commit_id` **natively in Mojo** (no Python round-trip
+needed, matching the "validate before touching the network" pattern used
+by every other connector) and an `AruaruDb` struct wrapping
+`aruaru_db.AruaruDbSync` (sync/`psycopg` by default — Mojo's own
+async/await story is still evolving, so bridging it with Python's asyncio
+loop was judged not worth the reliability trade-off; async is reachable
+via `raw()`). `test_aruaru_db.mojo` covers the network-free validation
+paths plus an `ARUARU_DB_TEST_DSN`-gated live round-trip. **Toolchain
+reality check**: confirmed via `which`/`--version` that this environment
+has no `mojo` compiler/interpreter and no `magic`/`modular` CLI (same
+situation as the missing Go/Maven/Ruby toolchains in 続き32) — so neither
+`.mojo` file has been compiled or run here; the README states this
+honestly, matching the standard already set by
+`clients/go-aruaru-db/README.md`, `clients/java-aruaru-db/README.md`, and
+`clients/ruby-aruaru-db/README.md`. Updated `docs/CLIENTS.md` (§0.2
+connector table, §1 language matrix in both languages) and
+`clients/README.md`; did not touch any other connector's files.
