@@ -423,10 +423,14 @@ fn describe_columns(engine: &QueryEngine, sql: &str) -> Option<Vec<String>> {
             Some(cols) => Some(cols),
             None => engine.table_columns(&table),
         },
-        // `select_as_of`は要求された列リストを無視し常にテーブルの
-        // フルROWを返す(`AruaruDbBackend::get_at_commit`のdoc comment
-        // 参照)ため、実行時と同じ列形状(テーブル全列)を返す。
-        parser::Statement::SelectAsOf { table, .. } => engine.table_columns(&table),
+        // 【2026-09-03】`select_as_of`も通常の`Select`と同じく列射影を
+        // 尊重するようになった。RowDescription と DataRow の列数を揃える
+        // ため、`columns`(SELECT の列リスト)があればそれを、無ければ
+        // (`SELECT *`)テーブル全列を返す。
+        parser::Statement::SelectAsOf { table, columns, .. } => match columns {
+            Some(cols) => Some(cols),
+            None => engine.table_columns(&table),
+        },
         parser::Statement::AruaruLog { .. } => Some(vec![
             "commit_id".to_string(),
             "author".to_string(),

@@ -33,7 +33,7 @@
 //! let rows = db
 //!     .query_as_of("SELECT qty FROM items WHERE id = 'sword'", &first, &[])
 //!     .await?;
-//! assert_eq!(rows[0].get::<_, i32>(0), 1);
+//! assert_eq!(rows[0].get::<_, String>(0).parse::<i32>().unwrap(), 1); // aruaru-wire は列を text で返す
 //! # Ok(()) }
 //! ```
 
@@ -226,14 +226,21 @@ mod tests {
             db.execute("UPDATE items SET qty = 5 WHERE id = 'sword'", &[]).await.unwrap();
             db.commit("restock").await.unwrap();
 
+            // 注意: aruaru-wire は現状、通常テーブル列を VARCHAR(text)で返す
+            // (`docs/CLIENTS.md` §5)。typed getter(`get::<i32>`)は使えない
+            // ので文字列で受けて parse する。
             let latest = db.query("SELECT qty FROM items WHERE id = 'sword'", &[]).await.unwrap();
-            assert_eq!(latest[0].get::<_, i32>(0), 5);
+            assert_eq!(latest[0].get::<_, String>(0).parse::<i32>().unwrap(), 5);
 
             let old = db
                 .query_as_of("SELECT qty FROM items WHERE id = 'sword'", &first, &[])
                 .await
                 .unwrap();
-            assert_eq!(old[0].get::<_, i32>(0), 1, "AS OF COMMIT must return the historical value");
+            assert_eq!(
+                old[0].get::<_, String>(0).parse::<i32>().unwrap(),
+                1,
+                "AS OF COMMIT must return the historical value"
+            );
         });
     }
 }

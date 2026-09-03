@@ -378,8 +378,24 @@ PostgreSQL 互換なので、上記いずれも aruaru-db 専用のビルドは�
 にクエリを実行せず構文解析 + スキーマ参照で列を解決する方式へ改修済みで、
 `sqlx` / `Npgsql` / JDBC の `PreparedStatement` / psycopg の
 server-side binding などが通る(`aruaru_commit` の二重実行も起きない)。
-既知の制限: `SELECT col1, col2 ... AS OF COMMIT` の列射影は未対応(常に
-フル行、呼び出し側でインデックス指定)。
+**2026-09-03 修正**: `SELECT col1, col2 ... AS OF COMMIT` の**列射影に対応**
+(旧: 常にフル行を返していた)。`SELECT *` はフル行、列を並べれば
+その順・その列だけ、不明な列名はエラー。通常の `SELECT` と同じ挙動。
+
+### 5.1 結果列の型は現状すべて VARCHAR(text)
+
+`aruaru-wire` は現在、関数以外の結果列を **`VARCHAR`(text フォーマット)**
+で返す(内部ストレージが文字列のため)。したがって:
+
+- **typed getter は使えない**: `row.get::<i32>(0)`(tokio-postgres)/
+  `rs.getInt(1)`(JDBC)/ `cur.fetchone()[0]` を `int` として扱う 等は
+  失敗しうる。**文字列で受けて `parse` / `Integer.parseInt` / `int()`**。
+- ORM のマッピングは、列を `TEXT`/`String` として定義するか、読み出し後に
+  アプリ側で変換する。
+- `aruaru_commit()` の戻り値(commit_id)は元々 text なので影響なし。
+
+型付き結果(INT4/TIMESTAMP 等の OID を返す)は今後の `aruaru-wire` の
+課題(`CLAUDE.md` HANDOFF 参照)。
 
 ---
 
@@ -479,8 +495,18 @@ Most ORMs/drivers default to the **extended protocol**. `aruaru-wire`'s
 resolve columns from parse + schema lookup **without executing the
 query** (so `sqlx` / `Npgsql` / JDBC `PreparedStatement` / psycopg
 server-side binding all work, and `aruaru_commit` is not double-run).
-Known limit: column projection in `SELECT c1, c2 ... AS OF COMMIT` is not
-honored yet (full row is returned).
+**Fixed 2026-09-03**: column projection in `SELECT c1, c2 ... AS OF
+COMMIT` **is now honored** (previously the full row was always returned).
+`SELECT *` keeps the full row; listing columns returns those columns in
+that order; an unknown column name errors. Same as a normal `SELECT`.
+
+**5.1 — result columns currently all come back as `VARCHAR` (text).**
+`aruaru-wire` currently returns non-function result columns as `VARCHAR`
+(text format) because internal storage is string-based. So typed getters
+(`row.get::<i32>(0)`, `rs.getInt(1)`, treating `cur.fetchone()[0]` as an
+int, …) can fail — **read as string and `parse` / `Integer.parseInt` /
+`int()`**. `aruaru_commit()`'s return (the commit id) is text anyway.
+Typed results (real INT4/TIMESTAMP OIDs) are future `aruaru-wire` work.
 
 ## 6. Verification status (no exaggeration)
 
