@@ -6577,3 +6577,35 @@ update `clients/*/README.md` with the final verified/not-verified).
 :5433 and update the READMEs. (3) Go / Java / .NET / Ruby connectors not
 yet built (same pattern). (4) typed results in `aruaru-wire`. (5) GPU
 §12.4 remainder.
+
+### 続き31 追記(同日、実サーバ往復 E2E 完了)
+projection-fix 入り release バイナリのビルド完了後、ローカル `aruaru-server`
+(:5433、`ARUARU_USERS=app:secret`)相手に**拡張プロトコル**のコネクタ・
+ライブ往復を実施:
+- **Rust `aruaru-db-connector`**: `cargo test -- --ignored
+  live_commit_and_as_of_round_trip` = **passed**(`connect` SCRAM/NoTls →
+  `commit()` → `query_as_of()` が過去値 `1`、最新 `5`)。
+- **Node `@aruaru/db`**: `npm i pg && node live-check.js` = **OK**
+  (同上、`as-of qty=1 / latest qty=5`)。実装中に Node 側の実バグ 1 件修正:
+  `commit()` が `SELECT aruaru_commit($1) AS commit_id` の別名に依存して
+  いたが aruaru-db は `AS alias` が効かず結果列名は関数名 `aruaru_commit`。
+  → 列名非依存(先頭列)へ修正。`node test.js` 4 件も green。
+- Python `aruaru-db` は asyncpg がこの環境に未導入のため実サーバ往復は
+  未実施(単体 4 件は green)。PHP/COBOL はツールチェーンなし。
+`clients/{rust-aruaru-db,node-aruaru-db,README}.md` の検証状況を更新済み。
+これで「🛑 再開用メッセージ」項目 2(コネクタ実往復検証)の Rust/Node 分は
+**完了**。残りは Python の asyncpg 実往復と Go/Java/.NET/Ruby の新規実装。
+
+**English**: After the projection-fix release binary built, ran the
+extended-protocol connector live round-trips against a local
+`aruaru-server` (:5433): **Rust `aruaru-db-connector`** `cargo test --
+--ignored` = passed; **Node `@aruaru/db`** `npm i pg && node
+live-check.js` = OK (both: as-of `1`, latest `5`). Fixed one real Node
+bug on the way — `commit()` relied on a `SELECT ... AS commit_id` alias
+but aruaru-db doesn't honor `AS alias` (the result column is the function
+name `aruaru_commit`); now name-independent (first column). `node
+test.js` 4 pass. Python's asyncpg isn't installed here so its live
+round-trip is not run (4 unit tests green); PHP/COBOL have no toolchain.
+Connector READMEs updated. Revival-message item 2 (connector live
+verification) is **done for Rust/Node**; remaining: Python asyncpg live
+run and Go/Java/.NET/Ruby connectors.

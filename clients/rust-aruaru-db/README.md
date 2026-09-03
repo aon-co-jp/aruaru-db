@@ -58,8 +58,8 @@ ARUARU_DB_TEST_DSN="host=localhost port=5433 user=app password=secret dbname=app
 
 ## 検証状況
 
-- **ネットワーク不要のテスト(2 + doctest)= このセッションで green**。
-- **実サーバ往復(`--ignored`)= 未実施**(この環境に稼働中 aruaru-server
-  なし)。ロジックは `tokio-postgres` の標準 API + 文字列組み立てのみ。
-  過去に `sqlx` / `psql` の pgwire 往復は検証済み(`../../CLAUDE.md`
-  2026-07-13/14)。
+- **ネットワーク不要のテスト(2 + doctest)= green**。
+- **実サーバ往復(`--ignored`)= 2026-09-03 green**: ローカル `aruaru-server`
+  (:5433、`ARUARU_USERS=app:secret`)相手に `connect`(SCRAM/NoTls)→
+  `commit()` → `query_as_of()`(拡張プロトコル)が過去値 `1`(最新は `5`)
+  を返すことを確認(`AS OF COMMIT` 列射影修正 `1566c0b` 込み)。

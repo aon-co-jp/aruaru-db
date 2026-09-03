@@ -64,11 +64,14 @@ class AruaruDb {
 
   /** Git-on-SQL: 全テーブルをスナップショットし commit_id を返す。 */
   async commit(message) {
-    const r = await this._c.query('SELECT aruaru_commit($1) AS commit_id', [message]);
-    if (!r.rows.length || r.rows[0].commit_id == null) {
+    // aruaru-db は結果列を関数名(`aruaru_commit`)で返し、`AS alias` は
+    // 効かない。列名に依存せず先頭列の値を取る。
+    const r = await this._c.query('SELECT aruaru_commit($1)', [message]);
+    const first = r.rows.length ? Object.values(r.rows[0])[0] : null;
+    if (first == null) {
       throw new Error('aruaru_commit() returned no commit id');
     }
-    return String(r.rows[0].commit_id);
+    return String(first);
   }
 
   /**
