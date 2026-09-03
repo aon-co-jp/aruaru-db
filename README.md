@@ -218,10 +218,22 @@ SELECT qty FROM items WHERE id = 'sword' AS OF COMMIT 'abc123...'; -- 1 (過去)
 ```
 
 内部では commit の `root_hash` から Prolly Tree を再構築して読み出すため、
-最新の可変テーブル状態を経由しません。現状のスコープ: 単一行 (PK 一致の
-`WHERE`) のみ対応、フルテーブルスキャンの `AS OF` は未対応(次回拡張候補)。
-pgwire 経由(`open-runo`/`open-web-server` からの外部アクセス)にはまだ
-配線されていません — 詳細は本ファイル下部の HANDOFF 節を参照。
+最新の可変テーブル状態を経由しません。**2026-09-03 修正**: `AS OF COMMIT`
+も通常の `SELECT` と同じく**列射影を尊重**するようになりました
+(旧: 常にフル行を返していた。`SELECT *` はフル行、列を並べればその順・
+その列だけ、不明列はエラー)。単一行と WHERE 無しフルスキャンの両方に対応。
+
+**クライアント接続**(Java / Rust+Axum・Poem・RPoem / Python+FastAPI・
+Django・Flask / PHP+Laravel / Go / Node / .NET / COBOL / メインフレーム
+z/OS ほか)は [`docs/CLIENTS.md`](docs/CLIENTS.md) を参照 —
+aruaru-db は pgwire(:5433)+ GraphQL/HTTP(:4001)の 2 標準契約だけを
+公開するので、各言語の**標準 PostgreSQL ドライバでそのまま繋がり**、
+独自ドライバは不要です。Git-on-SQL を慣用 API で薄くラップした公式
+コネクタ(`aruaru-db-connector` (Rust) / `aruaru-db` (PyPI) /
+`@aruaru/db` (npm) / `aruaru/db` (Composer))は [`clients/`](clients/)。
+**現在の制限**: 結果列は今のところすべて `VARCHAR`(text)で返るため、
+`get::<i32>` 等の型付きゲッターではなく文字列で受けて parse してください
+(`docs/CLIENTS.md §5.1`)。
 
 ブランチ間の diff は SQL 関数としては提供されていません。`aruaru-graphql` の
 GraphQL API 経由で取得します:

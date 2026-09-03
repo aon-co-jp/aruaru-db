@@ -6487,3 +6487,93 @@ binds; not run — no COBOL toolchain here). `docs/CLIENTS.md` updated:
 table, §3.8c COBOL paths. Next: Go / Java / .NET / Ruby thin wrappers
 (currently only raw-driver recipes in §3), and live round-trips against
 a running server.
+
+## HANDOFF追記(2026-09-03続き31) `AS OF COMMIT` 列射影バグを修正(コネクタ実往復検証で発覚)+ 結果列 VARCHAR の明文化
+
+### 経緯
+続き29/30 で作った公式薄いコネクタ(Rust/Python/Node/PHP)の**実サーバ
+往復検証**を、ローカルに `aruaru-server`(pgwire :5433 + `ARUARU_USERS`)を
+起動して実施したところ、**2 件の実バグ/実仕様**が判明した。
+
+### バグ1: `SELECT col ... AS OF COMMIT` が列射影を無視(実害)
+2026-07-13 HANDOFF が「既知の制限」として記録していた「`select_as_of` は
+`SELECT` の列リストを無視し常にフル行を返す」が、型なしクライアント
+(`tokio-postgres` 等、`get::<String>(0)` する)では
+「`SELECT qty` を頼んだのに `id` の値(0 列目)が返る」という**実害**に
+なることを確認(`SELECT qty FROM p WHERE id='s' AS OF COMMIT '<id>'` →
+`"s"` が返っていた)。**修正**(`1566c0b`):
+- `parser.rs`: `Statement::SelectAsOf` に `columns: Option<Vec<String>>`。
+  `parse_select` が内側 `Select` の `columns` を流用。
+- `engine.rs::select_as_of`: `projection` 引数。`full_columns` から要求列を
+  順に取り出す `project` クロージャ(`SELECT *` はフル行、列指定はその順・
+  その列だけ、不明列は `Err`)。WHERE 有/無/行なしの 3 経路に適用。
+  `select_follower_read` は `None` を渡す。
+- `aruaru-wire::describe_columns`: `SelectAsOf` も `columns` を尊重
+  (RowDescription と DataRow の列数不一致による拡張プロトコルの
+  `error parsing response from server` を解消)。
+- `as_of` テストを射影後の正しい期待値へ更新 + `SELECT *` / 複数列順序 /
+  不明列 `Err` の新規アサーション。`cargo test -p aruaru-query` 60 /
+  `-p aruaru-wire` 10 / `-p aruaru-graphql` 22 = 全 green。
+
+### 仕様2: 結果列は現状すべて VARCHAR(text)
+`aruaru-wire` は関数以外の結果列を **`VARCHAR`(text フォーマット)** で
+返す(内部ストレージが文字列のため)。→ `get::<i32>` / `getInt` /
+`int(row[0])` は失敗しうる。**文字列で受けて parse する**。
+`docs/CLIENTS.md §5.1` に明記。型付き結果(実 OID)は `aruaru-wire` の
+今後の課題。
+
+### 検証状況(このセッション)
+- ユニット: 上記 92 テスト green。
+- simple プロトコル実往復: `AS OF qty=1`(正しい過去値)を確認。
+- 拡張プロトコル実往復(Rust `aruaru-db-connector` / Node `@aruaru/db` の
+  ライブテスト): **projection-fix 入り release バイナリで実施中**
+  (ビルドがこのセッション中に複数回タイムアウト・ロック競合で再実行に
+  なった。`docs/CLIENTS.md §6` / 各 `clients/*/README.md` に最新の
+  「検証済/未検証」を反映する)。
+
+### 🛑 再開用メッセージ(このトピックを次回続ける人向け)
+1. **`AS OF COMMIT` 列射影修正(`1566c0b`)は commit/push 済み。VPS 反映は
+   `/root/asrv_projfix.log` のビルド完了後に `systemctl restart
+   aruaru-server`**(このセッションで着手、完了確認まで至っていなければ
+   次回実施)。
+2. **公式薄いコネクタの実サーバ往復検証**: ローカルに
+   `target/release/aruaru-server.exe --data <tmp> --pg-port 5433
+   --gql-port 4001`(`ARUARU_USERS=app:secret`)を起動し、
+   - Rust: `ARUARU_DB_TEST_DSN="host=127.0.0.1 port=5433 user=app
+     password=secret dbname=aruaru" cargo test --manifest-path
+     clients/rust-aruaru-db/Cargo.toml -- --ignored`
+   - Node: `cd clients/node-aruaru-db && npm i pg && ARUARU_DB_DSN=...
+     node live-check.js`
+   を実行し、各 `README.md` の検証状況を更新。
+3. **未着手の言語コネクタ**: Go(`aruaru-db-go`)/ Java(`aruaru/db`
+   Maven)/ .NET(`Aruaru.Db` NuGet)/ Ruby(`aruaru_db` gem)。パターンは
+   Rust/Python/Node と同一(標準ドライバ + `commit()` / `query_as_of()` +
+   `is_safe_commit_id`)。`docs/CLIENTS.md §3` に生ドライバのレシピあり。
+4. **`aruaru-wire` の型付き結果**(仕様2): 列 OID を実型で返す改修。
+5. GPU 側の残り(§12.4): open-directx の `dxil-spirv` vs `naga` 比較 PR、
+   open-cuda の macOS/MoltenVK 実機検証、aruaru-llm スライス(C)
+   (`ARUARU_LLM_ENABLE_*` の能力交渉自動化)。
+
+**English**: Verifying the official thin connectors (続き29/30) against a
+live local `aruaru-server` surfaced two real issues. **(1) `SELECT col
+... AS OF COMMIT` ignored column projection** — the "known limitation"
+from 2026-07-13 was a real bug for untyped clients (`SELECT qty ... AS OF
+COMMIT` returned the `id` value). Fixed in `1566c0b`: `Statement::
+SelectAsOf` now carries `columns`; `select_as_of` projects (`SELECT *` =
+full row, listed columns in order, unknown column errors);
+`aruaru-wire::describe_columns` mirrors it (fixing an extended-protocol
+"error parsing response" from a RowDescription/DataRow column-count
+mismatch). `cargo test`: aruaru-query 60 / aruaru-wire 10 / aruaru-graphql
+22 green. **(2) result columns are all `VARCHAR` (text)** for now —
+`get::<i32>` etc. fail; read as string and parse (`docs/CLIENTS.md §5.1`).
+Live round-trip: simple protocol confirmed (`AS OF qty=1`); the
+extended-protocol connector live tests are running against the rebuilt
+binary (builds timed out / hit lock contention repeatedly this session —
+update `clients/*/README.md` with the final verified/not-verified).
+**Revival**: (1) push done; deploy `1566c0b` to VPS after
+`/root/asrv_projfix.log` finishes (`systemctl restart aruaru-server`).
+(2) run the Rust (`cargo test ... -- --ignored`) and Node
+(`npm i pg && node live-check.js`) live tests against a local server on
+:5433 and update the READMEs. (3) Go / Java / .NET / Ruby connectors not
+yet built (same pattern). (4) typed results in `aruaru-wire`. (5) GPU
+§12.4 remainder.
