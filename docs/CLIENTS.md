@@ -37,6 +37,24 @@ aruaru-db は 2 つの**標準契約**だけを公開する。どちらも普通
 (`aruaru-db-python-windows-device-driver-installer.exe` 等)を見つけたら
 この `aruaru-db-<言語>-connector` へ寄せる。
 
+### 0.2 公式「薄いコネクタ」パッケージ(標準ドライバ + Git-on-SQL ヘルパー)
+
+「実体のあるコネクタ層が欲しい」向けに、**各言語の標準ドライバをそのまま
+使い、その上に `commit()` / `query_as_of()` を慣用 API で足しただけ**の
+薄いパッケージを `clients/` に置く。ドライバの再実装ではない(速度差なし)。
+commit_id は全実装で「英数字 + `-` `_`、≤128 文字」を検証し、非安全なら
+ネットワークに触れる前にエラー(SQL インジェクション防止)。
+
+| パッケージ | 言語 | 下敷きの標準ドライバ | 同期/非同期 | ディレクトリ | テスト(ネットワーク不要ぶん) |
+|---|---|---|---|---|---|
+| `aruaru-db-connector` | Rust | `tokio-postgres` | 非同期 | `clients/rust-aruaru-db/` | ✅ green(2 + doctest) |
+| `aruaru-db` (PyPI) | Python | `asyncpg`(async)/ `psycopg` v3(sync) | 両方(`AruaruDb` / `AruaruDbSync`) | `clients/python-aruaru-db/` | ✅ green(4) |
+| `@aruaru/db` (npm) | Node/TS | `pg`(node-postgres) | 非同期 | `clients/node-aruaru-db/` | ✅ green(4) |
+| `aruaru/db` (Composer) | PHP | `PDO`(pdo_pgsql) | 同期 | `clients/php-aruaru-db/` | 未検証(この環境に PHP なし) |
+
+素の接続レシピ(パッケージを使わず標準ドライバだけ)は §3。COBOL は
+埋め込み SQL(`EXEC SQL`)で `clients/cobol/`。
+
 ### 0.1 「同期/非同期/ハイブリッドを、言語・OS が違っても速度を犠牲にせず互換」— それは pgwire が既に達成している
 
 - **ワイヤ上のバイト列は同期でも非同期でも同一**。「同期 or 非同期」は
@@ -79,6 +97,7 @@ aruaru-db は 2 つの**標準契約**だけを公開する。どちらも普通
 | **Node / TS** | (なし。JS は基本非同期) | `pg` / `postgres.js` | Express / Fastify / NestJS | `clients/node-pg/` |
 | **.NET (C#)** | `Npgsql`(同期 API) | `Npgsql`(async API)/ EF Core | ASP.NET Core / Minimal API | `clients/dotnet-npgsql/` |
 | **Ruby** | `pg` gem | (async gem 経由) | Rails (`adapter: postgresql`) | — (下記レシピ参照) |
+| **COBOL** | 埋め込み SQL(`EXEC SQL`)経由の同期 | — | Micro Focus / GnuCOBOL(OCESQL / ODBC / libpq) | `clients/cobol/` |
 
 > **GraphQL** はどの言語でも「HTTP で `POST /graphql`」なので専用ドライバ
 > 不要(`reqwest` / `httpx` / `OkHttp` / `fetch` / `HttpClient` 等)。
@@ -304,6 +323,26 @@ route.at("/items/:id", post(handler_fn(move |req, p| {
 `sqlx` はそのまま動く。**新規開発は不要**——`aruaru-db-connector` は
 「あると便利」な薄い層であって必須ではない。
 
+### 3.8c COBOL(埋め込み SQL `EXEC SQL`、独自ドライバなし)
+
+aruaru-db は pgwire なので COBOL からは標準の 3 経路で繋がる:
+(1) **ODBC**(psqlODBC を DSN 登録 + Micro Focus / OpenCOBOL ESQL でプリ
+コンパイル、Windows / Linux / UNIX / **z/OS USS**)、(2) **libpq 直呼び**
+(GnuCOBOL の `CALL "PQexec"` 等)、(3) **OCESQL**(`ocesql` で `EXEC SQL`
+→ libpq)。ポートは 5433。Git-on-SQL はホスト変数へバインドするだけ:
+
+```cobol
+       EXEC SQL SELECT aruaru_commit(:H-MSG) INTO :H-COMMIT-ID END-EXEC.
+       EXEC SQL
+           SELECT qty INTO :H-QTY
+           FROM items WHERE id = :H-ID
+           AS OF COMMIT :H-COMMIT-ID
+       END-EXEC.
+```
+
+完全な参照実装は `clients/cobol/ARUARU.cob`(プリコンパイル手順は
+`clients/cobol/README.md`)。
+
 ### 3.9 GraphQL(全言語共通・HTTP のみ)
 
 ```bash
@@ -325,6 +364,7 @@ curl -s http://localhost:4001/graphql -H 'content-type: application/json' \
 | **メインフレーム(IBM z/OS)** | **JDBC ドライバ(純 Java Type 4)** が z/OS 上の JVM でそのまま動く。ネイティブ言語からは USS の `libpq` |
 | **Android(スマホ / タブレット)** | JDBC(`org.postgresql:postgresql`)を依存に追加 / Ktor + `r2dbc-postgresql` / OkHttp で GraphQL。**注意**: 端末から直接 DB に繋ぐ構成はネットワーク/認証設計を伴う(通常はアプリサーバ経由) |
 | **iOS / iPadOS** | Swift: [`PostgresClientKit`](https://github.com/codewinsdotcom/PostgresClientKit) / [`PostgresNIO`](https://github.com/vapor/postgres-nio)(SwiftNIO ベース、非同期)。GraphQL は `URLSession` |
+| **COBOL(全 OS + メインフレーム)** | psqlODBC(unixODBC / Windows ODBC / z/OS USS)+ `EXEC SQL`、または libpq を `CALL`、または OCESQL。`clients/cobol/` 参照 |
 
 **共通の前提**: TCP と(推奨で)TLS が張れれば繋がる。ワイヤ形式が
 PostgreSQL 互換なので、上記いずれも aruaru-db 専用のビルドは不要。

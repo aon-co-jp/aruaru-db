@@ -1,0 +1,17 @@
+{
+  "name": "@aruaru/db",
+  "version": "0.1.0",
+  "description": "Thin official Node connector for aruaru-db: standard pg (node-postgres) + Git-on-SQL helpers (commit / AS OF COMMIT)",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "license": "MIT OR Apache-2.0",
+  "peerDependencies": {
+    "pg": ">=8"
+  },
+  "peerDependenciesMeta": {
+    "pg": { "optional": false }
+  }
+}

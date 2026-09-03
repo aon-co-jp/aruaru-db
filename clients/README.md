@@ -25,7 +25,11 @@ aruaru-db は **PostgreSQL ワイヤプロトコル(:5433)** と
 | `rust-axum/` | Rust + Axum + sqlx(PgPool) | 非同期 | 未検証(過去に sqlx pgwire 往復は検証済み、CLAUDE.md 2026-07-13/14) |
 | `php-laravel/` | PHP + Laravel + PDO_pgsql | 同期 | 未検証(この環境に PHP 未導入) |
 | `java-jdbc/` | Java + 素の JDBC | 同期(R2DBC 例も併記) | 未検証(この環境に JDBC jar 未導入) |
-| `rust-aruaru-db/` | **公式 Rust コネクタクレート** `aruaru-db-connector`(`tokio-postgres` + `commit()`/`query_as_of()` の薄いラッパー、RPoem/Axum/Poem 向け) | 非同期 | ネットワーク不要テスト(2 + doctest)= **green**。実サーバ往復(`--ignored`)= 未実施 |
+| `rust-aruaru-db/` | **公式 Rust コネクタ** `aruaru-db-connector`(`tokio-postgres` + `commit()`/`query_as_of()`、RPoem/Axum/Poem 向け) | 非同期 | ネットワーク不要 2 + doctest = **green** |
+| `python-aruaru-db/` | **公式 Python コネクタ** `aruaru-db`(`AruaruDb`=asyncpg / `AruaruDbSync`=psycopg。FastAPI/Django/Flask) | 両方 | ネットワーク不要 4 = **green** |
+| `node-aruaru-db/` | **公式 Node コネクタ** `@aruaru/db`(`pg` の薄いラッパー。Express/Fastify/NestJS) | 非同期 | ネットワーク不要 4 = **green** |
+| `php-aruaru-db/` | **公式 PHP コネクタ** `aruaru/db`(`PDO` の薄いラッパー。Laravel/Symfony) | 同期 | 未検証(この環境に PHP なし) |
+| `cobol/` | COBOL 埋め込み SQL(`EXEC SQL`)参照実装。ODBC(psqlODBC)/ libpq / OCESQL、z/OS 含む | 同期 | 未検証(COBOL 環境なし) |
 
 各サンプルの `README.md` に実行手順と、実際に往復検証したら結果を追記する。
 
