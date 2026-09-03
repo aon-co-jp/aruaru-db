@@ -22,7 +22,7 @@ xcopy /E /I aruaru-db-admin-web\dist installer\web-dist\
 rem 3-a. NSIS で .exe 生成
 cd installer
 makensis setup.nsi
-rem → aruaru-db-admin-setup-0.5.0.exe が生成される
+rem → aruaru-db-admin-win-installer.exe が生成される
 
 rem 3-b. WiX v4 で .msi 生成
 wix harvest web-dist -cg WebAssets -dr INSTALLDIR -o web-assets.wxs

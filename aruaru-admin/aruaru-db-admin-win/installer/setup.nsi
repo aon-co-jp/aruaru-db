@@ -11,7 +11,8 @@ Unicode True
 !define WEBVIEW2_URL  "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
 
 Name "${APP_NAME} ${APP_VERSION}"
-OutFile "aruaru-db-admin-setup-${APP_VERSION}.exe"
+; 命名規則: <コンポーネント名>-installer.exe(バージョン番号なし、ecosystem 標準)
+OutFile "aruaru-db-admin-win-installer.exe"
 InstallDir "${INSTALL_DIR}"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
