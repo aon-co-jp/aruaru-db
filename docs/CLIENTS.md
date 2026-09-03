@@ -272,6 +272,38 @@ var old = (int)(await q.ExecuteScalarAsync())!; // 1
 `adapter: postgresql` / `port: 5433`。`AS OF COMMIT` は
 `ActiveRecord::Base.connection.select_value(...)`。
 
+### 3.8b RPoem / Poem(Rust の Web フレームワーク)から使う
+
+**「RPoem 用ドライバ」「Poem 用ドライバ」は存在しないし、要らない。**
+RPoem(`open-runo-poem-compat`)は tokio/hyper 上の HTTP 層であって、DB
+クライアントを指定しない。RPoem アプリから aruaru-db へは、上の **Rust の
+非同期 PostgreSQL クライアント**をそのまま使う:
+
+| 選択肢 | いつ使うか |
+|---|---|
+| **`aruaru-db-connector`**(`clients/rust-aruaru-db/`) | `tokio-postgres` + `commit()` / `query_as_of()` の薄いラッパー。Git-on-SQL を慣用 API で使いたいとき |
+| **`tokio-postgres` 生** | 依存を最小にしたいとき。`SELECT aruaru_commit($1)` / `... AS OF COMMIT $2` を自分で書く |
+| **`sqlx`(`postgres`,`runtime-tokio`)** | コンパイル時クエリ検査 / `PgPool` が欲しいとき |
+| **`open-runo-db::aruaru::AruaruDbBackend`**(RPoem 同梱) | put/get/delete/list の**汎用 KV** だけでよいとき。**Git-on-SQL(`aruaru_commit`/`AS OF COMMIT`)は未対応**なので、版管理が要るなら上の 3 つ |
+
+RPoem には `Data<T>` 抽出子が無いため、共有状態(`Arc<AruaruDb>` /
+`Arc<PgPool>`)はハンドラ登録クロージャで `Arc::clone` をキャプチャする
+(`aruaru-llm` の RPoem 移行 HANDOFF 2026-07-31 と同じ形)。
+
+```rust
+let db = std::sync::Arc::new(aruaru_db_connector::AruaruDb::connect(&dsn).await?);
+let db_h = db.clone();
+route.at("/items/:id", post(handler_fn(move |req, p| {
+    let db = db_h.clone();
+    Box::pin(async move { /* db.commit(...).await / db.query_as_of(...).await */ })
+})));
+```
+
+**互換性**: aruaru-db の pgwire は拡張プロトコル込みで PostgreSQL 互換
+(`describe_portal` は 2026-07-14 修正済み)なので `tokio-postgres` /
+`sqlx` はそのまま動く。**新規開発は不要**——`aruaru-db-connector` は
+「あると便利」な薄い層であって必須ではない。
+
 ### 3.9 GraphQL(全言語共通・HTTP のみ)
 
 ```bash

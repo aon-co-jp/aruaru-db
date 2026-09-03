@@ -1,0 +1,27 @@
+# aruaru-db 公式 Rust コネクタ(薄いラッパー)。
+#
+# これは「独自の PostgreSQL ドライバ」ではない ——`tokio-postgres`(業界標準の
+# 非同期 PostgreSQL クライアント)をそのまま使い、その上に Git-on-SQL の
+# `commit()` / `query_as_of()` を慣用的な API で足しただけの薄い層。
+# RPoem / Axum / Poem など tokio ベースのアプリから使う想定。
+#
+# 同期が要る場合は `postgres` crate(`tokio-postgres` の同期ファサード)を
+# 直接使う ——ワイヤ形式は同一。プールは deadpool-postgres / bb8 で包む。
+#
+# メインの aruaru-db ワークスペースには含めない(独立クレート)。
+
+[package]
+name = "aruaru-db-connector"
+version = "0.1.0"
+edition = "2021"
+description = "Thin official Rust connector for aruaru-db: standard tokio-postgres + Git-on-SQL helpers (commit / AS OF COMMIT)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio-postgres = "0.7"
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+[workspace]
