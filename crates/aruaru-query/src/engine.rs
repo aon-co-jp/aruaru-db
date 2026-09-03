@@ -705,9 +705,10 @@ impl QueryEngine {
             Statement::AruaruLog { limit } => self.aruaru_log(limit),
             Statement::SelectAsOf {
                 table,
+                columns,
                 filter,
                 commit_id,
-            } => self.select_as_of(table, filter, commit_id),
+            } => self.select_as_of(table, columns, filter, commit_id),
         }
     }
 
@@ -1217,6 +1218,7 @@ impl QueryEngine {
     fn select_as_of(
         &self,
         table: String,
+        projection: Option<Vec<String>>,
         filter: Option<(String, String)>,
         commit_id: String,
     ) -> Result<QueryResponse, String> {
@@ -1238,6 +1240,33 @@ impl QueryEngine {
             }
         };
 
+        // 【2026-09-03】通常の SELECT と同じく列射影を尊重する
+        // (旧: フル行を返していた。docs/CLIENTS.md §5 / 2026-07-13 の既知制限)。
+        // `projection` が Some のとき、full_columns から要求列だけを順に取り出す。
+        let project =
+            |full_columns: Vec<String>,
+             rows: Vec<Vec<Value>>|
+             -> Result<(Vec<String>, Vec<Vec<Value>>), String> {
+                let Some(wanted) = &projection else {
+                    return Ok((full_columns, rows));
+                };
+                let idx: Vec<usize> = wanted
+                    .iter()
+                    .map(|w| {
+                        full_columns
+                            .iter()
+                            .position(|c| c.eq_ignore_ascii_case(w))
+                            .ok_or_else(|| format!("AS OF COMMIT: unknown column {w:?}"))
+                    })
+                    .collect::<Result<_, _>>()?;
+                let out_cols = idx.iter().map(|&i| full_columns[i].clone()).collect();
+                let out_rows = rows
+                    .into_iter()
+                    .map(|r| idx.iter().map(|&i| r.get(i).cloned().unwrap_or(Value::Null)).collect())
+                    .collect();
+                Ok((out_cols, out_rows))
+            };
+
         let Some((_, pk_value)) = filter else {
             // WHERE無し: table\0 プレフィックスでフルスキャンする。
             let mut prefix = table.as_bytes().to_vec();
@@ -1255,15 +1284,14 @@ impl QueryEngine {
                 })
                 .collect();
 
-            let columns = columns_for(rows.first().map(|r| r.len()).unwrap_or(0));
+            let full_columns = columns_for(rows.first().map(|r| r.len()).unwrap_or(0));
             rows.sort();
-            return Ok(QueryResponse::Rows {
-                columns,
-                rows: rows
-                    .into_iter()
-                    .map(|row| row.into_iter().map(Value::Text).collect())
-                    .collect(),
-            });
+            let value_rows: Vec<Vec<Value>> = rows
+                .into_iter()
+                .map(|row| row.into_iter().map(Value::Text).collect())
+                .collect();
+            let (columns, rows) = project(full_columns, value_rows)?;
+            return Ok(QueryResponse::Rows { columns, rows });
         };
 
         // キー形式は snapshot_root() と揃える: `table_name\0pk`
@@ -1272,11 +1300,10 @@ impl QueryEngine {
         key.extend_from_slice(pk_value.as_bytes());
 
         let Some(raw) = tree.get(&key) else {
-            // その時点でまだ存在しなかった/既に削除されていた行
-            return Ok(QueryResponse::Rows {
-                columns: vec![],
-                rows: vec![],
-            });
+            // その時点でまだ存在しなかった/既に削除されていた行。
+            // 射影が指定されていればその列名だけ(0 行)で返す。
+            let columns = projection.clone().unwrap_or_default();
+            return Ok(QueryResponse::Rows { columns, rows: vec![] });
         };
 
         let row: Vec<String> = String::from_utf8_lossy(&raw)
@@ -1284,12 +1311,11 @@ impl QueryEngine {
             .map(|s| s.to_string())
             .collect();
 
-        let columns = columns_for(row.len());
+        let full_columns = columns_for(row.len());
+        let value_rows = vec![row.into_iter().map(Value::Text).collect::<Vec<_>>()];
+        let (columns, rows) = project(full_columns, value_rows)?;
 
-        Ok(QueryResponse::Rows {
-            columns,
-            rows: vec![row.into_iter().map(Value::Text).collect()],
-        })
+        Ok(QueryResponse::Rows { columns, rows })
     }
 
     /// **Follower Read の実データ読み取り経路への接続**(2026-08-24新設)。
@@ -1321,7 +1347,7 @@ impl QueryEngine {
                     "no commit found at or before timestamp {timestamp_nanos} (follower read timestamp is older than the oldest commit)"
                 )
             })?;
-        self.select_as_of(table, filter, commit.id.as_str().to_string())
+        self.select_as_of(table, None, filter, commit.id.as_str().to_string())
     }
 
     // ── Git-on-SQL ───────────────────────────────────────────
@@ -1579,8 +1605,8 @@ fn namespace_statement_for_tenant(stmt: Statement, tenant_id: &str) -> Statement
         Statement::Delete { table, filter } => Statement::Delete { table: ns(table, tenant_id), filter },
         Statement::Update { table, set, filter } => Statement::Update { table: ns(table, tenant_id), set, filter },
         Statement::DropTable { table } => Statement::DropTable { table: ns(table, tenant_id) },
-        Statement::SelectAsOf { table, filter, commit_id } => {
-            Statement::SelectAsOf { table: ns(table, tenant_id), filter, commit_id }
+        Statement::SelectAsOf { table, columns, filter, commit_id } => {
+            Statement::SelectAsOf { table: ns(table, tenant_id), columns, filter, commit_id }
         }
         // テーブル単位ではない文はテナント名前空間の対象外、そのまま。
         other @ (Statement::Begin
@@ -1784,11 +1810,12 @@ mod tests {
             .unwrap();
         if let QueryResponse::Rows { columns, rows } = as_of_1 {
             assert_eq!(rows.len(), 1, "row must exist as of commit_1");
-            assert_eq!(columns, vec!["id", "qty"]);
+            // 【2026-09-03】列射影を尊重: SELECT qty なので qty 列だけ返る。
+            assert_eq!(columns, vec!["qty"]);
             assert_eq!(
                 rows[0],
-                vec![Value::Text("sword".to_string()), Value::Text("1".to_string())],
-                "AS OF commit_1 must return the value as of that commit, not the latest value"
+                vec![Value::Text("1".to_string())],
+                "AS OF commit_1 must return the projected value as of that commit, not the latest value"
             );
         } else {
             panic!("expected rows");
@@ -1802,7 +1829,7 @@ mod tests {
             ))
             .unwrap();
         if let QueryResponse::Rows { rows, .. } = as_of_2 {
-            assert_eq!(rows[0][1], Value::Text("5".to_string()));
+            assert_eq!(rows[0][0], Value::Text("5".to_string()));
         } else {
             panic!("expected rows");
         }
@@ -1811,6 +1838,35 @@ mod tests {
         assert!(eng
             .execute("SELECT qty FROM items WHERE id = 'sword' AS OF COMMIT 'deadbeef'")
             .is_err());
+
+        // SELECT * / 複数列 / 不明な列 の射影挙動。
+        let star = eng
+            .execute(&format!("SELECT * FROM items WHERE id = 'sword' AS OF COMMIT '{commit_1}'"))
+            .unwrap();
+        if let QueryResponse::Rows { columns, rows } = star {
+            assert_eq!(columns, vec!["id", "qty"], "SELECT * keeps the full row");
+            assert_eq!(rows[0], vec![Value::Text("sword".into()), Value::Text("1".into())]);
+        } else {
+            panic!("expected rows");
+        }
+        let two = eng
+            .execute(&format!(
+                "SELECT qty, id FROM items WHERE id = 'sword' AS OF COMMIT '{commit_1}'"
+            ))
+            .unwrap();
+        if let QueryResponse::Rows { columns, rows } = two {
+            assert_eq!(columns, vec!["qty", "id"], "projection order is honored");
+            assert_eq!(rows[0], vec![Value::Text("1".into()), Value::Text("sword".into())]);
+        } else {
+            panic!("expected rows");
+        }
+        assert!(
+            eng.execute(&format!(
+                "SELECT nope FROM items WHERE id = 'sword' AS OF COMMIT '{commit_1}'"
+            ))
+            .is_err(),
+            "unknown projected column must error"
+        );
     }
 
     /// **タスク1(2026-08-24)**: `ReadPlan::FollowerRead`が判定する

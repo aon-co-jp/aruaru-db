@@ -98,6 +98,8 @@ pub enum Statement {
     /// 将来の拡張、下記 engine.rs のドキュコメント参照)。
     SelectAsOf {
         table: String,
+        /// None = SELECT *(内側 SELECT の列リストをそのまま流用)
+        columns: Option<Vec<String>>,
         filter: Option<(String, String)>,
         commit_id: String,
     },
@@ -362,16 +364,12 @@ fn parse_select(sql: &str) -> Result<Statement, String> {
         if commit_id.is_empty() {
             return Err("AS OF COMMIT requires a commit id".to_string());
         }
-        // 残りは普通の SELECT として再パースし、table/filterを流用する。
-        let inner = match parse_select(head)? {
-            Statement::Select { table, filter, .. } => (table, filter),
+        // 残りは普通の SELECT として再パースし、columns/table/filterを流用する。
+        let (table, columns, filter) = match parse_select(head)? {
+            Statement::Select { table, columns, filter } => (table, columns, filter),
             other => return Err(format!("AS OF COMMIT: unsupported inner statement {other:?}")),
         };
-        return Ok(Statement::SelectAsOf {
-            table: inner.0,
-            filter: inner.1,
-            commit_id,
-        });
+        return Ok(Statement::SelectAsOf { table, columns, filter, commit_id });
     }
 
     let upper = upper_full;

@@ -66,6 +66,8 @@ async fn upsert_and_commit(
 }
 
 async fn get_latest(State(pool): State<PgPool>, Path(id): Path<String>) -> Json<Value> {
+    // NOTE(2026-09-03): aruaru-wire は列を VARCHAR(text) で返す(docs/CLIENTS.md §5.1)。
+    // sqlx で i32 に直接デコードすると失敗しうるため String で受けて parse する。
     let qty: Option<i32> = sqlx::query("SELECT qty FROM items WHERE id = $1")
         .bind(&id)
         .fetch_optional(&pool)
