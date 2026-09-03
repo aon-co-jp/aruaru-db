@@ -6068,3 +6068,106 @@ passed. **Still blocked (honestly)**: HLC case-A full migration (P-HLC-3,
 over-churn); open-cuda Hopper/Ada `sgemm_fp8_weight_vendor` (needs H100/RTX40
 + cuBLASLt FP8 — this box is a GT 730); AWQ real-model E2E (no public
 GPT-2-architecture AWQ models exist).
+
+## HANDOFF追記(2026-09-03続き26) HLC P-HLC-3 = 案A 全面移行(内部フル精度 2 フィールド + 外向き u64 互換維持)
+
+**位置づけ**: 復活用メッセージ項目4(d)・§5 で「案A への全面移行は過大」と
+していた HLC 案A を、ユーザー指示「世界中の言語で Google/GitHub を調査し
+最新理論を新規設計書に活かしてから実装、実用的になるまで数回反復」に
+沿って実施した。
+
+### 追加の一次資料調査(2026-09、英語。`docs/HLC_TIMESTAMP_REDESIGN.md` §6.1)
+- **CockroachDB `util/hlc`**: `Timestamp { WallTime int64(Unix ナノ秒、
+  フル精度), Logical int32, Synthetic bool }` を**パックせず別フィールド**。
+  順序 `(WallTime, Logical)` 辞書式。`max_offset` 既定 500ms。uncertainty
+  interval `[commit_ts, commit_ts + max_offset]`。物理時刻を先食いした
+  timestamp は `Synthetic=true`。クロックは `sync.Mutex`。
+- **uhlc-rs**(Zenoh): `NTP64`(64bit、下位 4bit を論理カウンタで置換
+  ≒3.5ns 分解能)。`update_with_timestamp` は incoming が現在の物理時刻 +
+  delta(既定 500ms)を超えたら **`Err`**。`Mutex` 保護。
+- **論文** arXiv:1808.05698(Raft + HLC): 書き込みの直列化点で単調前進、
+  フォロワーは受信 HLC で `update`。
+- **学び**: 業界主流は (a) 物理をフル精度で別フィールド、(b) `Mutex` 保護
+  (案B のロックフリー CAS は 65µs 粒度という妥協の裏返し)、(c) skew 上限で
+  incoming を `Err`。
+
+### 新設計(案A、低 churn 移行)
+- 内部 `HlcTimestamp { wall_nanos: u64(切り捨て無し), logical: u32,
+  synthetic: bool }`。順序 = `(wall_nanos, logical)` 辞書式。
+  **シフト・パックが無いので u64 オーバーフローは構造的に不可能**。
+- `Hlc` は `parking_lot::Mutex` 保護(CockroachDB / uhlc-rs と同じ)。
+- **外向き u64 互換を維持**: `as_ordinal()` は案B の 65µs 射影(logical
+  >0xFFFF は上位バケットへ桁上げ)。`Hlc` が `last_ordinal` を記憶し
+  `now_ordinal()` は常に厳密単調(射影のロスで逆転しかけたら
+  `last_ordinal + 1` へクランプ)。`now_ordinal` / `observe_ordinal` /
+  `try_observe_ordinal` / `from_ordinal` は**互換シグネチャ維持** →
+  `closed_ts` / `wal_service` / GraphQL `closedTsAdvance` は一切変更不要。
+- 新 API(既存を非推奨にしない): `now_hlc` / `now_hlc_sys` / `observe_hlc`
+  (フル精度)、`HlcTimestamp::uncertainty_upper(max_offset)` = CockroachDB の
+  uncertainty interval 上端 `wall_nanos + max_offset`。
+- `ClockSkew` フィールドを `remote_wall_nanos` / `local_wall_nanos` へ改名。
+  skew 判定はフル精度ナノ秒の正確な比較(案B の 65µs 丸め無し)。
+
+### 実装
+- `crates/aruaru-dist/src/hlc.rs` 全面書き換え(21 テスト、うち新規:
+  フル精度ナノ秒が切り捨てられないこと、synthetic フラグの意味、案B 射影の
+  16bit 桁上げ、`now_ordinal` の last_ordinal クランプ、`observe_hlc` の
+  フル精度往復、`uncertainty_upper`、eq/ord が synthetic を無視すること)。
+- `aruaru-graphql`: `Query.hlcNow { wallNanos logical synthetic ordinal
+  maxOffsetMs uncertaintyUpperNanos }`(観測専用、P-HLC-3b)+
+  `HlcNowGql` 型 + テスト。
+- `docs/HLC_TIMESTAMP_REDESIGN.md` §6 に調査・新設計・フェーズを追記。
+
+### 検証
+- `cargo test -p aruaru-dist hlc::` 21、`-p aruaru-graphql` 21、
+  `-p aruaru-server` 13、`cargo build --workspace` 成功、
+  clippy(hlc.rs / graphql)警告0。
+- **実 HTTP E2E(release、`follower_read.max_offset_ms: 500`)**:
+  - `hlcNow` #1 → `wallNanos: "1788408257477589700"`(**17 桁のフル精度
+    Unix ナノ秒**、truncated ordinal ではない)、`synthetic: false`、
+    `ordinal: "1788408257477541888"`(案B 65µs 射影、下位 16bit マスク)、
+    `maxOffsetMs: 500`、`uncertaintyUpperNanos: "1788408257977589700"`
+    (= wallNanos + 5e8、正確)。
+  - `hlcNow` #2 → `wallNanos` も `ordinal` も #1 より厳密増加。
+  - `closedTsAdvance`(`nowNanos` 省略 → `hlc.now_ordinal()`)→ 従来どおり
+    有効な ordinal を返す(**後方互換 intact**)。
+- 案A 全面移行はこれで**完了扱い**(内部は完全に案A、外向き u64 は
+  後方互換の射影)。
+
+### 残り
+1. `closed_ts` の follower read staleness 判定を `uncertainty_upper`
+   ベースへ(CockroachDB の uncertainty interval、P-HLC-3c、closed_ts の
+   設計トラック。今回はやらない)。
+2. 復活用メッセージ項目5(`disaster_backup.email` は続き25 で reconcile
+   配線済み。残りは Tauri 設定タブ等)・項目6・項目7(P4〜P6)。
+
+**English summary**: HLC "case-A" full migration is done. After an
+additional primary-source pass (CockroachDB `util/hlc` keeps `WallTime
+int64` + `Logical int32` + `Synthetic bool` as **unpacked separate
+fields** under a `sync.Mutex`; uhlc-rs likewise uses a `Mutex` and
+returns `Err` when an incoming timestamp exceeds wall + delta), the
+internal representation is now `HlcTimestamp { wall_nanos: u64
+(full-precision, no truncation), logical: u32, synthetic: bool }` ordered
+lexicographically by `(wall_nanos, logical)` — **no shift, no packing, so
+the u64 overflow of the original design is structurally impossible**.
+`Hlc` is now `parking_lot::Mutex`-guarded (the lock-free CAS of case-B was
+the flip side of its 65µs-granularity compromise). The **external u64
+ordinal wire format is unchanged**: `as_ordinal()` projects to the
+case-B 65µs ordinal (carrying past 16 bits when logical overflows), and
+`Hlc` remembers `last_ordinal` so `now_ordinal()` stays strictly
+monotonic; `now_ordinal` / `observe_ordinal` / `try_observe_ordinal` /
+`from_ordinal` keep their signatures, so `closed_ts` / `wal_service` /
+GraphQL `closedTsAdvance` need **zero changes**. New API alongside:
+`now_hlc` / `observe_hlc` (full precision) and
+`HlcTimestamp::uncertainty_upper(max_offset)` (CockroachDB's uncertainty
+interval upper bound). GraphQL `Query.hlcNow` added for observability.
+Verified end-to-end over real HTTP (release): `hlcNow` returns a 17-digit
+full-precision Unix-nanosecond `wallNanos` (not a truncated ordinal), two
+successive calls strictly increase both `wallNanos` and `ordinal`,
+`uncertaintyUpperNanos == wallNanos + 500ms`, and `closedTsAdvance` (with
+`nowNanos` omitted) still works unchanged. `cargo test`: aruaru-dist hlc
+21 / aruaru-graphql 21 / aruaru-server 13; `cargo build --workspace` OK;
+clippy clean. Case-A migration is complete (internals fully case-A, the
+external u64 is a backward-compatible projection). Remaining: rebase the
+`closed_ts` follower-read staleness check onto `uncertainty_upper`
+(P-HLC-3c, a separate closed_ts track).
