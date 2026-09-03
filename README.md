@@ -56,7 +56,15 @@
 > オーバーフロー構造的に不可能。外向きの u64 ordinal(`closedTsAdvance` 等)は
 > 案B の 65µs 射影として**互換維持**。新 API `Query.hlcNow` / `now_hlc` /
 > `uncertainty_upper`。実 HTTP E2E 済み。
-> 詳細は [`CLAUDE.md`](CLAUDE.md) HANDOFF(続き20〜26)。
+> **続き27**: **P-HLC-3c/3d**。3c = `closed_ts` の follower read staleness を
+> CockroachDB の uncertainty interval(`read_ts + max_offset` の全域が
+> 閉じ済み)へ、GraphQL `planFollowerRead(mode: "uncertainty-safe")`。
+> 3d = **外向き u64 射影からシフト・パック・切り捨てを完全撤去**
+> (`as_ordinal() = wall_nanos + logical`。`& !0xFFFF` バケットも
+> `advance_locked` のバケット分岐も削除、CockroachDB `hlc.go` `Now()` と
+> ビット一致)——u64 はフル精度 Unix ナノ秒スケールになり、65µs 粒度の
+> 代償が消滅。実 HTTP E2E で `hlcNow` の `wallNanos == ordinal` を確認。
+> 詳細は [`CLAUDE.md`](CLAUDE.md) HANDOFF(続き20〜27)。
 
 > 📌 保留タスク(2026-08-06): 東芝SBM・DeepSeek技術の組み込み構想あり。詳細は[CLAUDE.md](CLAUDE.md)参照。
 

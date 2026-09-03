@@ -196,6 +196,22 @@ impl ClosedTimestampTracker {
     pub fn can_serve_read_at(&self, read_ts: Timestamp) -> bool {
         read_ts != 0 && read_ts <= self.closed_timestamp()
     }
+
+    /// **uncertainty-safe** な follower read が可能か(2026-09-03 P-HLC-3c)。
+    /// CockroachDB の uncertainty interval `[read_ts, read_ts + max_offset]`
+    /// を踏まえ、この窓の**全域**が閉じ済み(= `closed_ts >= read_ts +
+    /// max_offset`)であることを要求する。これを満たせば、この時刻で読む
+    /// トランザクションは「見落としているかもしれない未来の書き込み」に
+    /// 遭遇しない ——uncertainty restart が発生し得ない。
+    /// `max_offset_nanos == 0`(スキュー上限無効)なら `can_serve_read_at`
+    /// と同じ(従来挙動)。
+    pub fn can_serve_uncertainty_safe_read_at(
+        &self,
+        read_ts: Timestamp,
+        max_offset_nanos: u64,
+    ) -> bool {
+        read_ts != 0 && read_ts.saturating_add(max_offset_nanos) <= self.closed_timestamp()
+    }
 }
 
 /// 複数 Range の closed timestamp を束ね、Range 横断の読み取り時刻交渉と
@@ -379,6 +395,47 @@ impl ClosedTimestampCoordinator {
         }
         ReadPlan::FollowerRead { timestamp: read_ts, staleness_nanos }
     }
+
+    /// **uncertainty-safe** な exact-staleness follower read
+    /// (2026-09-03 P-HLC-3c、`HlcTimestamp::uncertainty_upper` と対)。
+    /// `plan_exact_staleness_read` と同じく `read_ts = now - staleness` を
+    /// 先に固定するが、判定を `closed_ts >= read_ts + max_offset` へ強める
+    /// ——全 Range が read_ts の uncertainty interval 上端まで閉じ済みの
+    /// ときだけ follower read を許可する。`max_offset_nanos == 0` なら
+    /// `plan_exact_staleness_read` と同じ(従来挙動、後方互換)。
+    pub fn plan_uncertainty_safe_read(
+        &self,
+        range_ids: &[u64],
+        now: Timestamp,
+        staleness_nanos: u64,
+        max_offset_nanos: u64,
+    ) -> ReadPlan {
+        if max_offset_nanos == 0 {
+            // スキュー上限無効なら uncertainty 窓は幅ゼロ = 従来の exact 判定。
+            return self.plan_exact_staleness_read(range_ids, now, staleness_nanos);
+        }
+        if range_ids.is_empty() {
+            return ReadPlan::RouteToLeaseholder { reason: "no range specified" };
+        }
+        let read_ts = now.saturating_sub(staleness_nanos);
+        let trackers = self.trackers.read();
+        for id in range_ids {
+            match trackers.get(id) {
+                Some(t) if t.can_serve_uncertainty_safe_read_at(read_ts, max_offset_nanos) => {}
+                Some(_) => {
+                    return ReadPlan::RouteToLeaseholder {
+                        reason: "closed timestamp does not yet cover the read's uncertainty interval",
+                    }
+                }
+                None => {
+                    return ReadPlan::RouteToLeaseholder {
+                        reason: "range has no closed timestamp on this replica",
+                    }
+                }
+            }
+        }
+        ReadPlan::FollowerRead { timestamp: read_ts, staleness_nanos }
+    }
 }
 
 impl Default for ClosedTimestampCoordinator {
@@ -392,6 +449,7 @@ mod tests {
     use super::*;
 
     const SEC: u64 = 1_000_000_000;
+    const MS: u64 = 1_000_000;
 
     #[test]
     fn closed_timestamp_advances_with_target_lag_and_never_regresses() {
@@ -456,6 +514,41 @@ mod tests {
             c.negotiate_bounded_staleness(&[1], 20 * SEC, 30 * SEC).timestamp(),
             Some(17 * SEC)
         );
+    }
+
+    #[test]
+    fn uncertainty_safe_read_requires_closed_ts_to_cover_the_uncertainty_interval() {
+        let c = ClosedTimestampCoordinator::new(3 * SEC);
+        let r1 = c.register_range(1);
+        r1.advance_to(20 * SEC); // closed = 17s
+
+        // now=20s, staleness=1s -> read_ts = 19s。max_offset = 500ms。
+        // uncertainty 上端 = 19.5s > closed 17s -> leaseholder へ。
+        assert_eq!(
+            c.plan_uncertainty_safe_read(&[1], 20 * SEC, SEC, 500 * MS),
+            ReadPlan::RouteToLeaseholder {
+                reason: "closed timestamp does not yet cover the read's uncertainty interval"
+            }
+        );
+        // staleness=4s -> read_ts = 16s、上端 16.5s <= closed 17s -> follower read。
+        assert_eq!(
+            c.plan_uncertainty_safe_read(&[1], 20 * SEC, 4 * SEC, 500 * MS),
+            ReadPlan::FollowerRead { timestamp: 16 * SEC, staleness_nanos: 4 * SEC }
+        );
+        // max_offset = 0 なら plan_exact_staleness_read と同じ(read_ts <= closed で可)。
+        assert_eq!(
+            c.plan_uncertainty_safe_read(&[1], 20 * SEC, SEC, 0),
+            c.plan_exact_staleness_read(&[1], 20 * SEC, SEC),
+        );
+        // 未知の Range / Range 指定なし。
+        assert!(matches!(
+            c.plan_uncertainty_safe_read(&[99], 20 * SEC, 4 * SEC, 500 * MS),
+            ReadPlan::RouteToLeaseholder { .. }
+        ));
+        assert!(matches!(
+            c.plan_uncertainty_safe_read(&[], 20 * SEC, 4 * SEC, 500 * MS),
+            ReadPlan::RouteToLeaseholder { .. }
+        ));
     }
 
     #[test]

@@ -5,32 +5,43 @@
 //! `atolab/uhlc-rs`(Zenoh)。
 //!
 //! **2026-09-03 再設計 P-HLC-3(正本: `docs/HLC_TIMESTAMP_REDESIGN.md` §6)
-//! = 案A への全面移行(低 churn 版)**:
+//! = 案A への全面移行 + P-HLC-3d = 射影からシフト・パック・切り捨てを完全撤去**:
 //!
 //! 旧・案B(2026-09-02)は「物理成分を 65.536µs 粒度へ切り捨て、下位 16bit に
 //! 論理カウンタを詰めて 1 個の `AtomicU64` に収める」方式だった。u64
 //! オーバーフローは除去できたが、**物理分解能がナノ秒 → 65µs に落ちる**という
-//! 代償があった。一次資料の再調査(CockroachDB `util/hlc` は
-//! `WallTime int64`・`Logical int32`・`Synthetic bool` をパックせず別
-//! フィールドで持つ。uhlc-rs は `Mutex` 保護。両者とも incoming が壁時計 +
-//! max_offset を超えたら `Err`)を踏まえ、**内部表現をフル精度の
-//! 2 フィールド + `synthetic` フラグへ刷新**した。
+//! 代償があった。P-HLC-3(2026-09-03 前半)で内部表現はフル精度 2 フィールドへ
+//! 刷新したが、**外向き `as_ordinal()` に案B の `& !0xFFFF` バケット射影が
+//! 残っており**、`advance_locked` も「バケットが進んだか」で分岐していた
+//! (= シフト・パックの残滓)。P-HLC-3d でこれを撤去した。
 //!
-//! - 内部: [`HlcTimestamp`] = `{ wall_nanos: u64(フル精度 Unix ナノ秒),
-//!   logical: u32, synthetic: bool }`。順序は `(wall_nanos, logical)` の
-//!   辞書式。**シフト・パックが無いので u64 オーバーフローは構造的に不可能**。
-//! - クロック本体 [`Hlc`] は `parking_lot::Mutex` 保護(業界主流。案B の
-//!   ロックフリー CAS は 65µs 粒度という妥協の裏返しだった)。
-//! - **外向き u64 互換は維持**: [`HlcTimestamp::as_ordinal`] は案B の 65µs
-//!   射影を返し、[`Hlc::now_ordinal`] / [`Hlc::observe_ordinal`] /
-//!   [`Hlc::try_observe_ordinal`] のシグネチャは不変。`closed_ts` /
-//!   `wal_service` / GraphQL の `closedTsAdvance` 等は**一切変更不要**。
-//!   `Hlc` は最後に発行した ordinal を記憶し、u64 経路は常に厳密単調
-//!   (射影のロスで逆転しかけたら `last_ordinal + 1` へクランプ)。
-//! - 新 API(既存を非推奨にはしない): [`Hlc::now_hlc`] /
-//!   [`Hlc::observe_hlc`] がフル精度 [`HlcTimestamp`] を返す。
-//!   [`HlcTimestamp::uncertainty_upper`] は CockroachDB の uncertainty
-//!   interval 上端 `wall_nanos + max_offset`。
+//! 一次資料(CockroachDB `util/hlc` は `WallTime int64`・`Logical int32`・
+//! `Synthetic bool` をパックせず別フィールド + `sync.Mutex`。uhlc-rs も
+//! `Mutex`。両者とも incoming が壁時計 + max_offset を超えたら `Err`)に忠実:
+//!
+//! - 内部: [`HlcTimestamp`] = `{ wall_nanos: u64(フル精度 Unix ナノ秒、
+//!   一切切り捨てない), logical: u32, synthetic: bool }`。順序は
+//!   `(wall_nanos, logical)` の辞書式。
+//! - クロック本体 [`Hlc`] は `parking_lot::Mutex` 保護(業界主流)。
+//! - **`advance_locked` はバケット概念を持たない**: 物理クロックが 1ns でも
+//!   進めば `wall_nanos` を採用し `logical = 0`、進んでいなければ `logical += 1`
+//!   ——CockroachDB `hlc.go` `Now()` とビット単位で同じ規則。
+//! - **`as_ordinal()` は `wall_nanos.saturating_add(logical)`**。シフトも
+//!   マスクも無い。`logical` は「物理クロックが停まっている間に発生した
+//!   同一ナノ秒内の追加イベント数」であり、ナノ秒空間へそのまま足し込む
+//!   (= その分だけ先の synthetic な時刻。`max_offset` で有界)。切り捨てが
+//!   無いので `closed_ts` 等が受け取る u64 は**フル精度の Unix ナノ秒**。
+//! - u64 経路の**厳密単調**は [`Hlc`] が `last_ordinal` を記憶してクランプ
+//!   (`logical` 畳み込みで逆転しかけたら `last_ordinal + 1`)。
+//!   [`Hlc::now_ordinal`] / [`Hlc::observe_ordinal`] / [`Hlc::try_observe_ordinal`]
+//!   のシグネチャは不変 ——`closed_ts` / `wal_service` / GraphQL
+//!   `closedTsAdvance` は**一切変更不要**。
+//! - [`HlcTimestamp::from_ordinal`] は `{ wall_nanos: ordinal, logical: 0,
+//!   synthetic: true }`(物理成分をそのまま復元。畳み込まれた `logical` の
+//!   端数は u64 経路では失うが、フル精度が要る所は [`Hlc::observe_hlc`])。
+//! - 新 API: [`Hlc::now_hlc`] / [`Hlc::observe_hlc`] がフル精度
+//!   [`HlcTimestamp`] を返す。[`HlcTimestamp::uncertainty_upper`] は
+//!   CockroachDB の uncertainty interval 上端 `wall_nanos + max_offset`。
 //!
 //! ネットワーク越しの HLC 伝播(送信時に相乗り・受信時に update)は
 //! 呼び出し側(`raft::transport` / `admin.rs::closed_ts_receive` 等)が
@@ -39,17 +50,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
-
-/// u64 ordinal 射影の 65.536µs バケット幅(案B の下位 16bit)。後方互換の
-/// ためだけに残す ——内部の [`HlcTimestamp::wall_nanos`] はフル精度ナノ秒。
-const ORDINAL_LOGICAL_BITS: u32 = 16;
-const ORDINAL_LOGICAL_MASK: u64 = (1 << ORDINAL_LOGICAL_BITS) - 1; // 0xFFFF
-const ORDINAL_BUCKET_MASK: u64 = !ORDINAL_LOGICAL_MASK; // 0xFFFF_FFFF_FFFF_0000
-
-#[inline]
-fn ordinal_bucket(wall_nanos: u64) -> u64 {
-    wall_nanos & ORDINAL_BUCKET_MASK
-}
 
 /// HLC タイムスタンプ(案A、フル精度 2 フィールド)。
 ///
@@ -78,20 +78,17 @@ impl HlcTimestamp {
     }
 
     /// 既存の `closed_ts` / `wal_service` 等が受け渡す「単調な u64 版番号」への
-    /// **射影**(案B の 65.536µs 粒度)。`wall_nanos` の下位 16bit を捨てて
-    /// バケット整列し、そこへ `logical` を詰める。`logical` が 0xFFFF を超える
-    /// (同一 65µs 窓に 65536 超のイベント)場合は上位バケットへ桁上げして
-    /// 単調性を保つ。**左シフトしないためオーバーフローしない。**
+    /// **射影**(P-HLC-3d、シフト・マスク・バケット無し)。
+    /// `wall_nanos.saturating_add(logical)` ——`wall_nanos` は切り捨てず、
+    /// `logical`(= 物理クロック停止中に発生した同一ナノ秒内の追加イベント数)を
+    /// ナノ秒空間へそのまま足し込むだけ。結果はフル精度の Unix ナノ秒スケール。
     ///
-    /// 注意: これは粗い射影であり、同一 65µs バケット内で `wall_nanos` だけが
-    /// 進んで `logical` が 0 に戻ったケースなど、`as_ordinal()` 単体では
-    /// 逆転し得る。u64 の**厳密単調**が必要なら [`Hlc::now_ordinal`] を使うこと
-    /// (`Hlc` が `last_ordinal` でクランプする)。
+    /// 注意: 物理クロックが 1ns 進んで `logical` が 0 に戻った直後など、
+    /// `as_ordinal()` 単体では前回値より小さくなり得る。u64 の**厳密単調**が
+    /// 必要なら [`Hlc::now_ordinal`] を使うこと(`Hlc` が `last_ordinal` で
+    /// クランプする)。
     pub fn as_ordinal(&self) -> u64 {
-        let bucket = ordinal_bucket(self.wall_nanos);
-        let carried_buckets = (self.logical as u64) >> ORDINAL_LOGICAL_BITS;
-        let lo = (self.logical as u64) & ORDINAL_LOGICAL_MASK;
-        bucket.saturating_add(carried_buckets << ORDINAL_LOGICAL_BITS) | lo
+        self.wall_nanos.saturating_add(self.logical as u64)
     }
 
     /// 旧名。`as_ordinal()` へ委譲する後方互換エイリアス。
@@ -101,13 +98,10 @@ impl HlcTimestamp {
     }
 
     /// u64 ordinal を `HlcTimestamp` へ復号(side transport 受信時など)。
-    /// 案B 解釈(バケット整列済み `wall_nanos` + 16bit `logical`)。
+    /// 物理成分をそのまま復元する(`synthetic = true`。u64 経路では畳み込まれた
+    /// `logical` の端数は失われる ——フル精度が要る所は [`Hlc::observe_hlc`])。
     pub fn from_ordinal(ordinal: u64) -> Self {
-        Self {
-            wall_nanos: ordinal & ORDINAL_BUCKET_MASK,
-            logical: (ordinal & ORDINAL_LOGICAL_MASK) as u32,
-            synthetic: false,
-        }
+        Self { wall_nanos: ordinal, logical: 0, synthetic: true }
     }
 
     /// CockroachDB の uncertainty interval 上端。`wall_nanos + max_offset`
@@ -237,26 +231,25 @@ impl Hlc {
     }
 
     /// ローカルイベント(書き込み等)発生時の遷移(ロック保持中に呼ぶ)。
+    /// CockroachDB `hlc.go` `Now()` とビット単位で同じ規則。**バケット無し**:
     ///
-    /// - 65µs バケットが進んだ(`ordinal_bucket(wall) > ordinal_bucket(st.wall)`)
-    ///   → `(wall, 0)` にリセット(u64 射影の単調性のため)。
-    /// - それ以外 → `wall_nanos = max(st.wall_nanos, wall)`、`logical += 1`。
-    ///   物理が進んでいなければ `synthetic = true`。
+    /// - 物理クロックが 1ns でも進んだ(`wall_now > st.wall_nanos`)
+    ///   → `wall_nanos = wall_now`、`logical = 0`、`synthetic = false`。
+    /// - それ以外(物理が停まっている / 後退)
+    ///   → `logical += 1`(同一ナノ秒内の因果前進)、`synthetic = true`。
+    ///   `logical` が u32 飽和する現実にはあり得ないケースだけ `wall_nanos` を
+    ///   1ns 進めて `logical = 0`(厳密単調を死守)。
     fn advance_locked(st: &mut HlcState, wall_now_nanos: u64) -> HlcTimestamp {
-        if ordinal_bucket(wall_now_nanos) > ordinal_bucket(st.wall_nanos) {
+        if wall_now_nanos > st.wall_nanos {
             st.wall_nanos = wall_now_nanos;
             st.logical = 0;
         } else {
-            let new_wall = st.wall_nanos.max(wall_now_nanos);
-            let new_logical = st.logical.saturating_add(1);
-            // 論理カウンタが u32 飽和した極端ケースだけ、物理を 1ns 進めて
-            // 厳密単調を守る(現実には起き得ない)。
-            if new_logical == st.logical {
-                st.wall_nanos = new_wall.saturating_add(1);
+            let bumped = st.logical.saturating_add(1);
+            if bumped == st.logical {
+                st.wall_nanos = st.wall_nanos.saturating_add(1);
                 st.logical = 0;
             } else {
-                st.wall_nanos = new_wall;
-                st.logical = new_logical;
+                st.logical = bumped;
             }
         }
         st.synthetic = st.wall_nanos > wall_now_nanos;
@@ -390,14 +383,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn as_ordinal_never_overflows_with_real_unix_nanos() {
+    fn as_ordinal_never_overflows_and_keeps_full_precision() {
         // 2026 年相当の実 Unix ナノ秒。旧々実装は wall<<16 でここが panic/ラップした。
         let real_nanos: u64 = 1_760_000_000_000_000_000;
         let ts = HlcTimestamp::new(real_nanos, 5);
-        let ord = ts.as_ordinal();
-        assert!(ord < u64::MAX);
-        // ordinal は真の壁時計から ±65535ns 以内。
-        assert!(ord >= real_nanos - ORDINAL_LOGICAL_MASK && ord <= real_nanos + ORDINAL_LOGICAL_MASK);
+        // P-HLC-3d: シフトもマスクも無い。ordinal == wall_nanos + logical。
+        assert_eq!(ts.as_ordinal(), real_nanos + 5);
+        assert_eq!(HlcTimestamp::new(real_nanos, 0).as_ordinal(), real_nanos, "logical 0 -> ordinal is exactly the nanosecond");
     }
 
     #[test]
@@ -411,20 +403,21 @@ mod tests {
     }
 
     #[test]
-    fn now_resets_logical_when_wall_clock_crosses_a_65us_bucket() {
+    fn now_resets_logical_whenever_the_physical_clock_moves_forward() {
         let hlc = Hlc::with_initial(0x10_0000, 5);
-        let ts = hlc.now_hlc(0x20_0000 + 1234); // 別バケット
-        assert_eq!(ts.wall_nanos, 0x20_0000 + 1234, "full precision preserved");
+        let ts = hlc.now_hlc(0x10_0000 + 1); // 物理が 1ns でも進めば logical リセット
+        assert_eq!(ts.wall_nanos, 0x10_0000 + 1, "full precision preserved");
         assert_eq!(ts.logical, 0);
         assert!(!ts.synthetic);
     }
 
     #[test]
-    fn now_bumps_logical_and_advances_wall_within_the_same_bucket() {
+    fn now_bumps_logical_only_when_the_physical_clock_does_not_advance() {
         let hlc = Hlc::with_initial(0x10_0000, 5);
-        let ts = hlc.now_hlc(0x10_0000 + 42); // 同一 65µs バケット
-        assert_eq!(ts.wall_nanos, 0x10_0000 + 42, "wall advances to the real reading");
+        let ts = hlc.now_hlc(0x0F_0000); // 物理クロックが後退
+        assert_eq!(ts.wall_nanos, 0x10_0000, "wall held");
         assert_eq!(ts.logical, 6);
+        assert!(ts.synthetic, "advanced by logical only -> synthetic");
     }
 
     #[test]
@@ -450,16 +443,14 @@ mod tests {
     }
 
     #[test]
-    fn now_ordinal_is_strictly_monotonic_even_when_wall_advances_within_a_bucket() {
-        // 案A→案B 射影のロスがあっても Hlc::now_ordinal は last_ordinal で
-        // クランプするので厳密単調。
+    fn now_ordinal_is_strictly_monotonic_even_when_the_projection_would_regress() {
+        // 物理クロックが 1ns 進んで logical が 0 に戻ると as_ordinal 単体は
+        // 前回値を下回り得る。Hlc::now_ordinal は last_ordinal でクランプ。
         let hlc = Hlc::with_initial(0x30_0000, 900);
         let mut prev = 0u64;
         for i in 0..2000u64 {
-            // 同一バケット内で wall をじりじり進める(射影だと logical が 0 に
-            // 戻り得るケース)。
             let o = {
-                let wall = 0x30_0000 + i; // すべて同じ 65µs バケット
+                let wall = 0x30_0000 + i;
                 let mut st = hlc.state.lock();
                 let ts = Hlc::advance_locked(&mut st, wall);
                 let o = ts.as_ordinal().max(st.last_ordinal.saturating_add(1));
@@ -472,34 +463,32 @@ mod tests {
     }
 
     #[test]
-    fn ordinal_projection_is_monotonic_across_bucket_boundary() {
+    fn ordinal_projection_is_monotonic_when_the_clock_sticks_then_jumps_forward() {
         let hlc = Hlc::new();
         let mut prev = 0u64;
         for _ in 0..60_000 {
-            let o = hlc.now_hlc(0x30_0000 + 7).as_ordinal();
+            let o = hlc.now_hlc(0x30_0000 + 7).as_ordinal(); // 物理据え置き → logical だけ増える
             assert!(o > prev);
             prev = o;
         }
-        let after = hlc.now_hlc(0x40_0000).as_ordinal();
-        assert!(after > prev, "bucket boundary must not invert: {after} !> {prev}");
-        assert_eq!(after & ORDINAL_LOGICAL_MASK, 0, "new bucket resets logical to 0");
+        let after = hlc.now_hlc(0x40_0000).as_ordinal(); // 物理が大きく前進
+        assert!(after > prev, "forward jump must not invert: {after} !> {prev}");
     }
 
     #[test]
-    fn as_ordinal_carries_into_the_next_bucket_when_logical_exceeds_16_bits() {
+    fn as_ordinal_folds_logical_into_nanosecond_space_and_stays_monotonic() {
         let hlc = Hlc::with_initial(0x50_0000, 0);
         let mut prev = 0u64;
-        let mut carried = false;
+        let mut last = 0u64;
         for _ in 0..70_000 {
-            let ts = hlc.now_hlc(0x50_0000); // 同一 wall・同一バケット → logical だけ増える
+            let ts = hlc.now_hlc(0x50_0000); // 物理据え置き → logical++ のみ
             let o = ts.as_ordinal();
-            assert!(o > prev, "monotonic through the 16-bit carry: {o} !> {prev}");
+            assert_eq!(o, 0x50_0000 + ts.logical as u64, "ordinal == wall_nanos + logical, nothing else");
+            assert!(o > prev, "monotonic: {o} !> {prev}");
             prev = o;
-            if o >= 0x51_0000 {
-                carried = true;
-            }
+            last = o;
         }
-        assert!(carried, "as_ordinal should have carried past the 65us bucket");
+        assert_eq!(last, 0x50_0000 + 70_000, "70k stuck-clock events -> exactly +70000 ns");
     }
 
     #[test]
@@ -542,7 +531,7 @@ mod tests {
     #[test]
     fn observe_ordinal_pulls_local_clock_forward() {
         let hlc = Hlc::with_initial(0x10_0000, 0);
-        let remote_ord = (0x80_0000u64 & ORDINAL_BUCKET_MASK) | 7;
+        let remote_ord = 0x80_0007u64;
         hlc.observe_ordinal(remote_ord, 0x10_0000);
         let next = hlc.now_hlc(0x10_0000).as_ordinal();
         assert!(next > remote_ord, "local clock must advance past an observed remote ordinal");
