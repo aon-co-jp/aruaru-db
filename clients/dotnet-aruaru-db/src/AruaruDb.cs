@@ -60,7 +60,13 @@ public sealed class AruaruDb : IAsyncDisposable
     /// </summary>
     public static AruaruDb Connect(string connectionString)
     {
-        var dataSource = NpgsqlDataSource.Create(connectionString);
+        // aruaru-db は pg_catalog の完全な問い合わせに対応していないため、
+        // Npgsql 既定のブートストラップ時型読み込み(pg_type 等への内部
+        // クエリ)が "SELECT: missing FROM" で失敗する。NoTypeLoading で
+        // このブートストラップ自体を無効化する(実サーバ往復検証で発覚)。
+        var builder = new NpgsqlDataSourceBuilder(connectionString);
+        builder.ConnectionStringBuilder.ServerCompatibilityMode = Npgsql.ServerCompatibilityMode.NoTypeLoading;
+        var dataSource = builder.Build();
         return new AruaruDb(dataSource, ownsDataSource: true);
     }
 

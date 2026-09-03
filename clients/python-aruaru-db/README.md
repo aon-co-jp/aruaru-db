@@ -78,5 +78,25 @@ old = db.query_as_of_val("SELECT qty FROM items WHERE id = %s", commit, ("sword"
 ```bash
 python -m unittest discover -s tests   # ネットワーク不要(4 件)= green
 ```
-実サーバ往復は別途 `asyncpg` / `psycopg` を入れて DSN を通す(この環境では
-未実施、`../../docs/CLIENTS.md` §6 参照)。
+実サーバ往復は別途 `asyncpg` / `psycopg` を入れて DSN を通す。
+
+## 検証状況(2026-09-03、asyncpg 実サーバ往復)
+
+- `pip install asyncpg`(0.31.0)を実際に導入し、`live-check.py`
+  (`ARUARU_DB_DSN=... python live-check.py`)でローカル `aruaru-server`
+  (:5433)への実往復を試みたが、**`asyncpg.connect()`/
+  `asyncpg.create_pool()` の時点でハング**(30秒タイムアウトで強制終了、
+  `pool=False` の単一接続でも同様)し、`commit()`/`query_as_of()` まで
+  到達しなかった。**未解決**。
+- 推定原因(未確証): asyncpg は接続確立時に PostgreSQL の型カタログへ
+  イントロスペクションクエリを発行する(内蔵の `introspection.py`)。
+  同時期に `.NET`(Npgsql)コネクタでも同種の症状
+  (`NpgsqlDataSource` の既定ブートストラップが `pg_catalog` の完全
+  実装を前提とし `"SELECT: missing FROM"` で失敗)が実際に発生し、
+  `ServerCompatibilityMode.NoTypeLoading` で回避できた(`../dotnet-
+  aruaru-db/README.md` 参照)。asyncpg 側でも同様の型イントロスペクション
+  回避オプション(`server_settings`・カスタム型コーデック登録による
+  ブートストラップ短絡等)が無いか、次回調査すること。
+- Rust `tokio-postgres`(`rust-aruaru-db`)/ Node `pg`(`node-aruaru-db`)/
+  .NET `Npgsql`(`NoTypeLoading` 設定後)はいずれも実サーバ往復まで
+  green 済み(2026-09-03)——asyncpg 固有の問題である可能性が高い。

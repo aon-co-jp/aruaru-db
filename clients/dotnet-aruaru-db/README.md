@@ -61,9 +61,15 @@ ARUARU_DB_TEST_CONNSTRING="Host=127.0.0.1;Port=5433;Username=app;Password=secret
   10/10 green**(この開発機には .NET 8 ランタイムが無く `net10.0` の
   共有ランタイムのみだったため、`tests/Aruaru.Db.Tests.csproj` に
   `<RollForward>LatestMajor</RollForward>` を追加して解消)。
-- **実サーバ往復(`ARUARU_DB_TEST_CONNSTRING`)は未実施**(この
-  セッションでは環境変数未設定のため `LiveCommitAndAsOfRoundTrip` は
-  早期 return でスキップされる設計)。設計は `rust-aruaru-db`/
-  `node-aruaru-db`(実サーバ往復まで 2026-09-03 に green 確認済み)と
-  同じ(commit_id 検証 → 結果の位置ベース読み取り → `AS OF COMMIT` の
-  安全な文字列連結)。
+- **実サーバ往復(`ARUARU_DB_TEST_CONNSTRING`)= 2026-09-03 実施・
+  passed(10/10)**。ただし途中で**実バグを1件発見・修正**:
+  `NpgsqlDataSource.Create(connectionString)` の既定動作(接続確立時に
+  `pg_type` 等へブートストラップ問い合わせして型情報を読み込む)が、
+  aruaru-db が `pg_catalog` を完全実装していないため
+  `"SELECT: missing FROM"` で失敗していた。
+  `NpgsqlDataSourceBuilder` + `ServerCompatibilityMode.NoTypeLoading`
+  でこのブートストラップ自体を無効化して解消(`Connect()` 内、
+  他言語のドライバでも同種の型システム自動探索を無効化する設定が
+  必要になり得る——Python `asyncpg` は 2026-09-03 時点で同種の問題に
+  遭遇し、こちらは未解決のまま〈下記〉)。修正後は`connect` →
+  `commit()` → `queryAsOf()` の一連が実サーバに対して green。
