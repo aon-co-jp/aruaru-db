@@ -94,7 +94,16 @@
 > (db, table)): list the sync state of every columnar replica without
 > knowing table names. HLC case-A full migration remains future work
 > (`docs/HLC_TIMESTAMP_REDESIGN.md` P-HLC-3). See `CLAUDE.md` HANDOFF
-> entries (continued 20–24).
+> **cont. 26**: **HLC case-A full migration (P-HLC-3)**. After an
+> additional primary-source pass (CockroachDB `util/hlc` keeps
+> WallTime/Logical as unpacked separate fields under a Mutex; uhlc-rs
+> likewise), the internal representation is now `HlcTimestamp {
+> wall_nanos: u64 (no truncation), logical: u32, synthetic: bool }` — no
+> shift, no packing, so the original u64 overflow is structurally
+> impossible. The external u64 ordinal (`closedTsAdvance` etc.) is kept
+> **backward-compatible** as the case-B 65µs projection. New API:
+> `Query.hlcNow` / `now_hlc` / `uncertainty_upper`. Verified end-to-end
+> over real HTTP. See `CLAUDE.md` HANDOFF entries (continued 20–26).
 >
 > Note: `open-cuda`/`open-directx` remain out of scope for this SET
 > policy for now (no HTTP surface), but this is a provisional call, not

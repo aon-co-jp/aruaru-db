@@ -49,7 +49,14 @@
 > リモート値拒否まで確認)。**続き24**: `Query.htapReplicasAll`(全テーブル
 > 一覧、TiFlash `TIFLASH_REPLICA` が全 (db,table) 行を返すのと同様、テーブル
 > 名を知らなくても全列レプリカの同期状態を一覧できる)を追加。
-> 詳細は [`CLAUDE.md`](CLAUDE.md) HANDOFF(続き20〜24)。
+> **続き26**: **HLC 案A 全面移行(P-HLC-3)**。一次資料の再調査(CockroachDB
+> `util/hlc` は WallTime/Logical をパックせず別フィールド + Mutex、uhlc-rs も
+> 同様)を踏まえ、内部を `HlcTimestamp { wall_nanos: u64(切り捨て無し),
+> logical: u32, synthetic: bool }` へ刷新——シフト・パックが無いので u64
+> オーバーフロー構造的に不可能。外向きの u64 ordinal(`closedTsAdvance` 等)は
+> 案B の 65µs 射影として**互換維持**。新 API `Query.hlcNow` / `now_hlc` /
+> `uncertainty_upper`。実 HTTP E2E 済み。
+> 詳細は [`CLAUDE.md`](CLAUDE.md) HANDOFF(続き20〜26)。
 
 > 📌 保留タスク(2026-08-06): 東芝SBM・DeepSeek技術の組み込み構想あり。詳細は[CLAUDE.md](CLAUDE.md)参照。
 
