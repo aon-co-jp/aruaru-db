@@ -58,9 +58,12 @@ Apache Maven 3.9.16 をこの開発機へ実際にネットから導入し(Java 
 [INFO] BUILD SUCCESS
 ```
 
-**未検証のまま残る部分**: 実サーバ往復テストは(実 `aruaru-server` を
-起動していないため)`Skipped: 1` として正しくスキップされた——実際に
-稼働中サーバーへの接続確認はこのパスでも未実施。設計・API 形状は
+**2026-09-06追記: 実サーバ往復も検証済み**——ローカルに実際に
+`aruaru-server`を起動し、`ARUARU_DB_TEST_URL="jdbc:postgresql://
+127.0.0.1:5433/app"`を設定した上で`mvn test`を再実行したところ
+`Tests run: 3, Failures: 0, Errors: 0, Skipped: 0`(スキップ無し、
+`liveCommitAndAsOfRoundTrip`含め全件実行)で`BUILD SUCCESS`。
+commit → `AS OF COMMIT`往復が実際に成功することを確認した。設計・API 形状は
 同一パターンの [`rust-aruaru-db`](../rust-aruaru-db)・
 [`node-aruaru-db`](../node-aruaru-db)(いずれも 2026-09-03 実サーバ
 往復検証済み)に倣っている。拡張プロトコル(`PreparedStatement`)は

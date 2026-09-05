@@ -6968,3 +6968,143 @@ connector table, §1 language matrix in both languages) and
   実`aruaru-server`起動)をGo/Java/Ruby全てで実施、(2) Python相互運用
   モジュールを含む別のMojoディストリビューション/バージョンの調査、
   (3) Python(`asyncpg`)の実サーバ往復も依然未実施のまま(続き31参照)。
+
+## HANDOFF追記(2026-09-06) Go/Java/Ruby/Rust/Mojo 全て実サーバ往復まで完了 + Mojo旧バージョンでPython相互運用が実機動作確認 + `rust-axum`サンプルの実バグ3件を発見・修正 + aruaru-wireの深刻なグローバルトランザクションバグを発見
+
+前回HANDOFF(2026-09-05)の「次にすべきこと」を全て実施。加えて未着手だった
+`rust-axum`(Poem/RPoemが同じパターンで使うAxum+sqlxサンプル)を実際に
+ビルド可能なプロジェクトへ組み立てて実行したところ、サンプル自体のバグ
+3件と、`aruaru-wire`本体の深刻なバグ1件を発見した。
+
+### 1. Go/Java/Ruby/Rust の実サーバ往復(ARUARU_DB_TEST_*)を全て実施・成功
+ローカルに実`aruaru-server`(`--pg-port 5433/5434`、`ARUARU_USERS=app:
+secret`)を起動し:
+- **Go**: `ARUARU_DB_TEST_DSN=postgres://app:secret@127.0.0.1:5433/app
+  go test -run Live -v ./...` → `TestLiveCommitAndAsOfRoundTrip ... PASS`。
+- **Java**: `ARUARU_DB_TEST_URL=jdbc:postgresql://127.0.0.1:5433/app
+  mvn test` → `Tests run: 3, Failures: 0, Errors: 0, Skipped: 0`
+  (`BUILD SUCCESS`)。
+- **Ruby**: `gem install pg`(Windows用プリコンパイル済みバイナリ
+  `pg-1.6.3-x64-mingw-ucrt`が取得され、Cコンパイラ環境無しで導入できた
+  ——当初の懸念は誤りだった)+ `ARUARU_DB_TEST_DSN=... rspec` →
+  `6 examples, 0 failures`。
+- **Rust(`rust-aruaru-db`)**: 2026-09-03時点で既に検証済みだったが、
+  今回は**WSL2 Ubuntu上でネイティブLinuxビルド**(`rustup`経由でRust
+  1.98.1をWSLへ導入)としても再実行し、`cargo test --release --
+  --ignored` → `test tests::live_commit_and_as_of_round_trip ... ok`
+  (Windows/Linux両方で往復成功を確認)。
+
+各READMEに実行結果を反映済み。
+
+### 2. Mojoコネクタ: 旧バージョン(0.26.2.0)でPython相互運用が実機動作
+前回HANDOFF(2026-09-05)で「Mojo 1.0.0にはPython相互運用モジュールが
+無い」と判明していたが、`pixi search -c https://conda.modular.com/max
+mojo`でこのチャンネルに旧リリース(`0.26.2.0`等)も配布されていることを
+発見。`pixi add "mojo==0.26.2.0"`で実際に導入したところ、
+**`from python import Python`が実際にコンパイル・実行に成功**
+(`Implicit standard library imports are deprecated`という将来向け
+非推奨警告のみ)。続けてPython側の依存(`aruaru_db`、
+`psycopg[binary]`)を導入し、`aruaru_db.mojo`/`test_aruaru_db.mojo`
+本体を**実際にコンパイル・実行**:
+- ネットワーク不要テスト4件: `mojo run test_aruaru_db.mojo` →
+  `test_aruaru_db.mojo: all checks passed`(`ARUARU_DB_TEST_DSN`未設定
+  時は`skipped`メッセージ付き)。
+- **実サーバ往復**: `ARUARU_DB_TEST_DSN="host=<WSLからWindowsホストへの
+  デフォルトゲートウェイIP> port=... user=app password=secret
+  dbname=aruaru" mojo run test_aruaru_db.mojo` → `skipped`メッセージが
+  出なくなり、`test_live_commit_and_as_of_round_trip`本体
+  (`AruaruDb.connect`→`commit`→`AS OF COMMIT`往復)が実際に実行され
+  成功したことを確認(`all checks passed`)。
+
+**結論**: Mojo 1.0.0系での動作は引き続き未確認だが、旧バージョン
+(0.26.2.0)を`pixi add "mojo==0.26.2.0"`で指定すれば、このコネクタは
+設計通りに完全動作することを実機で確認できた。
+
+### 3. `clients/rust-axum/main.rs`の実バグ3件を発見・修正
+このファイルは2026-09-03の新設時点で「Cargo.tomlを伴わないレシピ」に
+留まり、**一度も実際にビルド・実行されたことがなかった**。今回、実際に
+`Cargo.toml`を組み立てビルド可能なプロジェクトとしてWSL2 Linux上で
+実行したところ、以下3件の実バグが判明した(いずれも修正済み):
+1. `pool.begin()`(sqlxの明示トランザクション)が`BeginFailed`で失敗し、
+   後続で「transaction already active」というプール接続状態異常を
+   誘発した——他の全コネクタと同じ「明示的トランザクションでラップ
+   しない」パターンへ揃えて撤去。
+2. `get_latest`/`get_as_of`が`Option<i32>`で列をデコードしようとして
+   `ColumnDecode`エラーで失敗(コメント自体は「Stringで受けてparseする」
+   と正しく書かれていたが実装コードが追従しておらず、コメントと
+   コードが乖離していた——このエコシステムで繰り返し見つかる
+   ドキュメント/実装の乖離パターンの新たな実例)。`Option<String>`で
+   受けてから`i32`へparseする形に修正。
+3. `get_as_of`が`AS OF COMMIT $2`をバインドパラメータとして渡そうと
+   していたが、aruaru-wireは`AS OF COMMIT`句をバインドパラメータとして
+   受け付けない(他の全コネクタが共通して行う「commit_idを検証してから
+   文字列連結する」設計から外れていた)。`is_safe_commit_id`
+   (英数字+`-`/`_`、≤128文字)で検証してから安全に文字列連結する形へ
+   修正。
+修正後、実際に`upsert→commit→最新値取得→再upsert`が正しいJSONを返す
+ことを実機で確認した(`AS OF COMMIT`往復自体は下記4番のバグにより
+このセッションでは最終確認できず、次回の課題として残る)。
+
+### 4. `aruaru-wire`の深刻な実バグを発見(修正は専用タスクへ切り出し)
+上記3の検証中、**全く別の新規接続からの単純なautocommit INSERT**でも
+「transaction already active」エラーが再現することに気づき調査した
+結果、`crates/aruaru-query/src/engine.rs`の`QueryEngine`が
+`txn: parking_lot::Mutex<Option<TxnState>>`という**単一の共有インスタンス
+上のグローバル状態**でトランザクションを管理していることが根本原因と
+判明した(`aruaru-wire`は`Arc<QueryEngine>`を全pgwire接続で共有する
+設計、`crates/aruaru-wire/src/lib.rs`76行目付近)。
+
+**影響**: どれか1つのクライアントが`BEGIN`を送った後、`COMMIT`/
+`ROLLBACK`せずに(クライアント側のエラー・クラッシュ・プロトコル
+不整合等の理由で)処理が中断すると、`txn`はSomeのまま残り続け、
+**以後サーバー全体で全く別の接続からの全ての`BEGIN`(および暗黙の
+autocommit書き込みの一部)が「transaction already active」で永久に
+失敗するようになる**。サーバー再起動以外に回復手段がない(同じ
+プロセスが生き続ける限り、他の接続がCOMMIT/ROLLBACKを送っても、
+それは別セッションが張ったつもりの見えないトランザクションの後始末に
+しかならず、根本的には解消しない)。
+
+**再現手順(実機で確認済み)**: sqlxの`pool.begin()`がサーバー側では
+成功したがクライアント側で何らかの理由により`BeginFailed`として
+処理された状態を作った後、全く別の新規接続(Python psycopg3)から
+プレーンな`INSERT`を実行したところ`psycopg.errors.SyntaxError:
+transaction already active`で失敗することを確認。
+
+**対応**: `parking_lot::Mutex<Option<TxnState>>`という単一グローバル
+状態を、pgwire接続(セッション)ごとに分離した状態へ設計変更する必要が
+あり、`aruaru-wire`/`aruaru-query`/`aruaru-graphql`/`aruaru-server`
+複数クレートにまたがる影響範囲の調査を要する規模のため、専用の
+フォローアップタスクとして切り出した(`spawn_task`で
+`task_d3c43773`として記録、詳細な修正方針・再現手順はタスクの
+プロンプト本文を参照)。**このバグ自体は`rust-axum`サンプルの実装
+ミスとは独立に、どんなクライアントであっても一度BEGINしてCOMMIT/
+ROLLBACKし忘れれば発生しうる根本的な設計上の欠陥である**——今回は
+コネクタのテスト作業中に偶然踏み抜いた形だが、実運用でも同様の
+条件(クライアントの異常切断等)で発生しうるため優先度は高いと判断する。
+
+### 5. Rustのメインフレーム対応・「AWSのメインフレーム」の技術的整理
+ユーザーからの一連の質問への回答をここに記録する。
+- **z/OS実機(z/Architecture)へのRust対応**: rustc/LLVMには公式の
+  z/OSターゲットが存在せず、非公式コミュニティ実装も未成熟——これは
+  「開発すれば動く」種類の制約ではなく、コンパイラ自体の技術的制約
+  である。COBOL/Java/Cのようなメインフレーム到達経路(ODBC/EXEC SQL/
+  JZOS等)がRustには無い。
+- **「AWSのメインフレーム」の実体**: これは実際のIBM Z実機
+  (z/Architecture)ではなく、**AWS Mainframe Modernization**
+  (COBOL/PL1資産を標準的なAWS Linux基盤〈x86_64 EC2〉へリホスト/
+  リファクタリングするサービス)である。つまり実体は**普通のLinux**
+  であり、Rust/Poem/RPoemは追加のポーティング作業なしに、既存の
+  Linux向けビルドがそのまま動作する。「z/OS実機」と「AWSメインフレーム」
+  は技術的に全く別物である点を明確にした。
+- 上記を実証する形で、`rust-aruaru-db`をWSL2 Ubuntu(x86_64-unknown-
+  linux-gnu、AWS Mainframe Modernizationが実際にワークロードを再ホスト
+  する先と同種の環境)上でネイティブビルド・実サーバ往復まで成功させた
+  (上記1番参照)。
+
+- 次にすべきこと: (1) `task_d3c43773`(aruaru-wireのグローバル
+  トランザクションバグ修正)、(2) `rust-axum`の`AS OF COMMIT`往復の
+  最終確認(上記4番のバグにより今回未完了)、(3) Python(`asyncpg`)の
+  実サーバ往復、(4) PHP(`php-cli`/`php-pgsql`はWSLへ導入済み、
+  `php-aruaru-db`にはテストファイル自体が存在しないため新規作成が
+  必要)・COBOL(`gnucobol4`はWSLへ`sudo -u root`経由で導入済み、
+  `clients/cobol/ARUARU.cob`の実コンパイル・実行は未実施)の実検証。

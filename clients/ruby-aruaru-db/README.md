@@ -78,10 +78,23 @@ Finished in 0.06589 seconds
 `lib/aruaru/db.rb`は`require "pg"`を`.connect`メソッド内でのみ遅延
 実行するため、`double`(モック)ベースの単体テスト(本 gem の主要な
 検証対象)は`pg` gem自体が未導入でも実行できることを確認した。
-**未検証のまま残る部分**: `pg` gem(libpq のネイティブバインディング、
-Windows でのビルドには追加のCコンパイラ環境が必要)は今回導入して
-いないため、`gem build`・実サーバ往復(`Client.connect`経由)は
-未実施。設計は `rust-aruaru-db`/`node-aruaru-db`(実サーバ往復まで
+
+**2026-09-06追記: `pg` gem導入+実サーバ往復も検証済み**——
+`gem install pg`を実行したところ、Windows用の**プリコンパイル済み
+バイナリ**(`pg-1.6.3-x64-mingw-ucrt`)が取得され、Cコンパイラ環境
+無しでインストールできた(当初想定していた「追加のCコンパイラ環境が
+必要」という懸念は誤りだった)。ローカルに実際に`aruaru-server`を
+起動し、`ARUARU_DB_TEST_DSN="host=127.0.0.1 port=5433 user=app
+password=secret dbname=app"`を設定した上で`rspec`を再実行:
+
+```
+......
+
+6 examples, 0 failures
+```
+
+(既存5件+live round trip 1件、commit → `AS OF COMMIT`往復が実際に
+成功することを確認した)。設計は `rust-aruaru-db`/`node-aruaru-db`(実サーバ往復まで
 2026-09-03 に green 確認済み)/`php-aruaru-db` と同じ
 (commit_id 検証 → 位置ベースの `aruaru_commit` 列読み取り →
 `AS OF COMMIT` の安全な文字列連結)を踏襲している。
