@@ -64,13 +64,24 @@ gem build aruaru-db.gemspec
 
 ## 検証状況
 
-**未検証**(この開発環境に `ruby`/`gem` コマンドが導入されていないため
-`bundle exec rspec`/`gem build` を実行できなかった——`ruby -v`/`gem -v`
-がコマンド未検出)。コードは `rust-aruaru-db`/`node-aruaru-db`(実サーバ
-往復まで 2026-09-03 に green 確認済み)/`php-aruaru-db` と同じ設計
+**2026-09-05: rspec実行は実際に検証済み**——RubyInstaller公式exe
+(3.3.6)をこの開発機へ実際にネットから導入し、`gem install rspec`
+(純Rubyのため`pg`のネイティブ拡張ビルド不要)→`rspec`を実行:
+
+```
+.....
+
+Finished in 0.06589 seconds
+5 examples, 0 failures
+```
+
+`lib/aruaru/db.rb`は`require "pg"`を`.connect`メソッド内でのみ遅延
+実行するため、`double`(モック)ベースの単体テスト(本 gem の主要な
+検証対象)は`pg` gem自体が未導入でも実行できることを確認した。
+**未検証のまま残る部分**: `pg` gem(libpq のネイティブバインディング、
+Windows でのビルドには追加のCコンパイラ環境が必要)は今回導入して
+いないため、`gem build`・実サーバ往復(`Client.connect`経由)は
+未実施。設計は `rust-aruaru-db`/`node-aruaru-db`(実サーバ往復まで
+2026-09-03 に green 確認済み)/`php-aruaru-db` と同じ
 (commit_id 検証 → 位置ベースの `aruaru_commit` 列読み取り →
-`AS OF COMMIT` の安全な文字列連結)を踏襲しており、目視レビュー・
-`double`(モック)ベースのユニットテストの記述は行ったが、実際の
-`rspec` 実行・`gem build`・実サーバ往復はこのセッションでは検証できて
-いない。Ruby ツールチェーンが使える環境で上記コマンドを実行して確認
-すること。
+`AS OF COMMIT` の安全な文字列連結)を踏襲している。

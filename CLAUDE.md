@@ -6908,3 +6908,63 @@ honestly, matching the standard already set by
 `clients/ruby-aruaru-db/README.md`. Updated `docs/CLIENTS.md` (§0.2
 connector table, §1 language matrix in both languages) and
 `clients/README.md`; did not touch any other connector's files.
+
+## HANDOFF追記(2026-09-05) Go/Java/Ruby ツールチェーンを実際にネットから導入 + Mojoの「未検証」判断を訂正(WSL経由で実導入・実機検証)
+
+**経緯**: 続き32/33 が「この開発機にGo/Maven/Ruby/Mojoのツールチェーンが
+無いため未検証」としていたことに対し、ユーザーから「ネットから入手
+できないのですか?」との指摘。実際に試したところ、いずれもネットワーク
+経由で導入可能だった——**「ツールチェーンが無い」という前提そのものを
+再検証すべきだった**という反省点を明記する。
+
+### 実際に導入したもの
+- **Go 1.23.4**(公式`go.dev`から直接zip取得、`C:\devtools\go`へ展開)。
+  `go version`で動作確認済み。
+- **Apache Maven 3.9.16**(`dlcdn.apache.org`から直接zip取得、Java 17は
+  この開発機に既導入済みだったためJDK別途インストール不要)。
+  `mvn -v`で動作確認済み。
+- **Ruby 3.3.6**(RubyInstaller公式exe、`/VERYSILENT`でサイレント
+  インストール)。`ruby -v`/`gem -v`で動作確認済み。
+- **WSL2 Ubuntu**(既にこの開発機に導入済みと判明)+ **pixi**
+  (Modular公式、`curl -fsSL https://pixi.sh/install.sh | sh`)経由で
+  **Mojo 1.0.0コンパイラ**を実際に導入・`mojo run`での実行に成功
+  (詳細は`clients/mojo-aruaru-db/README.md`の2026-09-05追記参照——
+  Python相互運用モジュール自体がこの配布チャンネルに同梱されていない
+  という、より具体的な別の制約が判明した)。
+
+### 実際にビルド・テストまで完了(Go/Java/Ruby)
+- **Go**: `go mod tidy`(`jackc/pgx/v5`等の依存を実際に取得、`go.sum`
+  生成・コミット)→`go build ./...`成功→`go test ./... -v`で
+  `TestIsSafeCommitID`・`TestQueryAsOfRejectsUnsafeCommitIDBeforeTouching
+  TheNetwork`が実際にPASS、`TestLiveCommitAndAsOfRoundTrip`は
+  `ARUARU_DB_TEST_DSN`未設定のため正しくSKIP。
+- **Java**: `mvn test`で`BUILD SUCCESS`、`Tests run: 3, Failures: 0,
+  Errors: 0, Skipped: 1`(スキップは実サーバ往復テスト、同上の理由)。
+- **Ruby**: `gem install rspec`(純Rubyのため`pg`のネイティブ拡張
+  ビルド不要と判明)→`rspec`で`5 examples, 0 failures`。
+  `lib/aruaru/db.rb`が`require "pg"`を`.connect`メソッド内でのみ
+  遅延実行する設計のため、`pg` gem自体を導入しなくても`double`
+  ベースの単体テストは実行できることを実機で確認した。
+
+**Mojo**: 上述の通りコンパイラ自体の導入・実行(`mojo run`)には成功
+したが、`aruaru_db.mojo`が依存する`from python import Python`が
+`error: unable to locate module 'python'`で解決できないことを実機
+確認済み(このMojo 1.0.0配布チャンネルにPython相互運用モジュールが
+含まれていない)。Mojo 1.0の言語仕様変更(`fn`→`def`、`let`→`var`、
+`len(s)`/`s[i]`→`s.byte_length()`/`s[byte=i]`)に合わせて
+`aruaru_db.mojo`/`test_aruaru_db.mojo`の構文は修正済みで、Python
+相互運用を使わない部分(`is_safe_commit_id`)は実際にコンパイル・
+実行し正しい結果を得ることを確認した(詳細は
+`clients/mojo-aruaru-db/README.md`参照)。
+
+**教訓(今後のセッション共通の指針として記録)**: 「この開発機に
+コマンドが無い」という事実確認は、「ネットから入手できない」ことの
+証明にはならない。特にGo/Java/Ruby/Node/Pythonのような主要言語の
+公式配布物は大抵ZIP/公式インストーラで即座に取得できるため、
+「ツールチェーン不在→未検証のまま次へ」と結論する前に、まず
+ダウンロード・インストールを試みること。
+
+- 次にすべきこと: (1) 実サーバ往復(`ARUARU_DB_TEST_*`環境変数、
+  実`aruaru-server`起動)をGo/Java/Ruby全てで実施、(2) Python相互運用
+  モジュールを含む別のMojoディストリビューション/バージョンの調査、
+  (3) Python(`asyncpg`)の実サーバ往復も依然未実施のまま(続き31参照)。

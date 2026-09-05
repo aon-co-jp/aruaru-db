@@ -26,6 +26,15 @@
 #   経路のみ使うなら `asyncpg` は不要)がインストールされている必要が
 #   ある。詳細・検証状況は README.md を参照。
 #
+# **2026-09-05追記(構文): Mojo 1.0(`fn`廃止→`def`、`let`廃止→`var`、
+# `inout self`廃止→`self`、参照はREADME.mdの検証状況を参照)へ追従した。
+# ただし本ファイルはこのMojo 1.0リリース(pixi/conda.modular.com/max
+# チャンネル、WSL Ubuntu上)で実際に`from python import Python`が
+# 解決できない(`unable to locate module 'python'`)ことを実機確認済み
+# ——この構文修正自体は将来pythonモジュールが利用可能な環境/バージョンで
+# 活きるが、現状このコネクタ全体はまだ動作未確認のままである(README.md
+# 参照)。**
+#
 # 正本 / source of truth: ../../docs/CLIENTS.md
 
 from python import Python
@@ -45,17 +54,21 @@ from python import PythonObject
 # repo: alnum + `-`/`_`, 1..=128 chars). This does NOT go through the
 # Python interop layer — like every other connector here, the safety
 # check itself happens natively, before any network I/O or driver call.
-fn is_safe_commit_id(id: String) -> Bool:
-    let n = len(id)
+def is_safe_commit_id(id: String) -> Bool:
+    # 2026-09-05: Mojo 1.0はStringのUTF-8曖昧性のため`len(s)`/`s[i]`を
+    # 廃止し明示的なアクセサへ変更した。commit_idは英数字+`-`/`_`のみを
+    # 許可するASCII専用文字集合のため、バイト単位アクセス
+    # (`byte_length()`/`s[byte=i]`)が意味的に正しい。
+    var n = id.byte_length()
     if n == 0 or n > 128:
         return False
     for i in range(n):
-        let c = id[i]
-        let is_digit = c >= "0" and c <= "9"
-        let is_upper = c >= "A" and c <= "Z"
-        let is_lower = c >= "a" and c <= "z"
-        let is_dash = c == "-"
-        let is_underscore = c == "_"
+        var c = id[byte=i]
+        var is_digit = c >= "0" and c <= "9"
+        var is_upper = c >= "A" and c <= "Z"
+        var is_lower = c >= "a" and c <= "z"
+        var is_dash = c == "-"
+        var is_underscore = c == "_"
         if not (is_digit or is_upper or is_lower or is_dash or is_underscore):
             return False
     return True
@@ -68,7 +81,7 @@ fn is_safe_commit_id(id: String) -> Bool:
 # Raised by `query_as_of` when the given commit id is not a safe literal.
 # Mojo's exception story is still evolving, so callers should match on the
 # Error's message text.
-fn _invalid_commit_id_message(id: String) -> String:
+def _invalid_commit_id_message(id: String) -> String:
     return (
         "commit id '"
         + id
@@ -100,7 +113,7 @@ fn _invalid_commit_id_message(id: String) -> String:
 struct AruaruDb:
     var _py_db: PythonObject
 
-    fn __init__(inout self, py_db: PythonObject):
+    def __init__(out self, py_db: PythonObject):
         self._py_db = py_db
 
     # dsn: libpq 形式("host=... port=5433 dbname=... user=... password=...")
@@ -110,9 +123,9 @@ struct AruaruDb:
     # dsn: either libpq key-value form or a "postgresql://" URL — passed
     # straight through to psycopg.
     @staticmethod
-    fn connect(dsn: String) raises -> AruaruDb:
-        let aruaru_db_mod = Python.import_module("aruaru_db")
-        let py_db = aruaru_db_mod.AruaruDbSync.connect(dsn)
+    def connect(dsn: String) raises -> AruaruDb:
+        var aruaru_db_mod = Python.import_module("aruaru_db")
+        var py_db = aruaru_db_mod.AruaruDbSync.connect(dsn)
         return AruaruDb(py_db)
 
     # raw(): 内部の Python オブジェクト(`aruaru_db.AruaruDbSync` インスタンス)
@@ -122,18 +135,18 @@ struct AruaruDb:
     #
     # Returns the underlying Python object as-is, for anything this thin
     # wrapper doesn't cover.
-    fn raw(self) -> PythonObject:
+    def raw(self) -> PythonObject:
         return self._py_db
 
-    fn execute(self, sql: String) raises:
+    def execute(self, sql: String) raises:
         _ = self._py_db.execute(sql)
 
     # commit: 全テーブルをスナップショットし、新しい commit_id を返す
     # (`SELECT aruaru_commit('message')`)。
     #
     # commit: snapshots all tables and returns the new commit id.
-    fn commit(self, message: String) raises -> String:
-        let cid = self._py_db.commit(message)
+    def commit(self, message: String) raises -> String:
+        var cid = self._py_db.commit(message)
         return String(cid)
 
     # query_as_of: VersionlessAPI ── base_select(`AS OF COMMIT` を含まない
@@ -149,18 +162,18 @@ struct AruaruDb:
     # validated *natively in Mojo* via `is_safe_commit_id` before it ever
     # crosses into the Python interop layer — matching every other
     # connector's "reject before touching the network" design.
-    fn query_as_of(self, base_select: String, commit_id: String) raises -> PythonObject:
+    def query_as_of(self, base_select: String, commit_id: String) raises -> PythonObject:
         if not is_safe_commit_id(commit_id):
             raise Error(_invalid_commit_id_message(commit_id))
         return self._py_db.query_as_of(base_select, commit_id)
 
-    fn query_as_of_val(self, base_select: String, commit_id: String) raises -> PythonObject:
+    def query_as_of_val(self, base_select: String, commit_id: String) raises -> PythonObject:
         if not is_safe_commit_id(commit_id):
             raise Error(_invalid_commit_id_message(commit_id))
         return self._py_db.query_as_of_val(base_select, commit_id)
 
 
-fn main() raises:
+def main() raises:
     # モジュールとして import された時にも、`mojo run aruaru_db.mojo` で
     # 直接実行された時にも困らないよう、ネットワーク不要の自己診断だけ
     # 行う小さな `main`。実際の接続例は README.md を参照。

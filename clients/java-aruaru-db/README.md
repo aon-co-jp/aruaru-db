@@ -48,12 +48,20 @@ mvn -f clients/java-aruaru-db/pom.xml test   # ユニットテスト(ネット�
 
 ## 検証状況
 
-**未検証**——この開発環境に Maven(`mvn`)/JDK が存在しないため、
-`mvn test` 自体を実行できていない。ネットワーク不要なユニットテスト
-(`isSafeCommitId`・不正 commit_id の即時拒否)を `AruaruDbTest.java` に
-用意してあるので、Maven が使える環境で確認すること。実サーバ往復は
-未実施(この環境に到達可能な aruaru-server もこのパスでは未起動)。
-設計・API 形状は同一パターンの [`rust-aruaru-db`](../rust-aruaru-db)・
+**2026-09-05: ビルド・ネットワーク不要テストは実際に検証済み**——
+Apache Maven 3.9.16 をこの開発機へ実際にネットから導入し(Java 17は
+既導入済み)、`mvn test` を実行:
+
+```
+[INFO] Running tokyo.aon.aruaru.db.AruaruDbTest
+[WARNING] Tests run: 3, Failures: 0, Errors: 0, Skipped: 1
+[INFO] BUILD SUCCESS
+```
+
+**未検証のまま残る部分**: 実サーバ往復テストは(実 `aruaru-server` を
+起動していないため)`Skipped: 1` として正しくスキップされた——実際に
+稼働中サーバーへの接続確認はこのパスでも未実施。設計・API 形状は
+同一パターンの [`rust-aruaru-db`](../rust-aruaru-db)・
 [`node-aruaru-db`](../node-aruaru-db)(いずれも 2026-09-03 実サーバ
 往復検証済み)に倣っている。拡張プロトコル(`PreparedStatement`)は
 aruaru-wire 側で 2026-07-14 に対応済み。
