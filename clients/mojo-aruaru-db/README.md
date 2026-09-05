@@ -152,23 +152,57 @@ libpq 形式・`postgresql://` URL のどちらも `psycopg`/`asyncpg` がその
    時期)や、将来Python相互運用が復活/別パッケージとして提供された
    場合は、本ファイルの構文修正済みの土台がそのまま活きる見込み。
 
+**2026-09-06追記: 旧バージョン(0.26.2.0)で完全に動作確認できた**——
+`pixi search -c https://conda.modular.com/max mojo`でこのチャンネルには
+1.0.0以外に`1.0.0b2`/`1.0.0b1`/`0.26.2.0`等の旧リリースも配布されて
+いることを確認し、`pixi add "mojo==0.26.2.0"`で実際に導入したところ、
+**Python相互運用が正しく機能した**(`from python import Python`は
+`Implicit standard library imports are deprecated`という将来的な
+非推奨警告のみでコンパイル・実行に成功、`Python.import_module("sys")`
+経由で実際にホストのPythonバージョン文字列を取得できた)。
+
+続けて`pixi add python`+`pip install "psycopg[binary]"`+
+`pip install -e clients/python-aruaru-db`でPython側の依存を導入し、
+**`aruaru_db.mojo`/`test_aruaru_db.mojo`本体を実際にコンパイル・
+実行**:
+
+```
+$ mojo run test_aruaru_db.mojo
+test_live_commit_and_as_of_round_trip: skipped (set ARUARU_DB_TEST_DSN to run)
+test_aruaru_db.mojo: all checks passed
+```
+
+(ネットワーク不要テスト4件——`is_safe_commit_id`受理/拒否/過長ID拒否・
+`query_as_of`の事前拒否——全てpassed)。
+
+**さらに実 `aruaru-server` を起動し `ARUARU_DB_TEST_DSN` を設定した
+上で再実行したところ、実サーバ往復まで成功した**:
+
+```
+$ ARUARU_DB_TEST_DSN="host=172.22.0.1 port=5433 user=app password=secret dbname=aruaru" mojo run test_aruaru_db.mojo
+test_aruaru_db.mojo: all checks passed
+```
+
+(`skipped`メッセージが出なくなり、`test_live_commit_and_as_of_round_
+trip`本体——`AruaruDb.connect`→`commit`→`AS OF COMMIT`往復——が
+実際に実行され成功したことを確認。WSL2からWindowsホストのポートへは
+デフォルトゲートウェイのIPアドレス〈`ip route`の`default`行〉経由で
+到達できた)。
+
 **まとめ(誇張しない)**: 「Mojoはこの開発機にインストールできない」
 という当初の判断は誤りで、**WSL2経由で実際にインストール・実行
-できた**。その上で判明したのは「インストール不可能」ではなく
-「このMojo 1.0.0配布物にPython相互運用モジュールが無い」という、
-より具体的で別の制約だった。
+できた**。当初1.0.0チャンネルで「Python相互運用モジュールが無い」と
+判明した後、**同じconda.modular.com/maxチャンネルの旧バージョン
+(0.26.2.0)を導入することでPython相互運用が実際に機能し、
+このコネクタは設計通りにネットワーク不要テスト・実サーバ往復の
+両方で動作することを実機で確認できた**。1.0.0系での動作は依然未確認
+だが、実用上は0.26.2.0のように`from python import Python`を持つ
+バージョンを`pixi add "mojo==0.26.2.0"`で指定すれば問題なく使える。
 
 **次に必要な作業(この README を読んだ人向け)**:
 
-1. Python相互運用モジュールを含む別のMojoディストリビューション/
-   バージョン(プレ1.0系、または将来のPython相互運用復活版)を入手し、
-   `mojo build aruaru_db.mojo`のコンパイルを再試行する。あるいは
-   Modular公式に`from python import Python`の現行提供チャンネルを
-   問い合わせる。
-2. コンパイルが通った場合、セットアップ手順でPython側の依存
-   (`aruaru_db`、`psycopg[binary]`)を導入し、ネットワーク不要のテスト
-   (`is_safe_commit_id`系3件・`query_as_of`の事前拒否1件)が green に
-   なることを確認する。
-3. 実 `aruaru-server` を起動し `ARUARU_DB_TEST_DSN` を設定した上で
-   `test_live_commit_and_as_of_round_trip` を実行し、実際に commit /
-   `AS OF COMMIT` の往復ができることを確認する。
+1. Mojo 1.0.0系で改めてPython相互運用が復活/提供されるようになった
+   場合の再検証(現状は0.26.2.0系での動作確認に留まる)。
+2. CI/配布物としてどちらのMojoバージョンを推奨とするか(0.26.2.0の
+   ような旧バージョンへピン留めするか、Python相互運用復活を待つか)の
+   方針検討。

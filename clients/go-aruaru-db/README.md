@@ -51,9 +51,18 @@ Go 1.23.4 をこの開発機へ実際にネットから導入(公式`go.dev`配�
 PASS
 ```
 
-**未検証のまま残る部分**: 実 `aruaru-server` への往復
-(`TestLiveCommitAndAsOfRoundTrip`)は `ARUARU_DB_TEST_DSN` 未設定のため
-今回もスキップされた(稼働中サーバーを別途起動していない)。
+**2026-09-06追記: 実サーバ往復も検証済み**——ローカルに実際に
+`aruaru-server`(`--pg-port 5433`、`ARUARU_USERS=app:secret`)を起動し、
+`ARUARU_DB_TEST_DSN="postgres://app:secret@127.0.0.1:5433/app"`を設定した
+上で`go test -run Live -v ./...`を実行:
+
+```
+=== RUN   TestLiveCommitAndAsOfRoundTrip
+--- PASS: TestLiveCommitAndAsOfRoundTrip (0.10s)
+PASS
+```
+
+commit → `AS OF COMMIT`往復が実際に成功することを確認した。
 
 ```bash
 cd clients/go-aruaru-db
