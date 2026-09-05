@@ -35,14 +35,29 @@ VARCHAR(text)で返るため、文字列として受けて parse すること。
 
 ## 検証状況
 
-**未検証**——この開発環境に Go ツールチェーン(`go` コマンド)が存在
-しないため、`go build`/`go test`/`go vet` のいずれも実行できていない。
-`aruaru_test.go` にネットワーク不要なユニットテスト
-(`IsSafeCommitID`)と、`ARUARU_DB_TEST_DSN` 設定時のみ走る実サーバ往復
-テストを用意してある。Go 環境がある場所で
+**2026-09-05: ビルド・ネットワーク不要テストは実際に検証済み**——
+Go 1.23.4 をこの開発機へ実際にネットから導入(公式`go.dev`配布zip)し、
+`go mod tidy`(`jackc/pgx/v5`等の依存を実際に取得)→`go build ./...`
+(成功)→`go test ./... -v`を実行:
+
+```
+=== RUN   TestIsSafeCommitID
+--- PASS: TestIsSafeCommitID (0.00s)
+=== RUN   TestQueryAsOfRejectsUnsafeCommitIDBeforeTouchingTheNetwork
+--- PASS: TestQueryAsOfRejectsUnsafeCommitIDBeforeTouchingTheNetwork (0.00s)
+=== RUN   TestLiveCommitAndAsOfRoundTrip
+    aruaru_test.go:64: set ARUARU_DB_TEST_DSN to run against a live aruaru-server
+--- SKIP: TestLiveCommitAndAsOfRoundTrip (0.00s)
+PASS
+```
+
+**未検証のまま残る部分**: 実 `aruaru-server` への往復
+(`TestLiveCommitAndAsOfRoundTrip`)は `ARUARU_DB_TEST_DSN` 未設定のため
+今回もスキップされた(稼働中サーバーを別途起動していない)。
 
 ```bash
 cd clients/go-aruaru-db
+go mod tidy   # 初回のみ、依存を go.sum へ解決
 go build ./...
 go test ./...
 ARUARU_DB_TEST_DSN="postgres://app:secret@127.0.0.1:5433/app" go test -run Live ./...
