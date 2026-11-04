@@ -11,6 +11,7 @@
 
 pub mod admin_resolvers;
 pub mod admin_types;
+pub mod connect;
 
 use std::sync::Arc;
 
@@ -270,6 +271,11 @@ async fn graphql_handler(
     let token = req.header("x-admin-token").map(|v| v.to_string());
     let batch_req = gql_req.0.data(GraphqlAdminToken(token));
     schema.execute_batch(batch_req).await.into()
+}
+
+pub fn graphql_endpoint_for_schema(schema: AruaruSchema) -> impl poem::Endpoint {
+    use poem::EndpointExt;
+    graphql_handler.data(schema)
 }
 
 pub fn graphql_endpoint(engine: Arc<QueryEngine>, admin_ctx: AdminCtx) -> impl poem::Endpoint {

@@ -17,6 +17,7 @@ async-graphql.workspace    = true
 async-graphql-poem.workspace = true
 serde.workspace            = true
 serde_json.workspace       = true
+rust-json.workspace        = true
 anyhow.workspace           = true
 tracing.workspace          = true
 hex.workspace              = true
