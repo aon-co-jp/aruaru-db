@@ -475,26 +475,11 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
             .at("/disaster-email-backup/verify", post(verify_disaster_email_backup));
     }
     route
-        .at("/backup", get(list_backups).post(create_backup))
-        .at("/backup/restore", post(restore_backup))
-        .at("/backup/schedule", get(get_schedule).post(set_schedule))
-        .at("/migrate/test", post(migrate_test))
-        .at("/migrate/preview", post(migrate_preview))
-        .at("/migrate/run", post(migrate_run))
-        .at("/migrate/instance", post(migrate_instance))
         // 【2026-08-29 再設計 P2/P3】`/admin/parallel*` は全撤廃。
         // 設定 = 宣言的 `aruaru.yaml: query.parallel`(ホットリロード)、
         // 実効値 = GraphQL `parallelConfig` query、
         // 分散プラン = GraphQL `explainDistributed` query(実ロジック移植済み)、
         // ジョブ一覧 = GraphQL `parallelJobs` query。
-        .at("/federation", get(list_federation).post(register_federation))
-        .at("/federation/test", post(federation_test))
-        .at("/federation/drop", post(drop_federation))
-        .at("/federation/query", post(federated_query))
-        .at("/cluster", get(cluster_status))
-        .at("/cluster/node", post(cluster_node))
-        .at("/cluster/rebalance", post(cluster_rebalance))
-        .at("/cluster/propose", post(cluster_propose))
         // 【2026-08-31 REST完全撤廃】ephemeral SQL pod は `EphemeralRunner`
         // trait注入(`aruaru_dist::ephemeral`)によりGraphQL
         // `Mutation.ephemeralQuery`へ移行済み(`admin_shared.rs`/
@@ -515,7 +500,6 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         // ノード間 side transport の受信(`/receive`)・配布トリガー
         // (`/publish`、いつ誰に配布するかを人間が指示する制御面)は B4 として
         // 残置——受信の実体は既に `binary_transport.rs` のバイナリ経路。
-        .at("/closed-timestamp/receive", post(closed_ts_receive))
         .at("/closed-timestamp/publish", post(closed_ts_publish))
         // 【2026-08-29(続き10)REST完全撤廃】WAL サービス(status/append/page/
         // image-layer)は GraphQL `walService`/`walPage` query・`walAppend`/
@@ -526,13 +510,6 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         // ・`objectTablePrune` mutationへ完全移行済み(REST→GraphQL段階
         // 移行の既定方針に基づき、以後 object-table にRESTルートは持たない
         // ——これを他エンドポイント撤廃の雛形とする)。
-        .at("/registry", get(registry_list))
-        .at("/registry/summary", get(registry_summary))
-        .at("/registry/crawl", post(registry_crawl))
-        .at("/registry/test", post(registry_test_connection))
-        // Raft ノード間 RPC 受信エンドポイント
-        .at("/raft/append", post(raft_append))
-        .at("/raft/vote", post(raft_vote))
         // 【2026-08-29(続き4)REST完全撤廃】APIキー自動ライフサイクル管理の
         // 参照・破棄(旧 `GET /admin/keys/status`・`POST /admin/keys/revoke`)は
         // GraphQL `keyStatus` query / `revokeKeys` mutation へ完全移行済み
@@ -960,56 +937,6 @@ fn cluster_rebalance(state: Data<&Arc<AdminState>>) -> Json<Value> {
     }))
 }
 
-// ── Raft ノード間 RPC 受信 ──────────────────────────────────────
-
-/// AppendEntries 受信 (Leader → このノード)
-#[handler]
-fn raft_append(
-    state: Data<&Arc<AdminState>>,
-    Json(req): Json<aruaru_dist::AppendEntriesReq>,
-) -> Json<Value> {
-    let Some(node) = state.cluster_node() else {
-        return Json(json!({ "term": 0, "success": false, "match_index": 0, "from": 0 }));
-    };
-    let result = node.append_entries(
-        req.term,
-        req.prev_log_index,
-        req.prev_log_term,
-        req.entries,
-        req.leader_commit,
-    );
-    // commit が進んでいれば適用
-    node.apply_committed();
-    Json(json!({
-        "term": result.term,
-        "success": result.success,
-        "match_index": result.match_index,
-        "from": node.node_id(),
-    }))
-}
-
-/// RequestVote 受信 (Candidate → このノード)
-#[handler]
-fn raft_vote(
-    state: Data<&Arc<AdminState>>,
-    Json(req): Json<aruaru_dist::RequestVoteReq>,
-) -> Json<Value> {
-    let Some(node) = state.cluster_node() else {
-        return Json(json!({ "term": 0, "vote_granted": false, "from": 0 }));
-    };
-    let result = node.request_vote(
-        req.term,
-        req.candidate_id,
-        req.last_log_index,
-        req.last_log_term,
-    );
-    Json(json!({
-        "term": result.term,
-        "vote_granted": result.granted,
-        "from": node.node_id(),
-    }))
-}
-
 /// クライアント書き込みを Raft 経由で提案 (Leader のみ受理)
 ///
 /// **2026-07-25追記(gap (c) 対応)**: 以前はここで`crate::cluster::
@@ -1222,47 +1149,6 @@ async fn verify_disaster_email_backup(req: &Request, state: Data<&Arc<AdminState
 // - `/closed-timestamp/publish` … 「いつ・誰に配布するか」を人間/運用
 //   ツールが指示する制御トリガー(データプレーンの生転送ではない)。
 //   実際の転送は `BinaryTcpSideTransport`(生 TCP)経由。P4 で再検討。
-
-#[derive(Debug, Deserialize)]
-struct ClosedTsReceiveRequest {
-    updates: Vec<ClosedTsUpdate>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClosedTsUpdate {
-    range_id: u64,
-    closed_timestamp: aruaru_dist::Timestamp,
-}
-
-/// `POST /admin/closed-timestamp/receive` — side transport の受信側
-/// (2026-08-24新設・タスク2)。他ノード(leaseholder)から
-/// `HttpSideTransport::publish_to`経由で届いた closed timestamp 更新を
-/// このノードの`ClosedTimestampCoordinator`へ取り込む(follower側)。
-#[handler]
-fn closed_ts_receive(state: Data<&Arc<AdminState>>, Json(req): Json<ClosedTsReceiveRequest>) -> Json<Value> {
-    let updates: Vec<(u64, aruaru_dist::Timestamp)> =
-        req.updates.iter().map(|u| (u.range_id, u.closed_timestamp)).collect();
-    let advanced = state.closed_ts.apply_closed_timestamp_updates(&updates);
-    // 【2026-09-02 HLC 再設計 P-HLC-2】リモートから届いた closed timestamp の
-    // 最大値でローカル HLC を前進させる(送信時に相乗り・受信時に update、
-    // という HLC の因果伝播。ここでの「時刻」は closed_ts の u64 ordinal)。
-    if let Some(max_closed) = updates.iter().map(|(_, ts)| *ts).max() {
-        let wall = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        // max_offset(クロックスキュー上限)が設定されていれば、遠すぎる
-        // 未来の closed-ts は HLC を汚染しないよう拒否する(検査版を使う)。
-        if let Err(skew) = state.hlc.try_observe_ordinal(max_closed, wall) {
-            tracing::warn!(%skew, "closed_ts_receive: rejected a remote closed timestamp beyond max_offset");
-        }
-    }
-    Json(json!({
-        "success": true,
-        "received": updates.len(),
-        "advanced": advanced,
-    }))
-}
 
 #[derive(Debug, Deserialize)]
 struct ClosedTsPublishRequest {

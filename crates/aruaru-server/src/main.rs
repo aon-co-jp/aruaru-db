@@ -515,9 +515,8 @@ async fn main() -> anyhow::Result<()> {
         // mutation でもそのまま保てる。`KeyGuardian` は `build_schema` が
         // `AdminCtx.keyring` と同一インスタンスを schema data へ渡す。
 
-        let app = Route::new()
-            .at("/healthz", get(healthz))
-            .at("/graphql", aruaru_graphql::graphql_endpoint(
+        let gql_schema = aruaru_graphql::build_schema(
+
                 gql_engine.clone(),
                 aruaru_graphql::AdminCtx {
                     engine: gql_engine.clone(),
@@ -542,7 +541,12 @@ async fn main() -> anyhow::Result<()> {
                     hlc: Some(hlc_for_graphql.clone()),
                     columnar: columnar_for_graphql.clone(),
                 },
-            ))
+            
+        );
+        let app = Route::new()
+            .at("/healthz", get(healthz))
+            .at("/graphql", aruaru_graphql::graphql_endpoint_for_schema(gql_schema.clone()))
+            .nest("/", aruaru_graphql::connect::connect_endpoint(gql_schema.clone()))
             .at("/graphql/sdl", get(subgraph_sdl))
             .nest("/admin", admin::admin_routes(admin_state))
             // Web 版 Admin (別オリジン) からのアクセスを許可

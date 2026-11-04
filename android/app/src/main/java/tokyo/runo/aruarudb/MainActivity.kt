@@ -224,30 +224,35 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * aruaru-db管理API `GET /admin/cluster`(`crates/aruaru-server/src/
+     * aruaru-db管理API(Connect) `POST /open_runo.aruaru.admin.v1.Admin/ClusterStatus`(`crates/aruaru-server/src/
      * admin.rs::cluster_status`)へ接続し、クラスタの統計情報を取得する。
      * このAPIはaruaru-db本体が既に提供しているエンドポイントであり、この
      * アプリはそれをHTTP経由で叩くだけ(サーバー機能自体は実装しない)。
      */
-    private fun checkClusterStatus(baseUrl: String, log: StringBuilder): Boolean {
+    private fun checkClusterStatus(baseUrl: String, log: StringBuilder, adminToken: String? = null): Boolean {
         return try {
-            val url = URL("$baseUrl/admin/cluster")
+            val url = URL("$baseUrl/open_runo.aruaru.admin.v1.Admin/ClusterStatus")
             val conn = url.openConnection() as HttpURLConnection
             conn.connectTimeout = 5000
             conn.readTimeout = 5000
-            conn.requestMethod = "GET"
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.setRequestProperty("content-type", "application/json")
+            // 管理トークン(x-admin-token)は端末側の設定で与える。未設定なら 401 になる。
+            adminToken?.let { conn.setRequestProperty("x-admin-token", it) }
+            conn.outputStream.use { it.write("{}".toByteArray()) }
             val code = conn.responseCode
-            log.appendLine("GET $url -> $code")
+            log.appendLine("POST $url -> $code")
             if (code == 200) {
                 val body = conn.inputStream.bufferedReader().readText()
-                val json = JSONObject(body)
+                val json = JSONObject(body) // Connect は選択したフィールドの中身をそのまま返す
                 val stats = json.optJSONObject("stats")
                 if (stats != null) {
-                    log.appendLine("total_nodes: ${stats.optInt("total_nodes")}")
-                    log.appendLine("healthy_nodes: ${stats.optInt("healthy_nodes")}")
-                    log.appendLine("total_ranges: ${stats.optInt("total_ranges")}")
-                    log.appendLine("table_count: ${stats.optInt("table_count")}")
-                    log.appendLine("under_replicated: ${stats.optBoolean("under_replicated")}")
+                    log.appendLine("total_nodes: ${stats.optInt("totalNodes")}")
+                    log.appendLine("healthy_nodes: ${stats.optInt("healthyNodes")}")
+                    log.appendLine("total_ranges: ${stats.optInt("totalRanges")}")
+                    log.appendLine("table_count: ${stats.optInt("tableCount")}")
+                    log.appendLine("under_replicated: ${(stats.optJSONArray("underReplicated")?.length() ?: 0) > 0}")
                 }
                 conn.disconnect()
                 true

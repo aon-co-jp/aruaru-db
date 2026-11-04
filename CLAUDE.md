@@ -7220,3 +7220,11 @@ ROLLBACKし忘れれば発生しうる根本的な設計上の欠陥である**�
 - **WASM по-прежнему остаётся технологией для интерфейса.** Изменилось лишь то, что вызываемый им API теперь построен на Connect.
 - Интерфейсы, форма которых задана внешним стандартом (ACME, обратные вызовы OAuth, вебхуки сторонних сервисов, проверки работоспособности, статические файлы, OTLP), остаются обычным HTTP.
 - **Если есть сомнения — выбирайте Connect.**
+
+## REST→Connect移行状況(2026-11-05、API方針〈REST全廃・gRPC/Connect〉の反映)
+- 管理操作は Connect の単純呼び出し `POST /open_runo.aruaru.admin.v1.Admin/<Method>`(JSON、`x-admin-token`認証、失敗は`{"code","message"}`、JSONはRS-JSON `parse_secure`で上限・重複キー検査)。実装は`crates/aruaru-graphql/src/connect.rs`(既存の管理リゾルバを呼ぶ薄い層。21メソッド: Registry/RegistrySummary/ListBackups/GetBackupSchedule/ClusterStatus/ListFederatedSources/PreviewSource/ExplainDistributed/CreateBackup/RestoreBackup/SetBackupSchedule/ClusterNodeOp/RebalanceCluster/ClusterPropose/RegisterFederatedSource/DropFederatedSource/FederatedQuery/TestSourceConnection/RunMigration/CrawlRegistry/TestRegistryConnection)。
+- **移した(REST削除)**: `/admin/backup*`・`/admin/migrate/{test,preview,run,instance}`・`/admin/federation*`・`/admin/cluster*`・`/admin/registry*`(19経路)。呼び出し元の管理画面(Tauri)とAndroidをConnectへ変更。`/admin/migrate/instance`は中身が「受理」を返すだけのスタブだったため削除(Tauriの`migrate_instance`は未実装エラー)。
+- **残した(2026-11-05更新)**: `/admin/disaster-email-backup*`(feature gate、既定ビルドでは無効)、`/admin/closed-timestamp/publish`(運用者が配布先を指示する制御トリガー。実転送は `BinaryTcpSideTransport`)、デモweb `/api/status`・`/api/rebalance`(`web/`、`aruaru-db-web.service`)、`columnar_pod` の `/columnar/*`。ノード間の旧REST受信 `/admin/raft/{append,vote}`・`/admin/closed-timestamp/receive` は、送信側が既に `binary_transport` だったため**削除済み**。
+- **既知の差**: 旧 `closed_ts_receive` は受信時にローカルHLCを前進させていたが、バイナリ受信経路(`serve_binary_raft`)にはHLC観測の配線が無い(元からの差。別途対応が必要)。
+- **例外**: `/healthz`、`/graphql/sdl`(Cosmo規格)、PostgreSQLワイヤー互換、`/graphql`(問い合わせ)。
+- **未了**: 管理系GraphQL Mutationの削除、`admin.rs`/`cluster.rs` の未使用関数の整理(ビルド警告)、Tauri画面のブラウザ確認(未ビルド)、README/PORTINGへの反映。
