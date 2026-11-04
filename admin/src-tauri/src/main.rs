@@ -37,29 +37,36 @@ fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-async fn admin_get(base: &str, path: &str) -> Result<Value, String> {
+/// 管理操作は Connect の単純呼び出し(`POST /open_runo.aruaru.admin.v1.Admin/<Method>`、JSON)。
+/// 認証は環境変数 `ARUARU_DB_ADMIN_TOKEN` の値を `x-admin-token` で送る。
+/// 失敗は `{"code","message"}` を Err にして返す。
+async fn connect(base: &str, method: &str, body: Value) -> Result<Value, String> {
     let client = http_client()?;
-    client
-        .get(format!("{base}{path}"))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json::<Value>()
-        .await
-        .map_err(|e| e.to_string())
+    let mut rb = client
+        .post(format!("{base}/open_runo.aruaru.admin.v1.Admin/{method}"))
+        .json(&body);
+    if let Ok(t) = std::env::var("ARUARU_DB_ADMIN_TOKEN") {
+        rb = rb.header("x-admin-token", t);
+    }
+    let resp = rb.send().await.map_err(|e| e.to_string())?;
+    let ok = resp.status().is_success();
+    let v = resp.json::<Value>().await.map_err(|e| e.to_string())?;
+    if ok {
+        Ok(v)
+    } else {
+        Err(format!("{}: {}", v["code"].as_str().unwrap_or("error"), v["message"].as_str().unwrap_or("")))
+    }
 }
 
+/// 【未移行・REST 残り】`/admin/migrate/instance` と `/admin/disaster-email-backup*` は
+/// GraphQL/Connect に等価がまだ無く、サーバ側 REST のまま残っている(CLAUDE.md「REST→Connect移行状況」参照)。
 async fn admin_post(base: &str, path: &str, body: Value) -> Result<Value, String> {
     let client = http_client()?;
-    client
-        .post(format!("{base}{path}"))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .json::<Value>()
-        .await
-        .map_err(|e| e.to_string())
+    let mut rb = client.post(format!("{base}{path}")).json(&body);
+    if let Ok(t) = std::env::var("ARUARU_DB_ADMIN_TOKEN") {
+        rb = rb.header("x-admin-token", t);
+    }
+    rb.send().await.map_err(|e| e.to_string())?.json::<Value>().await.map_err(|e| e.to_string())
 }
 
 // ── 既存: GraphQL / 接続 ──────────────────────────────────────
@@ -127,13 +134,13 @@ pub struct BackupRequest {
 
 #[tauri::command]
 async fn create_backup(base_url: String, req: BackupRequest) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/backup", serde_json::to_value(req).unwrap()).await
+    connect(&base_url, "CreateBackup", json!({ "config": { "branch": req.branch, "kind": req.kind } })).await
 }
 
 #[tauri::command]
 async fn list_backups(base_url: String) -> Result<Vec<Value>, String> {
-    let v = admin_get(&base_url, "/admin/backup").await?;
-    Ok(v["backups"].as_array().cloned().unwrap_or_default())
+    let v = connect(&base_url, "ListBackups", json!({})).await?;
+    Ok(v.as_array().cloned().unwrap_or_default())
 }
 
 #[tauri::command]
@@ -143,10 +150,11 @@ async fn restore_backup(
     target_branch: String,
     point_in_time: Option<String>, // RFC3339; PITR 指定時
 ) -> Result<Value, String> {
-    admin_post(
+    let _ = point_in_time; // PITR 指定は Connect の RestoreBackup に未対応(従来のRESTでも未使用)
+    connect(
         &base_url,
-        "/admin/backup/restore",
-        json!({ "backup_id": backup_id, "target_branch": target_branch, "point_in_time": point_in_time }),
+        "RestoreBackup",
+        json!({ "input": { "backupId": backup_id, "targetBranch": target_branch } }),
     )
     .await
 }
@@ -158,10 +166,10 @@ async fn set_backup_schedule(
     enabled: bool,
     kind: String,
 ) -> Result<Value, String> {
-    admin_post(
+    connect(
         &base_url,
-        "/admin/backup/schedule",
-        json!({ "cron": cron, "enabled": enabled, "kind": kind }),
+        "SetBackupSchedule",
+        json!({ "input": { "cron": cron, "enabled": enabled, "kind": kind } }),
     )
     .await
 }
@@ -214,17 +222,27 @@ pub struct MigrationConfig {
 
 #[tauri::command]
 async fn test_source_connection(base_url: String, source: String, uri: String) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/migrate/test", json!({ "source": source, "uri": uri })).await
+    connect(&base_url, "TestSourceConnection", json!({ "source": source, "uri": uri })).await
 }
 
 #[tauri::command]
 async fn preview_source_schema(base_url: String, source: String, uri: String) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/migrate/preview", json!({ "source": source, "uri": uri })).await
+    connect(&base_url, "PreviewSource", json!({ "source": source, "uri": uri })).await
 }
 
 #[tauri::command]
 async fn run_migration(base_url: String, config: MigrationConfig) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/migrate/run", serde_json::to_value(config).unwrap()).await
+    connect(
+        &base_url,
+        "RunMigration",
+        json!({ "input": {
+            "source": config.source,
+            "sourceUri": config.source_uri,
+            "commitMessage": config.commit_message,
+            "includeTables": config.include_tables,
+        } }),
+    )
+    .await
 }
 
 /// aruaru → aruaru の「まるごとお引越し」(別クラスタへの移植)
@@ -312,78 +330,74 @@ pub struct FederatedSource {
 
 #[tauri::command]
 async fn list_federated_sources(base_url: String) -> Result<Vec<Value>, String> {
-    let v = admin_get(&base_url, "/admin/federation").await?;
-    Ok(v["sources"].as_array().cloned().unwrap_or_default())
+    let v = connect(&base_url, "ListFederatedSources", json!({})).await?;
+    Ok(v.as_array().cloned().unwrap_or_default())
 }
 
 #[tauri::command]
 async fn register_federated_source(base_url: String, source: FederatedSource) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/federation", serde_json::to_value(source).unwrap()).await
+    connect(&base_url, "RegisterFederatedSource", json!({ "input": { "name": source.name, "kind": source.kind, "uri": source.uri } })).await
 }
 
 #[tauri::command]
 async fn test_federated_source(base_url: String, kind: String, uri: String) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/federation/test", json!({ "kind": kind, "uri": uri })).await
+    connect(&base_url, "TestSourceConnection", json!({ "source": kind, "uri": uri })).await
 }
 
 #[tauri::command]
 async fn drop_federated_source(base_url: String, name: String) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/federation/drop", json!({ "name": name })).await
+    connect(&base_url, "DropFederatedSource", json!({ "name": name })).await
 }
 
 /// 複数DBをまたぐ横断クエリ (フェデレーテッドクエリ)
 #[tauri::command]
 async fn federated_query(base_url: String, sql: String) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/federation/query", json!({ "sql": sql })).await
+    connect(&base_url, "FederatedQuery", json!({ "sql": sql })).await
 }
 
 // ── クラスタ (分散基盤) ────────────────────────────────────────
 
 #[tauri::command]
 async fn get_cluster_status(base_url: String) -> Result<Value, String> {
-    admin_get(&base_url, "/admin/cluster").await
+    connect(&base_url, "ClusterStatus", json!({})).await
 }
 
 #[tauri::command]
 async fn add_cluster_node(base_url: String, node_id: u64, addr: String) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/cluster/node", json!({ "action": "add", "node_id": node_id, "addr": addr })).await
+    connect(&base_url, "ClusterNodeOp", json!({ "input": { "action": "add", "nodeId": node_id, "addr": addr } })).await
 }
 
 #[tauri::command]
 async fn decommission_node(base_url: String, node_id: u64) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/cluster/node", json!({ "action": "decommission", "node_id": node_id })).await
+    connect(&base_url, "ClusterNodeOp", json!({ "input": { "action": "decommission", "nodeId": node_id, "addr": "" } })).await
 }
 
 #[tauri::command]
 async fn rebalance_cluster(base_url: String) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/cluster/rebalance", json!({})).await
+    connect(&base_url, "RebalanceCluster", json!({})).await
 }
 
 // ── ⑤ 対応DBレジストリ (150+件) ─────────────────────────────────
 
 #[tauri::command]
 async fn list_registry(base_url: String) -> Result<Vec<Value>, String> {
-    let client = http_client()?;
-    let v = client
-        .get(format!("{base_url}/admin/registry"))
-        .send().await.map_err(|e| e.to_string())?
-        .json::<Value>().await.map_err(|e| e.to_string())?;
+    let v = connect(&base_url, "Registry", json!({})).await?;
     Ok(v.as_array().cloned().unwrap_or_default())
 }
 
 #[tauri::command]
 async fn registry_summary(base_url: String) -> Result<Value, String> {
-    admin_get(&base_url, "/admin/registry/summary").await
+    connect(&base_url, "RegistrySummary", json!({})).await
 }
 
 #[tauri::command]
 async fn registry_crawl(base_url: String) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/registry/crawl", json!({})).await
+    connect(&base_url, "CrawlRegistry", json!({})).await
 }
 
 #[tauri::command]
 async fn registry_test(base_url: String, id: String, uri: String) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/registry/test", json!({ "id": id, "uri": uri })).await
+    connect(&base_url, "TestRegistryConnection", json!({ "id": id, "uri": uri })).await
 }
 
 // ── Main ──────────────────────────────────────────────────────

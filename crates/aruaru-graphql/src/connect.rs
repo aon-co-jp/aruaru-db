@@ -158,7 +158,7 @@ pub async fn connect_handler(
         let m = err.message.clone();
         let (st, code) = if m.contains("x-admin-token") || m.contains("not configured") {
             (StatusCode::UNAUTHORIZED, "unauthenticated")
-        } else if err.path.is_empty() {
+        } else if err.path.is_empty() || m.starts_with("Variable") || m.starts_with("Invalid value") {
             (StatusCode::BAD_REQUEST, "invalid_argument")
         } else {
             (StatusCode::INTERNAL_SERVER_ERROR, "internal")

@@ -475,26 +475,11 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
             .at("/disaster-email-backup/verify", post(verify_disaster_email_backup));
     }
     route
-        .at("/backup", get(list_backups).post(create_backup))
-        .at("/backup/restore", post(restore_backup))
-        .at("/backup/schedule", get(get_schedule).post(set_schedule))
-        .at("/migrate/test", post(migrate_test))
-        .at("/migrate/preview", post(migrate_preview))
-        .at("/migrate/run", post(migrate_run))
-        .at("/migrate/instance", post(migrate_instance))
         // 【2026-08-29 再設計 P2/P3】`/admin/parallel*` は全撤廃。
         // 設定 = 宣言的 `aruaru.yaml: query.parallel`(ホットリロード)、
         // 実効値 = GraphQL `parallelConfig` query、
         // 分散プラン = GraphQL `explainDistributed` query(実ロジック移植済み)、
         // ジョブ一覧 = GraphQL `parallelJobs` query。
-        .at("/federation", get(list_federation).post(register_federation))
-        .at("/federation/test", post(federation_test))
-        .at("/federation/drop", post(drop_federation))
-        .at("/federation/query", post(federated_query))
-        .at("/cluster", get(cluster_status))
-        .at("/cluster/node", post(cluster_node))
-        .at("/cluster/rebalance", post(cluster_rebalance))
-        .at("/cluster/propose", post(cluster_propose))
         // 【2026-08-31 REST完全撤廃】ephemeral SQL pod は `EphemeralRunner`
         // trait注入(`aruaru_dist::ephemeral`)によりGraphQL
         // `Mutation.ephemeralQuery`へ移行済み(`admin_shared.rs`/
@@ -526,10 +511,6 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         // ・`objectTablePrune` mutationへ完全移行済み(REST→GraphQL段階
         // 移行の既定方針に基づき、以後 object-table にRESTルートは持たない
         // ——これを他エンドポイント撤廃の雛形とする)。
-        .at("/registry", get(registry_list))
-        .at("/registry/summary", get(registry_summary))
-        .at("/registry/crawl", post(registry_crawl))
-        .at("/registry/test", post(registry_test_connection))
         // Raft ノード間 RPC 受信エンドポイント
         .at("/raft/append", post(raft_append))
         .at("/raft/vote", post(raft_vote))

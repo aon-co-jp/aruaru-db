@@ -7142,3 +7142,10 @@ ROLLBACKし忘れれば発生しうる根本的な設計上の欠陥である**�
 - **Исключения (интерфейсы, форму которых определяет чужой стандарт, а не наш собственный API)**: ACME, обратные вызовы OAuth/OIDC, вебхуки сторонних сервисов (например, GitHub), проверки работоспособности, раздача статических файлов, OTLP и тому подобное. Такие интерфейсы принимают обычный HTTP, как того требует соответствующий стандарт.
 - Эталонные реализации: `RPoem` (`open_runo.admin.v1.Admin`) и `open-easy-web` (`server/src/connect.rs`, `proto/open_easy_web/admin/v1/admin.proto`).
 - Примечание: соответствует ли код конкретного репозитория этой политике, зависит от самого репозитория. Данный раздел лишь фиксирует политику и не означает, что код уже изменён.
+
+## REST→Connect移行状況(2026-11-05、API方針〈REST全廃・gRPC/Connect〉の反映)
+- 管理操作は Connect の単純呼び出し `POST /open_runo.aruaru.admin.v1.Admin/<Method>`(JSON、`x-admin-token`認証、失敗は`{"code","message"}`、JSONはRS-JSON `parse_secure`で上限・重複キー検査)。実装は`crates/aruaru-graphql/src/connect.rs`(既存の管理リゾルバを呼ぶ薄い層。21メソッド: Registry/RegistrySummary/ListBackups/GetBackupSchedule/ClusterStatus/ListFederatedSources/PreviewSource/ExplainDistributed/CreateBackup/RestoreBackup/SetBackupSchedule/ClusterNodeOp/RebalanceCluster/ClusterPropose/RegisterFederatedSource/DropFederatedSource/FederatedQuery/TestSourceConnection/RunMigration/CrawlRegistry/TestRegistryConnection)。
+- **移した(REST削除)**: `/admin/backup*`・`/admin/migrate/{test,preview,run,instance}`・`/admin/federation*`・`/admin/cluster*`・`/admin/registry*`(19経路)。呼び出し元の管理画面(Tauri)とAndroidをConnectへ変更。`/admin/migrate/instance`は中身が「受理」を返すだけのスタブだったため削除(Tauriの`migrate_instance`は未実装エラー)。
+- **残した(要続き)**: `/admin/disaster-email-backup*`(feature gate、Connect未実装)、ノード間 `/admin/raft/{append,vote}`・`/admin/closed-timestamp/{receive,publish}`(`binary_transport`への切替は配備調整が要る)、デモweb `/api/status`・`/api/rebalance`、`columnar_pod`の`/columnar/*`(内部pod)。
+- **例外**: `/healthz`、`/graphql/sdl`(Cosmo規格)、PostgreSQLワイヤー互換、`/graphql`(問い合わせ)。
+- **未了**: 管理系GraphQL Mutationの削除(Connect移行後に、問い合わせのみ残す)、`admin.rs`内の未使用ハンドラの整理(警告が出る)、既存テスト実行、VPS反映。
