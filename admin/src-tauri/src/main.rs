@@ -252,12 +252,10 @@ async fn migrate_instance(
     target_uri: String,
     include_history: bool, // コミット履歴(Git-on-SQL)も移送するか
 ) -> Result<Value, String> {
-    admin_post(
-        &base_url,
-        "/admin/migrate/instance",
-        json!({ "target_uri": target_uri, "include_history": include_history }),
-    )
-    .await
+    // 旧 REST `/admin/migrate/instance` はサーバー側が未実装のまま 2026-11-05 に削除した。
+    // 実装される(Connect の `MigrateInstance`)までは、404 ではなく明示的に未実装と返す。
+    let _ = (&base_url, &target_uri, include_history);
+    Err("aruaru→aruaru のインスタンス移行は未実装です(サーバー側に Connect メソッドがありません)".to_string())
 }
 
 // ── ③ 分散並列化 ───────────────────────────────────────────────
