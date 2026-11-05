@@ -10,6 +10,7 @@ name = "aruaru-server"
 path = "src/main.rs"
 
 [dependencies]
+rust-json.workspace = true
 aruaru-core    = { path = "../aruaru-core" }
 aruaru-dist    = { path = "../aruaru-dist" }
 aruaru-query   = { path = "../aruaru-query" }

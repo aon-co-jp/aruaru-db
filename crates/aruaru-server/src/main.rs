@@ -89,7 +89,7 @@ struct Cli {
     /// と組み合わせて使う——通常のlearner(`EngineApplier`、行ストアの
     /// 単純複製)とは別の、TiFlash型の列レプリカ検証専用フロー。
     /// 有効時は通常のpgwire/GraphQLサーバーを一切起動せず、Raft driverと
-    /// 最小限の観測用HTTP(`/healthz`・`GET /columnar/:table`)のみを
+    /// 最小限の観測用HTTP(`/healthz`・Connect `Columnar/Status`)のみを
     /// 提供して待ち受け続ける(`--gql-port`をその待受ポートとして流用)。
     #[arg(long, default_value_t = false)]
     columnar_learner: bool,
@@ -548,6 +548,7 @@ async fn main() -> anyhow::Result<()> {
             .at("/graphql", aruaru_graphql::graphql_endpoint_for_schema(gql_schema.clone()))
             .nest("/", aruaru_graphql::connect::connect_endpoint(gql_schema.clone()))
             .at("/graphql/sdl", get(subgraph_sdl))
+            .nest("/open_runo.aruaru.admin.v1.AdminNode", admin::admin_connect_routes(admin_state.clone()))
             .nest("/admin", admin::admin_routes(admin_state))
             // Web 版 Admin (別オリジン) からのアクセスを許可
             .with(Cors::new());

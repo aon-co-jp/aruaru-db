@@ -200,12 +200,12 @@ pub struct DisasterEmailBackupForm {
 
 #[tauri::command]
 async fn set_disaster_email_backup(base_url: String, config: DisasterEmailBackupForm) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/disaster-email-backup", serde_json::to_value(config).unwrap()).await
+    admin_post(&base_url, "/open_runo.aruaru.admin.v1.AdminNode/SetDisasterEmailBackup", serde_json::to_value(config).unwrap()).await
 }
 
 #[tauri::command]
 async fn verify_disaster_email_backup(base_url: String) -> Result<Value, String> {
-    admin_post(&base_url, "/admin/disaster-email-backup/verify", json!({})).await
+    admin_post(&base_url, "/open_runo.aruaru.admin.v1.AdminNode/VerifyDisasterEmailBackup", json!({})).await
 }
 
 // ── ② お引越し (移行 / 移植) ───────────────────────────────────

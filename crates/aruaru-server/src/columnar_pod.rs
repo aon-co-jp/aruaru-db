@@ -50,10 +50,10 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-#[handler]
-async fn columnar_status(
-    Path(table): Path<String>,
-    Data(applier): Data<&Arc<ColumnarApplier>>,
+async fn status_impl(
+    table: String,
+    q: std::collections::HashMap<String, String>,
+    applier: &Arc<ColumnarApplier>,
     req: &Request,
 ) -> Response {
     if let Err(code) = check_token(req) {
@@ -62,13 +62,6 @@ async fn columnar_status(
     // A.6-3: ?required_index=N&required_commit_seq=M が付いていれば、
     // Raft index + MVCC(commit 通し番号)で staleness を検証し、
     // 満たさなければ 409 CONFLICT + stale 詳細を返す。
-    let q: std::collections::HashMap<String, String> = req
-        .uri()
-        .query()
-        .unwrap_or("")
-        .split('&')
-        .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
-        .collect();
     let required_index = q.get("required_index").and_then(|s| s.parse::<u64>().ok());
     let required_commit_seq = q.get("required_commit_seq").and_then(|s| s.parse::<u64>().ok());
     if required_index.is_some() || required_commit_seq.is_some() {
@@ -132,37 +125,19 @@ async fn columnar_status(
 }
 
 /// `Query.htapReplicas` 相当の枝刈り込み観測 API。
-/// `GET /columnar/:table/prune?column=<c>&op=<gt|ge|lt|le|eq>&value=<v>`
+/// Connect `Prune`(`{table, column, op: gt|ge|lt|le|eq, value}`)
 /// (`op=eq` のときは bloom filter で等値枝刈り、`value` は文字列キー扱い)。
-#[handler]
-async fn columnar_prune(
-    Path(table): Path<String>,
+async fn prune_impl(
+    table: String,
+    params: std::collections::HashMap<String, String>,
+    applier: Arc<ColumnarApplier>,
     req: &Request,
 ) -> Response {
     if let Err(code) = check_token(req) {
         return code.into_response();
     }
-    // `.data()` から取り出す(handler 引数の Data<..> は check_token より
-    // 後に評価したいので手動で取得)。
-    let applier = match req.data::<Arc<ColumnarApplier>>() {
-        Some(a) => a.clone(),
-        None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    let params: std::collections::HashMap<String, String> = req
-        .uri()
-        .query()
-        .unwrap_or("")
-        .split('&')
-        .filter_map(|kv| {
-            let (k, v) = kv.split_once('=')?;
-            Some((
-                k.to_string(),
-                v.replace('+', " ").replace("%20", " "),
-            ))
-        })
-        .collect();
     let Some(column) = params.get("column").cloned() else {
-        return (StatusCode::BAD_REQUEST, "column query param is required").into_response();
+        return (StatusCode::BAD_REQUEST, "column is required").into_response();
     };
     let op = params.get("op").map(|s| s.as_str()).unwrap_or("eq");
     let value = params.get("value").cloned().unwrap_or_default();
@@ -205,6 +180,71 @@ async fn columnar_prune(
     }
 }
 
+pub const COLUMNAR_SERVICE: &str = "open_runo.aruaru.columnar.v1.Columnar";
+
+fn connect_fail(status: StatusCode, code: &str, message: &str) -> Response {
+    let body = serde_json::json!({ "code": code, "message": message }).to_string();
+    Response::builder().status(status).content_type("application/json").body(body)
+}
+
+/// Connect の単純呼び出し: `POST /open_runo.aruaru.columnar.v1.Columnar/{Status|Prune}`。
+/// 本文は JSON オブジェクト(RS-JSON `parse_secure` で上限つき)。`table` は必須、
+/// Status は `requiredIndex`・`requiredCommitSeq`、Prune は `column`・`op`・`value` を取る。
+#[handler]
+async fn connect(
+    Path(method): Path<String>,
+    body: poem::Body,
+    Data(applier): Data<&Arc<ColumnarApplier>>,
+    req: &Request,
+) -> Response {
+    if let Err(code) = check_token(req) {
+        return connect_fail(code, "unauthenticated", "invalid or missing x-admin-token header");
+    }
+    let json_ct = req
+        .header("content-type")
+        .map(|v| v.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json"))
+        .unwrap_or(false);
+    if !json_ct {
+        return connect_fail(StatusCode::UNSUPPORTED_MEDIA_TYPE, "invalid_argument", "content-type は application/json にしてください");
+    }
+    let bytes = match body.into_bytes_limit(64 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return connect_fail(StatusCode::PAYLOAD_TOO_LARGE, "invalid_argument", "本文が大きすぎます"),
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let limits = rust_json::Limits { max_bytes: 64 * 1024, max_depth: 8, reject_duplicate_keys: true };
+    let obj = match rust_json::parse_secure(&text, &limits) {
+        Ok(serde_json::Value::Object(o)) => o,
+        Ok(_) => return connect_fail(StatusCode::BAD_REQUEST, "invalid_argument", "本文は JSON オブジェクトにしてください"),
+        Err(e) => return connect_fail(StatusCode::BAD_REQUEST, "invalid_argument", &format!("invalid JSON: {e}")),
+    };
+    let get = |k: &str| -> Option<String> {
+        obj.get(k).and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        })
+    };
+    let Some(table) = get("table") else {
+        return connect_fail(StatusCode::BAD_REQUEST, "invalid_argument", "table is required");
+    };
+    let mut q = std::collections::HashMap::new();
+    match method.as_str() {
+        "Status" => {
+            if let Some(v) = get("requiredIndex") { q.insert("required_index".to_string(), v); }
+            if let Some(v) = get("requiredCommitSeq") { q.insert("required_commit_seq".to_string(), v); }
+            status_impl(table, q, applier, req).await
+        }
+        "Prune" => {
+            for (k, name) in [("column", "column"), ("op", "op"), ("value", "value")] {
+                if let Some(v) = get(k) { q.insert(name.to_string(), v); }
+            }
+            prune_impl(table, q, applier.clone(), req).await
+        }
+        _ => connect_fail(StatusCode::NOT_FOUND, "unimplemented", "unknown method"),
+    }
+}
+
 /// `--columnar-learner`フローから呼ばれる。呼び出し元がRaft driverを
 /// 別途`tokio::spawn`していることを前提とし、本関数はHTTPサーバーを
 /// 起動して待ち受け続ける(通常のリクエストハンドラループと同様、
@@ -212,8 +252,7 @@ async fn columnar_prune(
 pub async fn serve(bind_addr: String, applier: Arc<ColumnarApplier>) -> anyhow::Result<()> {
     let app = Route::new()
         .at("/healthz", get(healthz))
-        .at("/columnar/:table", get(columnar_status))
-        .at("/columnar/:table/prune", get(columnar_prune))
+        .at(format!("/{COLUMNAR_SERVICE}/:method"), poem::post(connect))
         .data(applier);
     tracing::info!(bind_addr = %bind_addr, "columnar learner observability server listening");
     Server::new(TcpListener::bind(bind_addr)).run(app).await?;

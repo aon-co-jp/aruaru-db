@@ -63,6 +63,14 @@ impl Config {
     }
 }
 
+/// 上流 aruaru-server の管理 Connect(`POST <root>/open_runo.aruaru.admin.v1.Admin/<Method>`)。
+/// `admin_base_url` は従来どおり `http://host:port/admin` 形式の設定値(末尾の `/admin` は無視する)。
+fn upstream_connect_url(admin_base_url: &str, method: &str) -> String {
+    let root = admin_base_url.trim_end_matches('/');
+    let root = root.strip_suffix("/admin").unwrap_or(root);
+    format!("{root}/open_runo.aruaru.admin.v1.Admin/{method}")
+}
+
 fn page_html(demo: bool, base_path: &str) -> String {
     let banner = if demo {
         r#"<div class="banner demo">これはread-onlyデモです。ログイン・登録・保存(クラスタ操作)は実際には出来ません。</div>"#
@@ -107,7 +115,7 @@ async function refreshStatus() {{
   const el = document.getElementById('status');
   el.textContent = '取得中...';
   try {{
-    const res = await fetch(BASE_PATH + '/api/status');
+    const res = await fetch(BASE_PATH + '/open_runo.aruaru.web.v1.Demo/Status', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: '{{}}' }});
     const body = await res.text();
     el.textContent = body;
   }} catch (e) {{
@@ -120,7 +128,7 @@ document.getElementById('rebalance').addEventListener('click', async () => {{
   const el = document.getElementById('rebalance-result');
   el.textContent = '実行中...';
   try {{
-    const res = await fetch(BASE_PATH + '/api/rebalance', {{
+    const res = await fetch(BASE_PATH + '/open_runo.aruaru.web.v1.Demo/Rebalance', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json', 'X-Admin-Token': token }},
       body: '{{}}'
@@ -155,8 +163,8 @@ fn main() {
     let status_handler = std::sync::Arc::new(move |_req: Request, _params: Params| {
         let config = Arc::clone(&status_config);
         Box::pin(async move {
-            let url = format!("{}/cluster", config.admin_base_url);
-            let mut builder = config.http_client.get(&url);
+            let url = upstream_connect_url(&config.admin_base_url, "ClusterStatus");
+            let mut builder = config.http_client.post(&url).header("content-type", "application/json").body("{}");
             if let Some(token) = &config.upstream_admin_token {
                 builder = builder.header("x-admin-token", token);
             }
@@ -192,7 +200,7 @@ fn main() {
             if provided.is_empty() || provided != admin_token {
                 return empty_status(StatusCode::UNAUTHORIZED);
             }
-            let url = format!("{}/cluster/rebalance", config.admin_base_url);
+            let url = upstream_connect_url(&config.admin_base_url, "RebalanceCluster");
             let mut builder = config.http_client.post(&url).json(&serde_json::json!({}));
             if let Some(token) = &config.upstream_admin_token {
                 builder = builder.header("x-admin-token", token);
@@ -219,8 +227,8 @@ fn main() {
         let app = Route::new()
             .at("/", get(index_handler))
             .at("/demo", get(demo_handler))
-            .at("/api/status", get(status_handler))
-            .at("/api/rebalance", post(rebalance_handler));
+            .at("/open_runo.aruaru.web.v1.Demo/Status", post(status_handler))
+            .at("/open_runo.aruaru.web.v1.Demo/Rebalance", post(rebalance_handler));
 
         let bind_addr: std::net::SocketAddr = std::env::var("ARUARU_WEB_BIND").unwrap_or_else(|_| "127.0.0.1:8098".to_string()).parse().expect("invalid ARUARU_WEB_BIND");
         let (addr, handle) = Server::new(TcpListener::bind(bind_addr)).run(app).await.expect("failed to bind server");

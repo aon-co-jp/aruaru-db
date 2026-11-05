@@ -371,9 +371,6 @@ fn check_admin_auth(
     Err((poem::http::StatusCode::UNAUTHORIZED, "invalid or missing x-admin-token header"))
 }
 
-fn now() -> String {
-    chrono::Utc::now().to_rfc3339()
-}
 
 // ── 型定義 ─────────────────────────────────────────────────────
 
@@ -466,15 +463,7 @@ struct RegistryTestRequest {
 // ═══════════════════════════════════════════════════════════════
 
 pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
-    #[allow(unused_mut)]
-    let mut route = Route::new();
-    #[cfg(feature = "disaster_email_backup")]
-    {
-        route = route
-            .at("/disaster-email-backup", post(set_disaster_email_backup))
-            .at("/disaster-email-backup/verify", post(verify_disaster_email_backup));
-    }
-    route
+    Route::new()
         // 【2026-08-29 再設計 P2/P3】`/admin/parallel*` は全撤廃。
         // 設定 = 宣言的 `aruaru.yaml: query.parallel`(ホットリロード)、
         // 実効値 = GraphQL `parallelConfig` query、
@@ -500,7 +489,6 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
         // ノード間 side transport の受信(`/receive`)・配布トリガー
         // (`/publish`、いつ誰に配布するかを人間が指示する制御面)は B4 として
         // 残置——受信の実体は既に `binary_transport.rs` のバイナリ経路。
-        .at("/closed-timestamp/publish", post(closed_ts_publish))
         // 【2026-08-29(続き10)REST完全撤廃】WAL サービス(status/append/page/
         // image-layer)は GraphQL `walService`/`walPage` query・`walAppend`/
         // `walCreateImageLayer` mutation へ完全移行済み。
@@ -526,6 +514,29 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
                 ep.call(req).await.map(poem::IntoResponse::into_response)
             }
         })
+}
+
+/// ノード間配布・メール退避の管理操作を Connect の単純呼び出しで受ける
+/// (`POST /open_runo.aruaru.admin.v1.AdminNode/<Method>`、2026-11-05、REST 全廃方針)。
+/// 認証は `/admin` と同じ `check_admin_auth`。本文は JSON(従来のRESTと同じフィールド名)。
+pub fn admin_connect_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
+    #[allow(unused_mut)]
+    let mut route = Route::new().at("/ClosedTsPublish", post(closed_ts_publish));
+    #[cfg(feature = "disaster_email_backup")]
+    {
+        route = route
+            .at("/SetDisasterEmailBackup", post(set_disaster_email_backup))
+            .at("/VerifyDisasterEmailBackup", post(verify_disaster_email_backup));
+    }
+    route.data(state.clone()).around(move |ep, req| {
+        let state = state.clone();
+        async move {
+            if let Err((status, msg)) = check_admin_auth(&req, &state.keyring) {
+                return Ok(poem::Response::builder().status(status).body(msg));
+            }
+            ep.call(req).await.map(poem::IntoResponse::into_response)
+        }
+    })
 }
 
 // ── APIキー自動ライフサイクル管理 ──────────────────────────────
@@ -612,24 +623,6 @@ fn set_schedule(state: Data<&Arc<AdminState>>, Json(req): Json<ScheduleRequest>)
 
 // ── ② お引越し ─────────────────────────────────────────────────
 
-/// host:port を URI から雑に抽出して TCP 到達性を確認する
-fn tcp_reachable(uri: &str) -> Result<String, String> {
-    // scheme://[user:pass@]host:port/...
-    let after_scheme = uri.splitn(2, "://").nth(1).unwrap_or(uri);
-    let authority = after_scheme.split('/').next().unwrap_or("");
-    let hostport = authority.rsplit('@').next().unwrap_or(authority);
-    if hostport.is_empty() {
-        return Err("host:port を解析できません".into());
-    }
-    // ToSocketAddrs で名前解決 (到達確認は呼び出し側で軽く)
-    match hostport.to_socket_addrs() {
-        Ok(mut addrs) => match addrs.next() {
-            Some(a) => Ok(a.to_string()),
-            None => Err(format!("解決できませんでした: {hostport}")),
-        },
-        Err(e) => Err(format!("{hostport}: {e}")),
-    }
-}
 
 #[handler]
 fn migrate_test(Json(req): Json<SourceUriRequest>) -> Json<Value> {
@@ -656,20 +649,6 @@ fn migrate_preview(Json(req): Json<SourceUriRequest>) -> Json<Value> {
     }))
 }
 
-/// source 文字列 → 取り込みワイヤ
-fn wire_for_source(source: &str) -> Option<aruaru_registry::Wire> {
-    use aruaru_registry::Wire;
-    match source.to_lowercase().as_str() {
-        "postgres" | "postgresql" | "cockroach" | "cockroachdb" | "yugabyte" | "yugabytedb"
-        | "redshift" | "alloydb" | "greenplum" | "materialize" | "citus" | "risingwave"
-        | "questdb" | "cratedb" | "supabase" | "neon" | "timescaledb" | "aruaru" => {
-            Some(Wire::Postgres)
-        }
-        "mysql" | "mariadb" | "tidb" | "singlestore" | "starrocks" | "doris" | "vitess"
-        | "oceanbase" | "polardb" | "percona" => Some(Wire::MySQL),
-        _ => None,
-    }
-}
 
 #[handler]
 async fn migrate_run(state: Data<&Arc<AdminState>>, Json(req): Json<Value>) -> Json<Value> {
@@ -1224,3 +1203,41 @@ async fn closed_ts_publish(
 // (`aruaru-graphql::admin_resolvers`)へ完全移行。共有インスタンスは
 // `AdminState.wal_storage`(`aruaru_dist::DisaggregatedStorage`)のまま、
 // `wal_storage_handle()` で `AdminCtx` へ注入する。
+
+fn now() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// host:port を URI から雑に抽出して TCP 到達性を確認する
+fn tcp_reachable(uri: &str) -> Result<String, String> {
+    // scheme://[user:pass@]host:port/...
+    let after_scheme = uri.splitn(2, "://").nth(1).unwrap_or(uri);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    if hostport.is_empty() {
+        return Err("host:port を解析できません".into());
+    }
+    // ToSocketAddrs で名前解決 (到達確認は呼び出し側で軽く)
+    match hostport.to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(a) => Ok(a.to_string()),
+            None => Err(format!("解決できませんでした: {hostport}")),
+        },
+        Err(e) => Err(format!("{hostport}: {e}")),
+    }
+}
+
+/// source 文字列 → 取り込みワイヤ
+fn wire_for_source(source: &str) -> Option<aruaru_registry::Wire> {
+    use aruaru_registry::Wire;
+    match source.to_lowercase().as_str() {
+        "postgres" | "postgresql" | "cockroach" | "cockroachdb" | "yugabyte" | "yugabytedb"
+        | "redshift" | "alloydb" | "greenplum" | "materialize" | "citus" | "risingwave"
+        | "questdb" | "cratedb" | "supabase" | "neon" | "timescaledb" | "aruaru" => {
+            Some(Wire::Postgres)
+        }
+        "mysql" | "mariadb" | "tidb" | "singlestore" | "starrocks" | "doris" | "vitess"
+        | "oceanbase" | "polardb" | "percona" => Some(Wire::MySQL),
+        _ => None,
+    }
+}

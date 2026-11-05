@@ -568,3 +568,7 @@ TiKVのsafe-ts・YugabyteDBの`yb_follower_read_staleness_ms`に相当する
 - **WASM по-прежнему остаётся технологией для интерфейса.** Изменилось лишь то, что вызываемый им API теперь построен на Connect.
 - Интерфейсы, форма которых задана внешним стандартом (ACME, обратные вызовы OAuth, вебхуки сторонних сервисов, проверки работоспособности, статические файлы, OTLP), остаются обычным HTTP.
 - **Если есть сомнения — выбирайте Connect.**
+
+## REST→Connect 移行(2026-11-05)
+管理操作は `POST /open_runo.aruaru.admin.v1.Admin/<Method>`(21メソッド)、ノード間配布・メール退避は `.../AdminNode/<Method>`、デモwebは `/open_runo.aruaru.web.v1.Demo/{Status,Rebalance}`、列レプリカ観測は `/open_runo.aruaru.columnar.v1.Columnar/{Status,Prune}` の Connect 単純呼び出し(JSON本文、`x-admin-token`、JSONはRS-JSON `parse_secure`)。旧 `/admin/*` のREST(ノード間 `raft`・`closed-timestamp/receive` を含む)は削除済み。例外は `/healthz`・`/graphql/sdl`・PostgreSQLワイヤー・`/graphql`(問い合わせ)。本番(VPS)反映の手順: glibc 2.39 以下で作るため **Ubuntu 24.04(WSL `Ubuntu-24.04`)でリリースビルド** → `objdump -T` で GLIBC_2.39 以下を確認 → scp → バックアップ → 入れ替え → 再起動 → curl(401/200/400/旧REST 404)。詳細・未了は `CLAUDE.md` の「REST→Connect移行状況」。
+
