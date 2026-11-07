@@ -7234,3 +7234,7 @@ ROLLBACKし忘れれば発生しうる根本的な設計上の欠陥である**�
 - **本番(VPS)確認**: 本番 `aruaru-server`(:4001)は移行後のバイナリ(Connect 認証なし401)。**`realdata-aruaru-db`(:14001、pid古い)は移行前のプロセスのまま**(Connect 404)。ディスク上のバイナリは新しいため再起動で入れ替わるが、別データのサービスなので未再起動(判断待ち)。
 - 古いコメント(Tauri `main.rs` 冒頭・`admin_post`、Android KDoc)の旧REST表記を修正。
 - **未了(変わらず)**: 管理系GraphQL Mutationの削除、`admin.rs` の未使用旧ハンドラ連鎖(`migrate_instance` 等)の削除、Tauri画面のブラウザ確認。
+
+## 2026-11-08 `.nest("/admin", admin_routes)` の実コード確認
+- `aruaru-server/src/admin.rs` の `admin_routes()` は、認証(`check_admin_auth`)を巻いた**ルート0本**の空の `Route`(中身は全てGraphQL/Connectへ移行済み)。旧RESTは残っていない。ノード間配布・メール退避は `AdminNode` のConnect(`admin_connect_routes`)。
+- 残るHTTP: `/healthz`(例外)、`/graphql`・`/graphql/sdl`、Connect。`/v1/keys/self-issue` はGraphQL `selfIssueKey` mutation に移行済みでRESTは無い。集計の「残8」は古い数えで、移行対象は0本。
