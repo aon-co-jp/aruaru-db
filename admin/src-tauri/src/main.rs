@@ -20,6 +20,8 @@
 //
 // これらサーバ側ハンドラの実装は aruaru-server の次タスク。
 // 本ファイルは「呼び出し規約」を確定させ、フロントを駆動できる状態にする。
+// 【注意】以下の `GET/POST {base}/admin/...` の一覧は旧REST時代の表記で、2026-11-05 に全て削除済み。
+// 現在は `POST {base}/open_runo.aruaru.admin.v1.Admin/<Method>`(Connect)。正は下の `connect()` と CLAUDE.md。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -58,8 +60,8 @@ async fn connect(base: &str, method: &str, body: Value) -> Result<Value, String>
     }
 }
 
-/// 【未移行・REST 残り】`/admin/migrate/instance` と `/admin/disaster-email-backup*` は
-/// GraphQL/Connect に等価がまだ無く、サーバ側 REST のまま残っている(CLAUDE.md「REST→Connect移行状況」参照)。
+/// メール退避(`AdminNode/SetDisasterEmailBackup`・`VerifyDisasterEmailBackup`)用の Connect 呼び出し。
+/// 2026-11-05 に旧 REST `/admin/disaster-email-backup*` は削除済み(CLAUDE.md「REST→Connect移行状況」参照)。
 async fn admin_post(base: &str, path: &str, body: Value) -> Result<Value, String> {
     let client = http_client()?;
     let mut rb = client.post(format!("{base}{path}")).json(&body);

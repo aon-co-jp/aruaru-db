@@ -31,7 +31,7 @@ import org.json.JSONObject
  * **重要な位置づけ**: このActivityはaruaru-db本体(Rust製の分散DB
  * サーバー、Multi-Raft/HTAP OlapCache等)をAndroid上で実行するものでは
  * ない。ユーザーが入力したリモートURL(既存のaruaru-db管理API、
- * `crates/aruaru-server/src/admin.rs`の`GET /admin/cluster`等)へHTTPで
+ * `crates/aruaru-graphql/src/connect.rs`のConnect `POST /open_runo.aruaru.admin.v1.Admin/ClusterStatus`等)へHTTPで
  * 接続し、疎通確認とクラスタ状態(ノード数・生存ノード数・レンジ数等)を
  * 画面上に表示する、リモート管理クライアントとして設計する。
  *

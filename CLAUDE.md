@@ -7228,3 +7228,9 @@ ROLLBACKし忘れれば発生しうる根本的な設計上の欠陥である**�
 - **既知の差**: 旧 `closed_ts_receive` は受信時にローカルHLCを前進させていたが、バイナリ受信経路(`serve_binary_raft`)にはHLC観測の配線が無い(元からの差。別途対応が必要)。
 - **例外**: `/healthz`、`/graphql/sdl`(Cosmo規格)、PostgreSQLワイヤー互換、`/graphql`(問い合わせ)。
 - **未了**: 管理系GraphQL Mutationの削除(Connect層が GraphQL 文書を内部実行しているため、Mutation を消すには先に resolver を共有関数へ切り出す必要がある。未着手)、`admin.rs` の未使用ハンドラ連鎖(移行済みの旧RESTハンドラ→`now`/`tcp_reachable`/`wire_for_source`/`cluster::{build_cluster,propose_*,summarize}`)の削除(連鎖が深く、ビルド警告のみ)、Tauri画面のブラウザ確認(未ビルド)、`columnar_pod` の実プロセス確認。
+
+## REST全廃 再確認(2026-11-07、親セッション指示の確認作業)
+- origin/main(568fb83)を新規cloneして再調査。**自前APIとしてのRESTは0本**(移した: 管理19+ノード間3+デモ2+columnar 2+メール退避ほか。version-controlの「残り8本」は古い数え)。例外は `/healthz`・`/graphql/sdl`(Cosmo規格)・PostgreSQLワイヤー・`/graphql`(問い合わせ)。
+- **本番(VPS)確認**: 本番 `aruaru-server`(:4001)は移行後のバイナリ(Connect 認証なし401)。**`realdata-aruaru-db`(:14001、pid古い)は移行前のプロセスのまま**(Connect 404)。ディスク上のバイナリは新しいため再起動で入れ替わるが、別データのサービスなので未再起動(判断待ち)。
+- 古いコメント(Tauri `main.rs` 冒頭・`admin_post`、Android KDoc)の旧REST表記を修正。
+- **未了(変わらず)**: 管理系GraphQL Mutationの削除、`admin.rs` の未使用旧ハンドラ連鎖(`migrate_instance` 等)の削除、Tauri画面のブラウザ確認。
