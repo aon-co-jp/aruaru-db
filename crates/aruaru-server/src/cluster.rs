@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aruaru_dist::{BinaryTcpTransport, Command, RaftDriver, RaftNode};
-use aruaru_query::{QueryEngine, QueryResponse};
+use aruaru_dist::{BinaryTcpTransport, RaftDriver, RaftNode};
+use aruaru_query::QueryEngine;
 
 /// 【2026-08-31移設】`EngineApplier`実体は`aruaru_dist::EngineApplier`へ
 /// 移設した(`MultiRaftCluster<EngineApplier>`をGraphQL側
@@ -50,15 +50,6 @@ fn to_binary_peer_addr(url_or_addr: &str) -> anyhow::Result<std::net::SocketAddr
     Ok(addr)
 }
 
-/// クラスタを構築する。peers が空なら単一ノード(即Leader)。
-/// 戻り値: (node, driver)。driver は呼び出し側で spawn する。
-pub fn build_cluster(
-    node_id: u64,
-    peers: &[(u64, String)],
-    engine: Arc<QueryEngine>,
-) -> anyhow::Result<(Arc<ClusterNode>, Arc<ClusterDriver>)> {
-    build_cluster_with_learners(node_id, peers, &[], false, engine)
-}
 
 /// 【2026-08-21新設・真のRaft learner化 第一歩】voter peer に加え、
 /// learner peer (投票権を持たない非同期複製先)・自ノード自身が learner
@@ -151,29 +142,7 @@ pub fn build_columnar_learner_cluster(
     Ok((node, driver))
 }
 
-/// Leader として書き込み SQL を Raft 経由で提案・適用する。
-/// 単一ノードでは即 commit/apply、複数ノードでは propose 後に driver が複製・commit する。
-pub fn propose_write(node: &Arc<ClusterNode>, sql: &str) -> Result<u64, String> {
-    let idx = node.propose(&Command::Exec(sql.to_string()))?;
-    if node.peers().is_empty() {
-        // 単一ノード: 即 commit + apply
-        node.try_commit_to(idx);
-        node.maybe_commit();
-        node.apply_committed();
-    }
-    Ok(idx)
-}
 
-/// 書き込みコマンドのコミット (aruaru_commit) を Raft 経由で提案
-pub fn propose_commit(node: &Arc<ClusterNode>, message: &str) -> Result<u64, String> {
-    let idx = node.propose(&Command::Commit(message.to_string()))?;
-    if node.peers().is_empty() {
-        node.try_commit_to(idx);
-        node.maybe_commit();
-        node.apply_committed();
-    }
-    Ok(idx)
-}
 
 /// "id@host:port,id@host:port" 形式のピア指定をパース
 pub fn parse_peers(spec: &str) -> Vec<(u64, String)> {
@@ -197,10 +166,3 @@ pub fn parse_peers(spec: &str) -> Vec<(u64, String)> {
         .collect()
 }
 
-/// QueryResponse をテキスト1行に要約 (propose 応答用)
-pub fn summarize(resp: QueryResponse) -> String {
-    match resp {
-        QueryResponse::Command { tag } => tag,
-        QueryResponse::Rows { rows, .. } => format!("{} rows", rows.len()),
-    }
-}

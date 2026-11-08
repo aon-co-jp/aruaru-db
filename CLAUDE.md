@@ -7238,3 +7238,6 @@ ROLLBACKし忘れれば発生しうる根本的な設計上の欠陥である**�
 ## 2026-11-08 `.nest("/admin", admin_routes)` の実コード確認
 - `aruaru-server/src/admin.rs` の `admin_routes()` は、認証(`check_admin_auth`)を巻いた**ルート0本**の空の `Route`(中身は全てGraphQL/Connectへ移行済み)。旧RESTは残っていない。ノード間配布・メール退避は `AdminNode` のConnect(`admin_connect_routes`)。
 - 残るHTTP: `/healthz`(例外)、`/graphql`・`/graphql/sdl`、Connect。`/v1/keys/self-issue` はGraphQL `selfIssueKey` mutation に移行済みでRESTは無い。集計の「残8」は古い数えで、移行対象は0本。
+
+## 旧REST残骸の削除(2026-11-09)
+`crates/aruaru-server/src/admin.rs` の未使用だった旧RESTハンドラ23本(backup/migrate/federation/cluster/registry、`migrate_instance` スタブ含む)・リクエスト型8個・補助関数(`now`/`tcp_reachable`/`wire_for_source`)と、`cluster.rs` の `build_cluster`/`propose_write`/`propose_commit`/`summarize` を削除(約540行)。WSL(Ubuntu-24.04)で `cargo check`(警告は未読フィールド `engine`/`registry`/`backups` と `replicator` のみ)・`cargo test -p aruaru-server -p aruaru-graphql` 全通過。実サーバーの起動確認・本番反映は未実施(挙動は変わらない削除のため。次の通常ビルド時に反映される)。**未了**: 管理系GraphQL Mutationの削除(Connect層がGraphQL文書を内部実行しているため先にresolverの共有関数化が要る)、Tauri画面のブラウザ確認。
