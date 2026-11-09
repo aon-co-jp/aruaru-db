@@ -91,6 +91,63 @@ const OPS: &[Op] = &[
         "$id: String!, $uri: String!",
         "testRegistryConnection(id: $id, uri: $uri) { ok message serverVersion }",
     ),
+    // ── 公開 /graphql から外した管理 Mutation(2026-11-09)。以前の GraphQL 経路と同じ resolver・認証。
+    op(
+        "ObjectTableCommit",
+        true,
+        "$blocks: [ObjectBlockInput!]!",
+        "objectTableCommit(blocks: $blocks) { snapshotId blockCount }",
+    ),
+    op(
+        "ObjectTablePrune",
+        true,
+        "$column: String!, $snapshotId: String, $op: String, $value: Float, $key: String",
+        "objectTablePrune(column: $column, snapshotId: $snapshotId, op: $op, value: $value, key: $key) { snapshotId predicate column keptBlocks skippedSegments skippedBlocks locations }",
+    ),
+    op("RevokeKeys", true, "$owner: String!", "revokeKeys(owner: $owner) { revokedCount }"),
+    op(
+        "ClosedTsRegisterRange",
+        true,
+        "$rangeId: Int!",
+        "closedTsRegisterRange(rangeId: $rangeId) { rangeId closedTimestamp }",
+    ),
+    op(
+        "ClosedTsAdvance",
+        true,
+        "$nowNanos: String",
+        "closedTsAdvance(nowNanos: $nowNanos) { rangeId closedTimestamp }",
+    ),
+    op(
+        "WalAppend",
+        true,
+        "$startLsn: String!, $records: [WalRecordInput!]!",
+        "walAppend(startLsn: $startLsn, records: $records) { commitLsn appliedLsn recordCount }",
+    ),
+    op(
+        "WalCreateImageLayer",
+        true,
+        "$pageKey: String!, $lsn: String",
+        "walCreateImageLayer(pageKey: $pageKey, lsn: $lsn) { pageKey gcCutoffLsn droppedDeltas }",
+    ),
+    op("ShardedStorePut", true, "$key: String!, $value: String!", "shardedStorePut(key: $key, value: $value) { key shardId }"),
+    op(
+        "MultiRaftSplit",
+        true,
+        "$rangeId: Int!, $splitKey: String!",
+        "multiRaftSplit(rangeId: $rangeId, splitKey: $splitKey) { success newRangeId rangeCount message }",
+    ),
+    op(
+        "MultiRaftMerge",
+        true,
+        "$rangeA: Int!, $rangeB: Int!",
+        "multiRaftMerge(rangeA: $rangeA, rangeB: $rangeB) { success mergedRangeId rangeCount message }",
+    ),
+    op(
+        "EphemeralQuery",
+        true,
+        "$tenantId: String!, $tables: [String!]!, $sql: String!",
+        "ephemeralQuery(tenantId: $tenantId, tables: $tables, sql: $sql) { success tenantId result { columns rows commandTag } error message }",
+    ),
 ];
 
 fn fail(status: StatusCode, code: &str, message: &str) -> Response {
@@ -175,4 +232,31 @@ pub async fn connect_handler(
 pub fn connect_endpoint(schema: AruaruSchema) -> impl poem::Endpoint {
     use poem::{post, EndpointExt, Route};
     Route::new().at(format!("/{SERVICE}/:method"), post(connect_handler)).data(schema)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// すべての Op の GraphQL 文書が、実際のスキーマ(Mutation あり)に対して妥当であること。
+    /// (変数を与えない検証だけを通す: 実行はせず、構文と型だけを確かめる。)
+    #[test]
+    fn every_op_document_parses_and_names_exist_in_the_schema() {
+        let sdl = crate::subgraph_sdl_full();
+        for o in OPS {
+            let decl = if o.vars.is_empty() { String::new() } else { format!("({})", o.vars) };
+            let kw = if o.mutation { "mutation" } else { "query" };
+            let doc = format!("{kw} Op{decl} {{ {} }}", o.field);
+            async_graphql::parser::parse_query(&doc)
+                .unwrap_or_else(|e| panic!("{} の文書が構文エラー: {e}
+{doc}", o.method));
+            let field = o.field.split(|c: char| c == '(' || c == ' ').next().unwrap();
+            assert!(sdl.contains(field), "{}: スキーマに {field} が無い", o.method);
+            // 変数宣言(`$name: Type`)の型が、スキーマ側の引数(`name: Type`)と一致すること。
+            for v in o.vars.split(", ").filter(|v| !v.is_empty()) {
+                let decl = v.trim_start_matches('$');
+                assert!(sdl.contains(decl), "{}: 引数 `{decl}` の型がスキーマと一致しない", o.method);
+            }
+        }
+    }
 }

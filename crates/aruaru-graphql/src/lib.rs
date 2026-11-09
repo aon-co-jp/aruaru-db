@@ -212,6 +212,27 @@ pub struct MutationRoot(VcsMutation, AdminMutation);
 
 pub type AruaruSchema = Schema<QueryRoot, MutationRoot, EmptySubscription>;
 
+/// 公開 `/graphql` と `/graphql/sdl` 用: 管理 Mutation(`AdminMutation`)を含まない。
+/// 方針(2026-11-04): 管理操作は Connect/gRPC、GraphQL は問い合わせ中心。管理操作は内部の
+/// `AruaruSchema`(Mutation あり)を Connect 層が使い、外へは出さない。
+#[derive(MergedObject, Default)]
+pub struct PublicMutationRoot(VcsMutation);
+
+pub type PublicSchema = Schema<QueryRoot, PublicMutationRoot, EmptySubscription>;
+
+/// 公開用スキーマ(管理 Mutation なし)。`build_schema` と同じデータを注入する。
+pub fn build_public_schema(engine: Arc<QueryEngine>, admin_ctx: AdminCtx) -> PublicSchema {
+    let keyring = admin_ctx.keyring.clone();
+    let mut b = Schema::build(QueryRoot::default(), PublicMutationRoot::default(), EmptySubscription)
+        .enable_federation()
+        .data(engine)
+        .data(admin_ctx);
+    if let Some(k) = keyring {
+        b = b.data(k);
+    }
+    b.finish()
+}
+
 fn builder() -> SchemaBuilder<QueryRoot, MutationRoot, EmptySubscription> {
     Schema::build(QueryRoot::default(), MutationRoot::default(), EmptySubscription)
         .enable_federation()
@@ -232,6 +253,14 @@ pub fn build_schema(engine: Arc<QueryEngine>, admin_ctx: AdminCtx) -> AruaruSche
 
 /// Federation SDL を出力 (wgc / hive CLI 用)
 pub fn subgraph_sdl() -> String {
+    Schema::build(QueryRoot::default(), PublicMutationRoot::default(), EmptySubscription)
+        .enable_federation()
+        .finish()
+        .sdl_with_options(SDLExportOptions::new().federation())
+}
+
+/// 内部スキーマ(管理 Mutation を含む。Connect 層が使う)の SDL。テスト・検査用。
+pub fn subgraph_sdl_full() -> String {
     Schema::build(QueryRoot::default(), MutationRoot::default(), EmptySubscription)
         .enable_federation()
         .finish()
@@ -276,6 +305,23 @@ async fn graphql_handler(
 pub fn graphql_endpoint_for_schema(schema: AruaruSchema) -> impl poem::Endpoint {
     use poem::EndpointExt;
     graphql_handler.data(schema)
+}
+
+#[poem::handler]
+async fn graphql_public_handler(
+    req: &poem::Request,
+    gql_req: GraphQLBatchRequest,
+    schema: poem::web::Data<&PublicSchema>,
+) -> GraphQLBatchResponse {
+    let token = req.header("x-admin-token").map(|v| v.to_string());
+    let batch_req = gql_req.0.data(GraphqlAdminToken(token));
+    schema.execute_batch(batch_req).await.into()
+}
+
+/// 公開 `/graphql` エンドポイント(管理 Mutation なしのスキーマ)。
+pub fn graphql_endpoint_for_public_schema(schema: PublicSchema) -> impl poem::Endpoint {
+    use poem::EndpointExt;
+    graphql_public_handler.data(schema)
 }
 
 pub fn graphql_endpoint(engine: Arc<QueryEngine>, admin_ctx: AdminCtx) -> impl poem::Endpoint {

@@ -59,3 +59,18 @@ export function isViaGateway(): boolean {
   const ep = gqlEndpoint();
   return !ep.includes("localhost") && !ep.includes("127.0.0.1");
 }
+
+const LS_TOKEN_KEY = "aruaru.adminToken";
+
+/** 管理操作の認証トークン(`x-admin-token`)。優先順位: localStorage > 環境変数。未設定なら undefined。 */
+export function adminToken(): string | undefined {
+  return lsGet(LS_TOKEN_KEY) ?? env("VITE_ARUARU_ADMIN_TOKEN");
+}
+
+export function setAdminToken(token: string): void {
+  if (typeof localStorage !== "undefined") localStorage.setItem(LS_TOKEN_KEY, token);
+}
+
+export function clearAdminToken(): void {
+  if (typeof localStorage !== "undefined") localStorage.removeItem(LS_TOKEN_KEY);
+}

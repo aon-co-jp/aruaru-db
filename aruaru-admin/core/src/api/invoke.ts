@@ -1,11 +1,13 @@
 /**
  * aruaru-DB Admin — GraphQL クライアント（REST 廃止・GraphQL 一本化）
  *
- * すべての操作を aruaru-server /graphql (async-graphql) へ GraphQL で送る。
+ * 問い合わせ(Query)は aruaru-server /graphql へ、管理操作(バックアップ・移行・クラスタ・統合など)は
+ * Connect(`POST /open_runo.aruaru.admin.v1.Admin/<Method>`)へ送る(2026-11-09、REST全廃方針。
+ * 公開 /graphql から管理 Mutation は外れた)。
  * 将来 Hive Gateway を差し込む場合は gqlEndpoint() の URL を切り替えるだけ。
  */
 
-import { gqlEndpoint } from "./config";
+import { adminToken, gqlEndpoint } from "./config";
 
 // ── 低レベル GQL 実行 ─────────────────────────────────────────
 
@@ -14,13 +16,29 @@ export interface GqlResult<T = any> {
   errors?: { message: string }[];
 }
 
+/** 管理操作(Connect の単純呼び出し)。`POST {base}/open_runo.aruaru.admin.v1.Admin/<Method>`。 */
+export async function connect<T = any>(method: string, body: Record<string, unknown> = {}): Promise<T> {
+  const base = gqlEndpoint().replace(/\/graphql$/, "");
+  const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json" };
+  const t = adminToken();
+  if (t) headers["x-admin-token"] = t;
+  const res = await fetch(`${base}/open_runo.aruaru.admin.v1.Admin/${method}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  const v: any = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`${v.code ?? res.status}: ${v.message ?? "request failed"}`);
+  return v as T;
+}
+
 export async function gql<T = any>(
   query: string,
   variables?: Record<string, unknown>
 ): Promise<GqlResult<T>> {
   const res = await fetch(gqlEndpoint(), {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json", ...(adminToken() ? { "x-admin-token": adminToken()! } : {}) },
     body: JSON.stringify({ query, variables: variables ?? null }),
   });
   if (!res.ok) throw new Error(`GraphQL HTTP ${res.status}`);
@@ -104,50 +122,24 @@ export async function invoke<T = any>(cmd: string, args: Args = {}): Promise<T> 
         `query { registrySummary { total connectable ga beta pgCompatible planned } }`
       );
     case "registry_crawl":
-      return gqlFirst<T>(
-        `mutation { crawlRegistry { ok updated message } }`
-      );
+      return connect<T>("CrawlRegistry");
     case "registry_test":
-      return gqlFirst<T>(
-        `mutation($id: String!, $uri: String!) {
-           testRegistryConnection(id: $id, uri: $uri) { ok message serverVersion }
-         }`,
-        { id: args.id, uri: args.uri }
-      );
-
+      return connect<T>("TestRegistryConnection", { id: args.id, uri: args.uri });
     // ── バックアップ ─────────────────────────────────────────
     case "list_backups":
       return gqlFirst<T>(
         `query { backups { id createdAt branch commitId kind sizeMb path status } }`
       );
     case "create_backup":
-      return gqlFirst<T>(
-        `mutation($branch: String, $kind: String) {
-           createBackup(config: { branch: $branch, kind: $kind }) {
-             id createdAt branch kind status
-           }
-         }`,
-        { branch: args.branch ?? null, kind: args.kind ?? "full" }
-      );
+      return connect<T>("CreateBackup", { config: { branch: args.branch ?? null, kind: args.kind ?? "full" } });
     case "restore_backup":
-      return gqlFirst<T>(
-        `mutation($id: String!, $target: String) {
-           restoreBackup(input: { backupId: $id, targetBranch: $target }) {
-             success message
-           }
-         }`,
-        { id: args.backupId ?? args.backup_id, target: args.targetBranch ?? null }
-      );
+      return connect<T>("RestoreBackup", {
+        input: { backupId: args.backupId ?? args.backup_id, targetBranch: args.targetBranch ?? null },
+      });
     case "set_backup_schedule":
-      return gqlFirst<T>(
-        `mutation($enabled: Boolean!, $cron: String!, $kind: String!) {
-           setBackupSchedule(input: { enabled: $enabled, cron: $cron, kind: $kind }) {
-             enabled cron kind nextRun
-           }
-         }`,
-        { enabled: args.enabled, cron: args.cron, kind: args.kind ?? "full" }
-      );
-
+      return connect<T>("SetBackupSchedule", {
+        input: { enabled: args.enabled, cron: args.cron, kind: args.kind ?? "full" },
+      });
     // ── クラスタ ─────────────────────────────────────────────
     case "get_cluster_status":
       return gqlFirst<T>(
@@ -160,59 +152,28 @@ export async function invoke<T = any>(cmd: string, args: Args = {}): Promise<T> 
          }`
       );
     case "add_cluster_node":
-      return gqlFirst<T>(
-        `mutation($nodeId: Int!, $addr: String!) {
-           clusterNodeOp(input: { action: "add", nodeId: $nodeId, addr: $addr }) {
-             success message
-           }
-         }`,
-        { nodeId: args.nodeId ?? args.node_id, addr: args.addr }
-      );
+      return connect<T>("ClusterNodeOp", {
+        input: { action: "add", nodeId: args.nodeId ?? args.node_id, addr: args.addr },
+      });
     case "decommission_node":
-      return gqlFirst<T>(
-        `mutation($nodeId: Int!) {
-           clusterNodeOp(input: { action: "remove", nodeId: $nodeId, addr: "" }) {
-             success message
-           }
-         }`,
-        { nodeId: args.nodeId ?? args.node_id }
-      );
+      return connect<T>("ClusterNodeOp", {
+        input: { action: "remove", nodeId: args.nodeId ?? args.node_id, addr: "" },
+      });
     case "rebalance_cluster":
-      return gqlFirst<T>(
-        `mutation { rebalanceCluster { success message } }`
-      );
+      return connect<T>("RebalanceCluster");
     case "cluster_propose":
-      return gqlFirst<T>(
-        `mutation($sql: String!) { clusterPropose(sql: $sql) { success message } }`,
-        { sql: args.sql }
-      );
-
+      return connect<T>("ClusterPropose", { sql: args.sql });
     // ── 並列実行 ─────────────────────────────────────────────
     case "get_parallel_config":
       return gqlFirst<T>(
         `query { parallelConfig { enabled maxWorkers chunkSize strategy } }`
       );
     case "set_parallel_config":
-      return gqlFirst<T>(
-        `mutation($enabled: Boolean!, $workers: Int!, $chunk: Int!, $strategy: String!) {
-           setParallelConfig(config: {
-             enabled: $enabled, maxWorkers: $workers, chunkSize: $chunk, strategy: $strategy
-           }) { enabled maxWorkers chunkSize strategy }
-         }`,
-        {
-          enabled: args.config?.enabled ?? args.enabled ?? false,
-          workers: args.config?.max_workers ?? args.max_workers ?? 4,
-          chunk:   args.config?.chunk_size ?? args.chunk_size ?? 10000,
-          strategy: args.config?.strategy ?? args.strategy ?? "hash",
-        }
-      );
+      // 並列実行の設定は宣言的設定(aruaru.yaml の query.parallel、ホットリロード)で行う。
+      // 旧 GraphQL `setParallelConfig` は2026-08-29に撤廃済み(この呼び出しは以前から失敗していた)。
+      throw new Error("並列実行の設定は aruaru.yaml の query.parallel で行います(画面からは変更できません)");
     case "explain_distributed":
-      return gqlFirst<T>(
-        `mutation($sql: String!) {
-           explainDistributed(sql: $sql) { step node range operation estimatedRows }
-         }`,
-        { sql: args.sql }
-      );
+      return connect<T>("ExplainDistributed", { sql: args.sql });
     case "list_parallel_jobs":
       return gqlFirst<T>(
         `query { parallelJobs { jobId sql status workers elapsedMs rowsProcessed startedAt } }`
@@ -224,78 +185,38 @@ export async function invoke<T = any>(cmd: string, args: Args = {}): Promise<T> 
         `query { federatedSources { name kind uri status tables } }`
       );
     case "register_federated_source":
-      return gqlFirst<T>(
-        `mutation($name: String!, $kind: String!, $uri: String!) {
-           registerFederatedSource(input: { name: $name, kind: $kind, uri: $uri }) {
-             name kind uri status tables
-           }
-         }`,
-        { name: args.name, kind: args.kind, uri: args.uri }
-      );
+      return connect<T>("RegisterFederatedSource", {
+        input: { name: args.name, kind: args.kind, uri: args.uri },
+      });
     case "test_federated_source":
-      return gqlFirst<T>(
-        `mutation($kind: String!, $uri: String!) {
-           testSourceConnection(source: $kind, uri: $uri) { ok message serverVersion }
-         }`,
-        { kind: args.kind, uri: args.uri }
-      );
+      return connect<T>("TestSourceConnection", { source: args.kind, uri: args.uri });
     case "drop_federated_source":
-      return gqlFirst<T>(
-        `mutation($name: String!) { dropFederatedSource(name: $name) { success message } }`,
-        { name: args.name }
-      );
+      return connect<T>("DropFederatedSource", { name: args.name });
     case "federated_query":
-      return gqlFirst<T>(
-        `mutation($sql: String!) {
-           federatedQuery(sql: $sql) { columns rows commandTag }
-         }`,
-        { sql: args.sql }
-      );
-
+      return connect<T>("FederatedQuery", { sql: args.sql });
     // ── マイグレーション ──────────────────────────────────────
     case "test_source_connection":
-      return gqlFirst<T>(
-        `mutation($source: String!, $uri: String!) {
-           testSourceConnection(source: $source, uri: $uri) { ok message serverVersion }
-         }`,
-        { source: args.source, uri: args.uri }
-      );
+      return connect<T>("TestSourceConnection", { source: args.source, uri: args.uri });
     case "preview_source_schema":
-      return gqlFirst<T>(
-        `query($source: String!, $uri: String!) {
-           previewSource(source: $source, uri: $uri) { schema name estimatedRows }
-         }`,
-        { source: args.source, uri: args.uri }
-      );
+      return connect<T>("PreviewSource", { source: args.source, uri: args.uri });
     case "run_migration":
-      return gqlFirst<T>(
-        `mutation($source: String!, $uri: String!, $msg: String, $tables: [String!]) {
-           runMigration(input: {
-             source: $source, sourceUri: $uri, commitMessage: $msg, includeTables: $tables
-           }) {
-             success wire totalRows commitId message
-             tables { table rows error }
-           }
-         }`,
-        {
+      return connect<T>("RunMigration", {
+        input: {
           source: args.source,
-          uri: args.source_uri ?? args.sourceUri,
-          msg: args.commit_message ?? args.commitMessage ?? null,
-          tables: args.include_tables ?? args.includeTables ?? null,
-        }
-      );
+          sourceUri: args.source_uri ?? args.sourceUri,
+          commitMessage: args.commit_message ?? args.commitMessage ?? null,
+          includeTables: args.include_tables ?? args.includeTables ?? null,
+        },
+      });
     case "migrate_instance":
-      return gqlFirst<T>(
-        `mutation($uri: String!, $history: Boolean!) {
-           runMigration(input: {
-             source: "aruaru", sourceUri: $uri,
-             commitMessage: "Instance migration",
-             includeTables: null
-           }) { success totalRows commitId message }
-         }`,
-        { uri: args.targetUri ?? args.target_uri, history: args.includeHistory ?? true }
-      );
-
+      return connect<T>("RunMigration", {
+        input: {
+          source: "aruaru",
+          sourceUri: args.targetUri ?? args.target_uri,
+          commitMessage: "Instance migration",
+          includeTables: null,
+        },
+      });
     default:
       throw new Error(`unknown command: ${cmd}`);
   }

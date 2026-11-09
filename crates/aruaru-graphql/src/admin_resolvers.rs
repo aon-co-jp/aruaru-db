@@ -23,6 +23,7 @@ use crate::admin_types::*;
 /// **同一の**`Arc<dyn ReplicatedWriter>`を`main.rs`から注入する
 /// (`replicator: Option<..>` — クラスタ構築に成功した場合のみ`Some`、
 /// 単一ノード/非クラスタ構成では`None`のまま、既存動作を変えない)。
+#[derive(Clone)]
 pub struct AdminCtx {
     pub engine: Arc<QueryEngine>,
     pub registry: Arc<Registry>,
@@ -1771,7 +1772,7 @@ mod cluster_propose_tests {
     use aruaru_dist::{Applier, Command, CommandResponse, RaftNode, RaftWriter, ReplicatedWriter};
     use aruaru_query::QueryEngine;
 
-    use crate::{build_schema, AdminCtx, GraphqlAdminToken};
+    use crate::{build_public_schema, build_schema, AdminCtx, GraphqlAdminToken};
 
     /// `ARUARU_DB_ADMIN_TOKEN`はプロセス全体のグローバル環境変数のため、
     /// このモジュール内のテストが並行に読み書きすると競合する
@@ -1953,6 +1954,35 @@ mod cluster_propose_tests {
             "replicator未設定時はフォールバックのはず: {result:?}"
         );
         assert!(engine.table_names().contains(&"t2".to_string()));
+    }
+
+    /// **2026-11-09追加**: 公開 `/graphql`(`build_public_schema`)は管理 Mutation を持たない
+    /// (管理操作は Connect のみ)。Query(読み取り)は引き続き通り、内部の `build_schema`
+    /// (Connect 層が使う)では管理 Mutation が従来どおり実行できる。
+    #[tokio::test]
+    async fn public_schema_has_no_admin_mutations_but_keeps_queries() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ARUARU_DB_ADMIN_TOKEN", TEST_ADMIN_TOKEN);
+
+        let engine = Arc::new(QueryEngine::new());
+        let public = build_public_schema(engine.clone(), admin_ctx(engine.clone(), None));
+        let resp = public
+            .execute(authorized_request(
+                r#"mutation { clusterPropose(sql: "CREATE TABLE pub1 (id INT PRIMARY KEY)") { success } }"#,
+            ))
+            .await;
+        assert!(!resp.errors.is_empty(), "公開スキーマで管理Mutationが通ってはいけない");
+        assert!(
+            resp.errors.iter().any(|e| e.message.contains("clusterPropose")),
+            "unknown field エラーのはず: {:?}",
+            resp.errors
+        );
+        assert!(!engine.table_names().contains(&"pub1".to_string()));
+        // Query は通る
+        let q = public.execute(authorized_request("query { clusterStatus { stats { totalNodes } } }")).await;
+        assert!(q.errors.is_empty(), "query は通るはず: {:?}", q.errors);
+        // 公開SDLに管理Mutationが出ない
+        assert!(!crate::subgraph_sdl().contains("clusterPropose"));
     }
 
     /// **2026-08-01追加(実バグ修正の検証)**: `/graphql`経由の管理操作は

@@ -515,10 +515,7 @@ async fn main() -> anyhow::Result<()> {
         // mutation でもそのまま保てる。`KeyGuardian` は `build_schema` が
         // `AdminCtx.keyring` と同一インスタンスを schema data へ渡す。
 
-        let gql_schema = aruaru_graphql::build_schema(
-
-                gql_engine.clone(),
-                aruaru_graphql::AdminCtx {
+        let gql_admin_ctx = aruaru_graphql::AdminCtx {
                     engine: gql_engine.clone(),
                     registry: registry.clone(),
                     backup: backup_engine.clone(),
@@ -540,12 +537,13 @@ async fn main() -> anyhow::Result<()> {
                     multi_raft: Some(multi_raft_for_graphql.clone()),
                     hlc: Some(hlc_for_graphql.clone()),
                     columnar: columnar_for_graphql.clone(),
-                },
-            
-        );
+                };
+        let gql_schema = aruaru_graphql::build_schema(gql_engine.clone(), gql_admin_ctx.clone());
+        // 公開 /graphql と /graphql/sdl は管理 Mutation を含まないスキーマ(管理操作は Connect のみ)。
+        let gql_public_schema = aruaru_graphql::build_public_schema(gql_engine.clone(), gql_admin_ctx);
         let app = Route::new()
             .at("/healthz", get(healthz))
-            .at("/graphql", aruaru_graphql::graphql_endpoint_for_schema(gql_schema.clone()))
+            .at("/graphql", aruaru_graphql::graphql_endpoint_for_public_schema(gql_public_schema))
             .nest("/", aruaru_graphql::connect::connect_endpoint(gql_schema.clone()))
             .at("/graphql/sdl", get(subgraph_sdl))
             .nest("/open_runo.aruaru.admin.v1.AdminNode", admin::admin_connect_routes(admin_state.clone()))

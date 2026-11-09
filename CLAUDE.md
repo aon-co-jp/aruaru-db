@@ -7241,3 +7241,10 @@ ROLLBACKし忘れれば発生しうる根本的な設計上の欠陥である**�
 
 ## 旧REST残骸の削除(2026-11-09)
 `crates/aruaru-server/src/admin.rs` の未使用だった旧RESTハンドラ23本(backup/migrate/federation/cluster/registry、`migrate_instance` スタブ含む)・リクエスト型8個・補助関数(`now`/`tcp_reachable`/`wire_for_source`)と、`cluster.rs` の `build_cluster`/`propose_write`/`propose_commit`/`summarize` を削除(約540行)。WSL(Ubuntu-24.04)で `cargo check`(警告は未読フィールド `engine`/`registry`/`backups` と `replicator` のみ)・`cargo test -p aruaru-server -p aruaru-graphql` 全通過。実サーバーの起動確認・本番反映は未実施(挙動は変わらない削除のため。次の通常ビルド時に反映される)。**未了**: 管理系GraphQL Mutationの削除(Connect層がGraphQL文書を内部実行しているため先にresolverの共有関数化が要る)、Tauri画面のブラウザ確認。
+
+## 管理 GraphQL Mutation を公開 /graphql から撤去(2026-11-09)
+- **公開 `/graphql` と `/graphql/sdl` は `PublicSchema`(Query + `VcsMutation`。管理 Mutation = `AdminMutation` なし)**。内部の `AruaruSchema`(管理 Mutation あり)は Connect 層(`connect.rs`)だけが使う。`AdminCtx` は `Clone`。方針: 管理操作は Connect/gRPC、GraphQL は問い合わせ。
+- **Connect に追加**(以前 GraphQL だけで呼べた11操作): `ObjectTableCommit`/`ObjectTablePrune`/`RevokeKeys`/`ClosedTsRegisterRange`/`ClosedTsAdvance`/`WalAppend`/`WalCreateImageLayer`/`ShardedStorePut`/`MultiRaftSplit`/`MultiRaftMerge`/`EphemeralQuery`(計32メソッド)。変数名は GraphQL の引数名(camelCase)。テスト `every_op_document_parses_and_names_exist_in_the_schema` で文書の構文・フィールド名・引数型をスキーマと照合。
+- **Web 管理画面(`aruaru-admin/core/src/api/invoke.ts`)**: 管理操作を `connect()` へ移行。**以前から不整合だった点も修正**: (1) `x-admin-token` を一切送っていなかった → `localStorage["aruaru.adminToken"]` または `VITE_ARUARU_ADMIN_TOKEN` から送る(`config.ts` の `adminToken()`)、(2) `explain_distributed` を mutation で呼んでいた(実体は Query)、(3) `set_parallel_config` は存在しない `setParallelConfig` を呼んでいた(2026-08-29撤廃済み)→ 「`aruaru.yaml: query.parallel` で設定」と明示エラーに。TypeScript は構文・型検査のみ(tsc)、ブラウザでの画面確認は未実施。
+- **確認(WSL実サーバー)**: 公開 `/graphql` の `mutation{rebalanceCluster}` は `Unknown field`、Query は 200、`/graphql/sdl` に管理 Mutation なし。Connect は認証なし401・重複キー400・`RebalanceCluster`/`ShardedStorePut`/`RevokeKeys`/`MultiRaftSplit` 200、旧 `/admin/cluster` 404。`cargo test -p aruaru-server -p aruaru-graphql` 全通過。
+- **未了**: Web 管理画面のブラウザ確認(トークン入力UIは無く、localStorage か環境変数で設定)、Tauri 画面のブラウザ確認、本番(VPS)への反映(WSLリリースビルド→入れ替え。次の通常デプロイで)。
