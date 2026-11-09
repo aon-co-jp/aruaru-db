@@ -234,6 +234,66 @@ fn parse_create_table(sql: &str) -> Result<Statement, String> {
     Ok(Statement::CreateTable { table, columns })
 }
 
+/// `s[from..]` で、単引用符のリテラル(`''` は引用符1個)の外にある最初の `)` の位置(`s` 全体での位置)。
+fn find_unquoted_close_paren(s: &str, from: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = from;
+    let mut in_quote = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                if in_quote && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 1; // `''` エスケープ
+                } else {
+                    in_quote = !in_quote;
+                }
+            }
+            b')' if !in_quote => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 単引用符のリテラルの外にある `,` だけで分割する(前後の空白は各要素で除去)。
+fn split_values_quote_aware(s: &str) -> Vec<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    let mut in_quote = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                if in_quote && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 1;
+                } else {
+                    in_quote = !in_quote;
+                }
+            }
+            b',' if !in_quote => {
+                out.push(s[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(s[start..].trim().to_string());
+    out
+}
+
+/// 値のリテラルを素の文字列へ。`'...'` なら外側の引用符1組だけを外し `''`→`'` に戻す。
+/// 引用符で囲まれていない値(数値など)は従来どおり前後の引用符を落とすだけ。
+fn unquote_sql_literal(v: &str) -> String {
+    let v = v.trim();
+    if v.len() >= 2 && v.starts_with('\'') && v.ends_with('\'') {
+        return v[1..v.len() - 1].replace("''", "'");
+    }
+    v.trim_matches(|c| c == '\'' || c == '"').to_string()
+}
+
 fn parse_insert(sql: &str) -> Result<Statement, String> {
     // INSERT INTO name (c1, c2) VALUES (v1, v2) [ON CONFLICT (c) DO UPDATE SET .../DO NOTHING]
     let after = sql[11..].trim(); // "INSERT INTO".len() == 11
@@ -258,12 +318,13 @@ fn parse_insert(sql: &str) -> Result<Statement, String> {
     let vopen = values_part
         .find('(')
         .ok_or_else(|| "INSERT: missing values '('".to_string())?;
-    let vclose = values_part
-        .find(')')
+    // 値のリテラルにはJSONなど `,` や `)` を含む文字列が来る(例: `'{"a":1,"b":[2]}'`)。
+    // 単純に `)` を探して `,` で割ると列数が合わなくなるため、引用符の中は読み飛ばす。
+    let vclose = find_unquoted_close_paren(values_part, vopen + 1)
         .ok_or_else(|| "INSERT: missing values ')'".to_string())?;
-    let values: Vec<String> = values_part[vopen + 1..vclose]
-        .split(',')
-        .map(|v| v.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
+    let values: Vec<String> = split_values_quote_aware(&values_part[vopen + 1..vclose])
+        .into_iter()
+        .map(|v| unquote_sql_literal(&v))
         .collect();
 
     if columns.len() != values.len() {
@@ -683,5 +744,21 @@ mod tests {
                 values: vec!["1".into(), "Alice".into()],
             }
         );
+    }
+
+    #[test]
+    fn insert_values_with_commas_parens_and_quotes_inside_literals() {
+        // JSON を値に持つ upsert(open-runo-db の kv_store.put が実際に送る形)。
+        let sql = "INSERT INTO kv_store (pk,table_name,key,value) VALUES ('t\u{1}k','t','k','{\"a\":1,\"b\":[2,3],\"c\":\"x) y\",\"d\":\"it''s\"}') ON CONFLICT (pk) DO UPDATE SET value=EXCLUDED.value";
+        match parse(sql).unwrap() {
+            Statement::Upsert { table, columns, values, conflict_column, .. } => {
+                assert_eq!(table, "kv_store");
+                assert_eq!(columns.len(), 4);
+                assert_eq!(values.len(), 4);
+                assert_eq!(values[3], "{\"a\":1,\"b\":[2,3],\"c\":\"x) y\",\"d\":\"it's\"}");
+                assert_eq!(conflict_column.as_deref(), Some("pk"));
+            }
+            other => panic!("expected Upsert, got {other:?}"),
+        }
     }
 }
