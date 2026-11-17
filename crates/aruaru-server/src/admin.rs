@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use poem::{handler, post, web::Data, web::Json, Endpoint, EndpointExt, Request, Route};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use aruaru_dist::admin_shared::{
@@ -30,9 +30,6 @@ use crate::cluster::ClusterNode;
 // ── 共有状態 ───────────────────────────────────────────────────
 
 pub struct AdminState {
-    pub engine: Arc<QueryEngine>,
-    pub registry: Arc<Registry>,
-    backups: Mutex<Vec<BackupManifest>>,
     /// 【2026-08-29改修】`Arc<Mutex<..>>`化——`aruaru_dist::admin_shared`の
     /// 共有型を使い、GraphQL側(`AdminCtx.schedule`)へ`schedule_handle()`
     /// 経由で同一インスタンスを渡す(`topology`と同じパターン)。
@@ -136,11 +133,8 @@ pub struct AdminState {
 }
 
 impl AdminState {
-    pub fn new(engine: Arc<QueryEngine>, registry: Arc<Registry>) -> Arc<Self> {
+    pub fn new(_engine: Arc<QueryEngine>, _registry: Arc<Registry>) -> Arc<Self> {
         Arc::new(Self {
-            engine,
-            registry,
-            backups: Mutex::new(Vec::new()),
             schedule: Arc::new(Mutex::new(None)),
             parallel: Arc::new(Mutex::new(ParallelConfigState::default())),
             federation: Arc::new(Mutex::new(Vec::new())),
@@ -195,6 +189,7 @@ impl AdminState {
         *self.replicator.lock() = Some(replicator);
     }
 
+    #[cfg(feature = "disaster_email_backup")]
     pub fn replicator(&self) -> Option<Arc<dyn aruaru_dist::ReplicatedWriter>> {
         self.replicator.lock().clone()
     }
@@ -368,18 +363,6 @@ fn check_admin_auth(
 
 
 // ── 型定義 ─────────────────────────────────────────────────────
-
-#[derive(Clone, Serialize)]
-struct BackupManifest {
-    id: String,
-    kind: String,
-    started_at: String,
-    finished_at: String,
-    size_bytes: u64,
-    row_count: u64,
-    commit_id: String,
-    branch: String,
-}
 
 // `ScheduleInfo`は`aruaru_dist::admin_shared::BackupScheduleState`(共有型)
 // へ統合済み(2026-08-29)——REST/GraphQL両方が同じ構造体・同じ
