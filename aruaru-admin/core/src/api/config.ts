@@ -74,3 +74,21 @@ export function setAdminToken(token: string): void {
 export function clearAdminToken(): void {
   if (typeof localStorage !== "undefined") localStorage.removeItem(LS_TOKEN_KEY);
 }
+
+/**
+ * サーバーのベース URL(`/graphql` を除いたもの)。Connect の呼び出し先
+ * (`POST <base>/open_runo.admin.v1.Admin/<Method>`)の基準になる。
+ */
+export function serverBase(): string {
+  return gqlEndpoint().replace(/\/graphql$/, "");
+}
+
+/** ベース URL を上書き保存する(`/graphql` は自動で付ける)。 */
+export function setServerBase(base: string): void {
+  setGqlEndpoint(`${base.replace(/\/+$/, "")}/graphql`);
+}
+
+/** ベース URL の上書きをリセットする。 */
+export function clearServerBase(): void {
+  clearGqlEndpoint();
+}

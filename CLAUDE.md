@@ -7250,3 +7250,8 @@ ROLLBACKし忘れれば発生しうる根本的な設計上の欠陥である**�
 - **未了**: Web 管理画面のブラウザ確認(トークン入力UIは無く、localStorage か環境変数で設定)、Tauri 画面のブラウザ確認、(本番反映は下記で完了)。
 
 - **本番反映(2026-11-09 完了)**: WSL(Ubuntu-24.04)でリリースビルド(既定機能、GLIBC_2.39)→ scp → `target/release/aruaru-server` を入れ替え(旧は `aruaru-server.before-20261109`)→ `aruaru-server.service`・`realdata-aruaru-db.service` を再起動。確認: 両ポート(4001/14001)で healthz 200・Connect 認証なし401、公開 `/graphql` の管理 Mutation は `Unknown field`。VPS上のクローンは `849f082` のまま(未コミット変更1件があるため `git pull` していない。ソース整列は次回)。
+
+## Web管理画面(aruaru-admin)のブラウザ確認と白画面バグ修正(2026-11-17)
+- ローカルで `aruaru-server`(`ARUARU_DB_ADMIN_TOKEN` 設定、`--gql-port 4000`)+ `aruaru-db-admin-web`(vite、5174)を起動し、ブラウザで全10画面を通した。**修正前は白画面**だった(いずれも以前からの不具合): (1)`core/src/api/config.ts` に `serverBase`/`setServerBase`/`clearServerBase` が無く `App.tsx` が読み込めない → 追加、(2)web版のviteが `@tauri-apps/plugin-dialog` を解決できず500 → `aruaru-db-admin-web/src/tauri-dialog-stub.ts` へalias、(3)クラスタ画面が camelCase の応答を snake_case 前提で読み落ちる → `mapClusterStatus`、(4)対応DB画面がサーバーの日本語ステータスで落ちる → `mapRegistry`で正規化。
+- 確認結果: 全10画面が描画、`CreateBackup` は token なし=401・token あり=200(画面は「完了」)、`RebalanceCluster` 200、旧RESTの呼び出し0。`vite build` 成功。`tsc --noEmit` は `@types/react` 解決などの型エラーが残る(以前から、未対応)。ダッシュボード・ブランチ・クエリは「実装中」のスタブ。
+- 本番(VPS)に出ているのは `web/` のデモUIで、`aruaru-db-admin-web` は配備していない(Dockerfile/nginx.confのみ)。

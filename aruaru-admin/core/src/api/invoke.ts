@@ -114,13 +114,17 @@ export async function invoke<T = any>(cmd: string, args: Args = {}): Promise<T> 
 
     // ── レジストリ ───────────────────────────────────────────
     case "list_registry":
-      return gqlFirst<T>(
+      return gqlFirst<any>(
         `query { registry { id name category wire status rank score updatedAt } }`
-      );
+      ).then((rows) => mapRegistry(rows) as T);
     case "registry_summary":
-      return gqlFirst<T>(
+      return gqlFirst<any>(
         `query { registrySummary { total connectable ga beta pgCompatible planned } }`
-      );
+      ).then((s) => ({
+        total: s?.total ?? 0, ga: s?.ga ?? 0, beta: s?.beta ?? 0,
+        pg_compatible: s?.pgCompatible ?? 0, read_only: 0, planned: s?.planned ?? 0,
+        postgres_wire: s?.connectable ?? 0,
+      }) as T);
     case "registry_crawl":
       return connect<T>("CrawlRegistry");
     case "registry_test":
@@ -142,7 +146,7 @@ export async function invoke<T = any>(cmd: string, args: Args = {}): Promise<T> 
       });
     // ── クラスタ ─────────────────────────────────────────────
     case "get_cluster_status":
-      return gqlFirst<T>(
+      return gqlFirst<any>(
         `query {
            clusterStatus {
              stats { totalNodes healthyNodes totalRanges totalRows tableCount replicationFactor underReplicated }
@@ -150,7 +154,7 @@ export async function invoke<T = any>(cmd: string, args: Args = {}): Promise<T> 
              ranges { rangeId startKey endKey leaderNode replicas sizeMb }
            }
          }`
-      );
+      ).then((c) => mapClusterStatus(c) as T);
     case "add_cluster_node":
       return connect<T>("ClusterNodeOp", {
         input: { action: "add", nodeId: args.nodeId ?? args.node_id, addr: args.addr },
@@ -220,4 +224,72 @@ export async function invoke<T = any>(cmd: string, args: Args = {}): Promise<T> 
     default:
       throw new Error(`unknown command: ${cmd}`);
   }
+}
+
+/**
+ * GraphQL の `clusterStatus`(camelCase)を、`ClusterView` が期待する
+ * snake_case の形へ変換する。サーバーが返さない項目(Raft term・CPU など)は
+ * 0 で補う(画面は未取得項目を 0 として表示する)。
+ */
+function mapClusterStatus(c: any) {
+  const s = c?.stats ?? {};
+  const nodes = (c?.nodes ?? []) as any[];
+  const ranges = (c?.ranges ?? []) as any[];
+  return {
+    stats: {
+      total_nodes: s.totalNodes ?? nodes.length,
+      healthy_nodes: s.healthyNodes ?? nodes.filter((n) => n.alive).length,
+      total_ranges: s.totalRanges ?? ranges.length,
+      total_rows: s.totalRows ?? 0,
+      total_disk_gb: nodes.reduce((a, n) => a + (n.diskUsedGb ?? 0), 0),
+      raft_term: 0,
+      replication_factor: s.replicationFactor ?? 0,
+    },
+    nodes: nodes.map((n) => ({
+      node_id: n.nodeId,
+      addr: n.addr,
+      role: n.role,
+      term: 0,
+      commit_index: n.commitIndex ?? 0,
+      applied_index: n.appliedIndex ?? 0,
+      ranges: n.ranges ?? 0,
+      disk_used_gb: n.diskUsedGb ?? 0,
+      cpu_pct: 0,
+      last_heartbeat_ms: 0,
+    })),
+    ranges: ranges.map((r) => ({
+      range_id: r.rangeId,
+      start_key: r.startKey,
+      end_key: r.endKey,
+      leader_node: r.leaderNode,
+      replicas: r.replicas ?? [],
+      size_mb: r.sizeMb ?? 0,
+      rows: 0,
+    })),
+  };
+}
+
+/** サーバーが返す日本語/英語のステータス表記を、画面の 5 段階キーへ正規化する。 */
+const REGISTRY_STATUS: Record<string, string> = {
+  GA: "Ga", Ga: "Ga", ga: "Ga",
+  Beta: "Beta", beta: "Beta",
+  "PG互換接続可": "PgCompatible", PgCompatible: "PgCompatible",
+  "読取専用": "ReadOnly", ReadOnly: "ReadOnly",
+  "計画中": "Planned", Planned: "Planned",
+};
+
+/** `registry` の camelCase 行を、`DatabaseRegistry` の snake_case の形へ変換する。 */
+function mapRegistry(rows: any) {
+  return ((rows ?? []) as any[]).map((r) => ({
+    id: r.id,
+    name: r.name ?? r.id,
+    category: r.category ?? "",
+    wire: r.wire ?? "",
+    status: REGISTRY_STATUS[r.status] ?? "Planned",
+    migrate: r.migrate ?? "",
+    backup: r.backup ?? "",
+    rank: r.rank ?? null,
+    score: r.score ?? null,
+    updated_at: r.updatedAt ?? null,
+  }));
 }
