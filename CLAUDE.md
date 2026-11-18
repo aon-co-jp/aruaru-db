@@ -7255,3 +7255,20 @@ ROLLBACKし忘れれば発生しうる根本的な設計上の欠陥である**�
 - ローカルで `aruaru-server`(`ARUARU_DB_ADMIN_TOKEN` 設定、`--gql-port 4000`)+ `aruaru-db-admin-web`(vite、5174)を起動し、ブラウザで全10画面を通した。**修正前は白画面**だった(いずれも以前からの不具合): (1)`core/src/api/config.ts` に `serverBase`/`setServerBase`/`clearServerBase` が無く `App.tsx` が読み込めない → 追加、(2)web版のviteが `@tauri-apps/plugin-dialog` を解決できず500 → `aruaru-db-admin-web/src/tauri-dialog-stub.ts` へalias、(3)クラスタ画面が camelCase の応答を snake_case 前提で読み落ちる → `mapClusterStatus`、(4)対応DB画面がサーバーの日本語ステータスで落ちる → `mapRegistry`で正規化。
 - 確認結果: 全10画面が描画、`CreateBackup` は token なし=401・token あり=200(画面は「完了」)、`RebalanceCluster` 200、旧RESTの呼び出し0。`vite build` 成功。`tsc --noEmit` は `@types/react` 解決などの型エラーが残る(以前から、未対応)。ダッシュボード・ブランチ・クエリは「実装中」のスタブ。
 - 本番(VPS)に出ているのは `web/` のデモUIで、`aruaru-db-admin-web` は配備していない(Dockerfile/nginx.confのみ)。
+
+
+## HANDOFF追記(2026-11-18 続き33) Python asyncpg 実サーバ往復 green・`close()` ハング修正(別アカウントでの再開用)
+**日本語**
+- リポジトリ: `aon-co-jp/aruaru-db`(`F:unoepositoryruaru-db`)。コミット `e9bf50b`(push済み)。VPS は `1566c0b` 反映済みのまま(今回はクライアント側のみの変更で再配備不要)。
+- `clients/python-aruaru-db`: `live-check.py` が実サーバ(`--pg-port 5433`)で `as-of qty='1' / latest qty='5'` / `OK`。単体4件 green。**「`connect()` でハング」は誤診**で、実際は最後の `close()` が固まっていた(aruaru-server は Terminate 後もソケットを閉じない)。`AruaruDb.close(timeout=2.0)` を追加(時間切れで `terminate()`)。`db.raw.close()` ではなく `db.close()` を使う。
+- 落とし穴: `aruaru-server` の既定 pg ポートは **5432**(`--pg-port 5433 --gql-port 4001 --data <dir>`、`ARUARU_USERS=app:secret`)。`../RS-JSON` のクローンが古いと `rust_json::parse_secure` が無くビルドが落ちる(履歴が書き直されているので `git pull` ではなく `fetch`+`reset --hard origin/main`)。ビルドで `Cargo.lock` が変わるので `git checkout Cargo.lock` で戻す。`data/` は試験の残り(未追跡、コミットしない)。
+- 未了: `aruaru-wire` の型付き結果(列OIDを実型に)、GPU側(`open-cuda/OmniGPU-Design.md §12.4` の `dxil-spirv` vs `naga`、macOS/MoltenVK 実機)、aruaru-llm スライスC(`ARUARU_LLM_ENABLE_*` の能力交渉自動化)。
+**English**
+- Repo: `aon-co-jp/aruaru-db` (`F:unoepositoryruaru-db`), commit `e9bf50b` (pushed); the VPS stays at `1566c0b` (client-only change, no redeploy needed).
+- `clients/python-aruaru-db`: `live-check.py` passes against a real server (`as-of qty='1' / latest qty='5'` / `OK`), 4 unit tests green. The old "hang on `connect()`" was a misdiagnosis: the final `close()` hung because aruaru-server does not close the socket after Terminate. Added `AruaruDb.close(timeout=2.0)` (falls back to `terminate()`); use `db.close()`, not `db.raw.close()`.
+- Pitfalls: the default pg port is **5432** (`--pg-port 5433 --gql-port 4001 --data <dir>`, `ARUARU_USERS=app:secret`); a stale `../RS-JSON` clone lacks `parse_secure` and breaks the build (history was rewritten: `fetch` + `reset --hard origin/main`, never `pull`); builds rewrite `Cargo.lock` (`git checkout Cargo.lock`); `data/` is test residue (untracked, do not commit).
+- Open: typed result columns in `aruaru-wire`; GPU side (`dxil-spirv` vs `naga`, macOS/MoltenVK); aruaru-llm slice C.
+
+### 再開用メッセージ / Resume message
+**日本語**: `F:unoepositoryruaru-db\CLAUDE.md` 末尾「続き33」を読んでから再開。Python asyncpg 往復は完了済み。次は(1)`aruaru-wire` の型付き結果、(2)GPU `OmniGPU-Design.md §12.4`、(3)aruaru-llm スライスC。REST新設禁止(Connectのみ)、秘密は出さない、実機で確認してから完了報告、返答は日本語のみ、push・タグは確認してから。
+**English**: Read "続き33" at the end of `F:unoepositoryruaru-db\CLAUDE.md`, then resume. The Python asyncpg round trip is done. Next: (1) typed results in `aruaru-wire`, (2) GPU `OmniGPU-Design.md §12.4`, (3) aruaru-llm slice C. No new REST (Connect only), never print secrets, verify on real systems before reporting done, reply in Japanese only, confirm before pushing or tagging.
