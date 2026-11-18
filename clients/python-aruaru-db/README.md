@@ -80,23 +80,20 @@ python -m unittest discover -s tests   # ネットワーク不要(4 件)= green
 ```
 実サーバ往復は別途 `asyncpg` / `psycopg` を入れて DSN を通す。
 
-## 検証状況(2026-09-03、asyncpg 実サーバ往復)
+## 検証状況(2026-11-18、asyncpg 実サーバ往復 = green)
 
-- `pip install asyncpg`(0.31.0)を実際に導入し、`live-check.py`
-  (`ARUARU_DB_DSN=... python live-check.py`)でローカル `aruaru-server`
-  (:5433)への実往復を試みたが、**`asyncpg.connect()`/
-  `asyncpg.create_pool()` の時点でハング**(30秒タイムアウトで強制終了、
-  `pool=False` の単一接続でも同様)し、`commit()`/`query_as_of()` まで
-  到達しなかった。**未解決**。
-- 推定原因(未確証): asyncpg は接続確立時に PostgreSQL の型カタログへ
-  イントロスペクションクエリを発行する(内蔵の `introspection.py`)。
-  同時期に `.NET`(Npgsql)コネクタでも同種の症状
-  (`NpgsqlDataSource` の既定ブートストラップが `pg_catalog` の完全
-  実装を前提とし `"SELECT: missing FROM"` で失敗)が実際に発生し、
-  `ServerCompatibilityMode.NoTypeLoading` で回避できた(`../dotnet-
-  aruaru-db/README.md` 参照)。asyncpg 側でも同様の型イントロスペクション
-  回避オプション(`server_settings`・カスタム型コーデック登録による
-  ブートストラップ短絡等)が無いか、次回調査すること。
-- Rust `tokio-postgres`(`rust-aruaru-db`)/ Node `pg`(`node-aruaru-db`)/
-  .NET `Npgsql`(`NoTypeLoading` 設定後)はいずれも実サーバ往復まで
-  green 済み(2026-09-03)——asyncpg 固有の問題である可能性が高い。
+- `ARUARU_USERS=app:secret aruaru-server --pg-port 5433` に対し
+  `live-check.py` が `as-of qty='1' / latest qty='5'` / `OK` で通る
+  (asyncpg 0.31.0、Python 3.14、Windows)。接続・CREATE/INSERT/UPDATE・
+  `aruaru_commit`・`AS OF COMMIT` はすべて正常。
+- **2026-09-03 に記録した「`connect()` でハング」は誤診だった**。実際に
+  固まっていたのは最後の `close()`:aruaru-server は Terminate 後も
+  ソケットを閉じず、asyncpg の `close()` が切断を待ち続ける(出力が
+  何も出ないので接続ハングに見えた)。`AruaruDb.close(timeout=2.0)` を
+  追加し、時間切れなら `terminate()` する。`await db.raw.close()` は使わず
+  `await db.close()` を使うこと。
+- `aruaru-server` の既定 pg ポートは 5432(`--pg-port 5433` を明示)。
+- English: the live asyncpg round trip now passes. The earlier "hang on
+  connect" was really `close()` waiting forever because the server does not
+  close the socket after Terminate; use `AruaruDb.close()` (timeout, then
+  `terminate()`).

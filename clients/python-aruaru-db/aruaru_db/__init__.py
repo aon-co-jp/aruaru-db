@@ -83,6 +83,17 @@ class AruaruDb:
         """内部の asyncpg Pool / Connection。透過的に何でも。"""
         return self._c
 
+    async def close(self, timeout: float = 2.0) -> None:
+        """接続を閉じる。aruaru-server は Terminate 後にソケットを閉じない
+        ため、asyncpg の ``close()`` はそのままだと待ち続ける。``timeout``
+        秒で打ち切って ``terminate()``(Pool は ``terminate()`` 相当)する。"""
+        import asyncio  # noqa: WPS433
+
+        try:
+            await asyncio.wait_for(self._c.close(), timeout)
+        except asyncio.TimeoutError:
+            self._c.terminate()
+
     async def execute(self, sql: str, *params: Any) -> str:
         return await self._c.execute(sql, *params)
 

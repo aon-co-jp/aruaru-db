@@ -34,7 +34,7 @@ async def main() -> None:
         assert latest == "5", f"expected latest qty=5, got {latest!r}"
         print("OK")
     finally:
-        await db.raw.close()
+        await db.close()
 
 
 if __name__ == "__main__":
