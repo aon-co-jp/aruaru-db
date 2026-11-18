@@ -11,6 +11,7 @@ export async function pickDirectory(title: string): Promise<string | null> {
   if (isTauri) {
     try {
       // 動的 import: web ビルドではバンドルされない
+      // @ts-ignore Tauri版にだけ存在するモジュール(webはviteのaliasでスタブへ)
       const mod = await import(/* @vite-ignore */ "@tauri-apps/plugin-dialog");
       const dir = await mod.open({ directory: true, title });
       return (dir as string) ?? null;

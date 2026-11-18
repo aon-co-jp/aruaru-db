@@ -111,10 +111,10 @@ export default function BackupManager({ baseUrl }: { baseUrl: string }) {
     if (dir) setLocalPath(dir as string);
   };
 
-  const phaseColor = (phase: Phase) => ({
+  const phaseColor = (phase: Phase) => (({
     Done: "text-green-400", Failed: "text-red-400",
     Idle: "text-gray-500",
-  }[phase] ?? "text-orange-400");
+  } as Record<string, string>)[phase] ?? "text-orange-400");
 
   const formatBytes = (n: number) =>
     n < 1024 ? `${n} B`
