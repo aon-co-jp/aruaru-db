@@ -1,3 +1,3 @@
 source: aon-co-jp/aruaru-db
-commit: d68db809a12b6213fae4bef403ec02dd8077e32b
-updated: 2026-11-20T05:20:28Z
+commit: 80e1cf7f7d4dad94c4c7e6921cb1e4f9525893f1
+updated: 2026-11-24T10:48:35Z

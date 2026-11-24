@@ -1,3 +1,5 @@
+> Latest translations / 翻訳の最新版: [0-LATEST-TRANSLATIONS.md](0-LATEST-TRANSLATIONS.md)
+
 # aruaru-DB 🦀
 
 > **2026-08-29〜31 更新(管理面の抜本再設計 = 2026 年最新設計として進行中)**:
