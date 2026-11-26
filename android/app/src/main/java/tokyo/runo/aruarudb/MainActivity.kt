@@ -31,7 +31,7 @@ import org.json.JSONObject
  * **重要な位置づけ**: このActivityはaruaru-db本体(Rust製の分散DB
  * サーバー、Multi-Raft/HTAP OlapCache等)をAndroid上で実行するものでは
  * ない。ユーザーが入力したリモートURL(既存のaruaru-db管理API、
- * `crates/aruaru-graphql/src/connect.rs`のConnect `POST /open_runo.aruaru.admin.v1.Admin/ClusterStatus`等)へHTTPで
+ * `crates/aruaru-graphql/src/connect.rs`のConnect `POST /open_runo.aruaru.admin.Admin/ClusterStatus`等)へHTTPで
  * 接続し、疎通確認とクラスタ状態(ノード数・生存ノード数・レンジ数等)を
  * 画面上に表示する、リモート管理クライアントとして設計する。
  *
@@ -224,14 +224,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * aruaru-db管理API(Connect) `POST /open_runo.aruaru.admin.v1.Admin/ClusterStatus`(`crates/aruaru-server/src/
+     * aruaru-db管理API(Connect) `POST /open_runo.aruaru.admin.Admin/ClusterStatus`(`crates/aruaru-server/src/
      * admin.rs::cluster_status`)へ接続し、クラスタの統計情報を取得する。
      * このAPIはaruaru-db本体が既に提供しているエンドポイントであり、この
      * アプリはそれをHTTP経由で叩くだけ(サーバー機能自体は実装しない)。
      */
     private fun checkClusterStatus(baseUrl: String, log: StringBuilder, adminToken: String? = null): Boolean {
         return try {
-            val url = URL("$baseUrl/open_runo.aruaru.admin.v1.Admin/ClusterStatus")
+            val url = URL("$baseUrl/open_runo.aruaru.admin.Admin/ClusterStatus")
             val conn = url.openConnection() as HttpURLConnection
             conn.connectTimeout = 5000
             conn.readTimeout = 5000

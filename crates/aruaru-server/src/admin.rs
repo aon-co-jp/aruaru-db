@@ -438,7 +438,7 @@ pub fn admin_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
 }
 
 /// ノード間配布・メール退避の管理操作を Connect の単純呼び出しで受ける
-/// (`POST /open_runo.aruaru.admin.v1.AdminNode/<Method>`、2026-11-05、REST 全廃方針)。
+/// (`POST /open_runo.aruaru.admin.AdminNode/<Method>`、2026-11-05、REST 全廃方針)。
 /// 認証は `/admin` と同じ `check_admin_auth`。本文は JSON(従来のRESTと同じフィールド名)。
 pub fn admin_connect_routes(state: Arc<AdminState>) -> impl poem::Endpoint {
     #[allow(unused_mut)]

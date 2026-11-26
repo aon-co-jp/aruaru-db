@@ -180,14 +180,14 @@ async fn prune_impl(
     }
 }
 
-pub const COLUMNAR_SERVICE: &str = "open_runo.aruaru.columnar.v1.Columnar";
+pub const COLUMNAR_SERVICE: &str = "open_runo.aruaru.columnar.Columnar";
 
 fn connect_fail(status: StatusCode, code: &str, message: &str) -> Response {
     let body = serde_json::json!({ "code": code, "message": message }).to_string();
     Response::builder().status(status).content_type("application/json").body(body)
 }
 
-/// Connect の単純呼び出し: `POST /open_runo.aruaru.columnar.v1.Columnar/{Status|Prune}`。
+/// Connect の単純呼び出し: `POST /open_runo.aruaru.columnar.Columnar/{Status|Prune}`。
 /// 本文は JSON オブジェクト(RS-JSON `parse_secure` で上限つき)。`table` は必須、
 /// Status は `requiredIndex`・`requiredCommitSeq`、Prune は `column`・`op`・`value` を取る。
 #[handler]

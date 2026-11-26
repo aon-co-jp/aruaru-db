@@ -1,6 +1,6 @@
 //! 管理操作の Connect(単純呼び出し)層(2026-11-04、REST 全廃方針)。
 //!
-//! `POST /open_runo.aruaru.admin.v1.Admin/<Method>`、`content-type: application/json`、
+//! `POST /open_runo.aruaru.admin.Admin/<Method>`、`content-type: application/json`、
 //! 本文は JSON オブジェクト。本文のキーは、対応する管理操作の引数名(camelCase)そのもの。
 //! 実体は既存の管理リゾルバ(`admin_resolvers`)で、認証(`x-admin-token`)も同じ検証を通る。
 //! 失敗は `{"code","message"}`(open-easy-web の connect.rs と同じ形)。
@@ -9,7 +9,7 @@
 use crate::{AruaruSchema, GraphqlAdminToken};
 use poem::{handler, http::StatusCode, web::Data, Request, Response};
 
-pub const SERVICE: &str = "open_runo.aruaru.admin.v1.Admin";
+pub const SERVICE: &str = "open_runo.aruaru.admin.Admin";
 
 struct Op {
     method: &'static str,
@@ -228,7 +228,7 @@ pub async fn connect_handler(
     Response::builder().content_type("application/json").body(out.to_string())
 }
 
-/// `POST /open_runo.aruaru.admin.v1.Admin/:method`
+/// `POST /open_runo.aruaru.admin.Admin/:method`
 pub fn connect_endpoint(schema: AruaruSchema) -> impl poem::Endpoint {
     use poem::{post, EndpointExt, Route};
     Route::new().at(format!("/{SERVICE}/:method"), post(connect_handler)).data(schema)

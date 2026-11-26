@@ -546,7 +546,7 @@ async fn main() -> anyhow::Result<()> {
             .at("/graphql", aruaru_graphql::graphql_endpoint_for_public_schema(gql_public_schema))
             .nest("/", aruaru_graphql::connect::connect_endpoint(gql_schema.clone()))
             .at("/graphql/sdl", get(subgraph_sdl))
-            .nest("/open_runo.aruaru.admin.v1.AdminNode", admin::admin_connect_routes(admin_state.clone()))
+            .nest("/open_runo.aruaru.admin.AdminNode", admin::admin_connect_routes(admin_state.clone()))
             .nest("/admin", admin::admin_routes(admin_state))
             // Web 版 Admin (別オリジン) からのアクセスを許可
             .with(Cors::new());

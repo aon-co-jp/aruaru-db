@@ -2,7 +2,7 @@
  * aruaru-DB Admin — GraphQL クライアント（REST 廃止・GraphQL 一本化）
  *
  * 問い合わせ(Query)は aruaru-server /graphql へ、管理操作(バックアップ・移行・クラスタ・統合など)は
- * Connect(`POST /open_runo.aruaru.admin.v1.Admin/<Method>`)へ送る(2026-11-09、REST全廃方針。
+ * Connect(`POST /open_runo.aruaru.admin.Admin/<Method>`)へ送る(2026-11-09、REST全廃方針。
  * 公開 /graphql から管理 Mutation は外れた)。
  * 将来 Hive Gateway を差し込む場合は gqlEndpoint() の URL を切り替えるだけ。
  */
@@ -16,13 +16,13 @@ export interface GqlResult<T = any> {
   errors?: { message: string }[];
 }
 
-/** 管理操作(Connect の単純呼び出し)。`POST {base}/open_runo.aruaru.admin.v1.Admin/<Method>`。 */
+/** 管理操作(Connect の単純呼び出し)。`POST {base}/open_runo.aruaru.admin.Admin/<Method>`。 */
 export async function connect<T = any>(method: string, body: Record<string, unknown> = {}): Promise<T> {
   const base = gqlEndpoint().replace(/\/graphql$/, "");
   const headers: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json" };
   const t = adminToken();
   if (t) headers["x-admin-token"] = t;
-  const res = await fetch(`${base}/open_runo.aruaru.admin.v1.Admin/${method}`, {
+  const res = await fetch(`${base}/open_runo.aruaru.admin.Admin/${method}`, {
     method: "POST",
     headers,
     body: JSON.stringify(body),

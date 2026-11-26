@@ -77,7 +77,7 @@ export function clearAdminToken(): void {
 
 /**
  * サーバーのベース URL(`/graphql` を除いたもの)。Connect の呼び出し先
- * (`POST <base>/open_runo.admin.v1.Admin/<Method>`)の基準になる。
+ * (`POST <base>/open_runo.admin.Admin/<Method>`)の基準になる。
  */
 export function serverBase(): string {
   return gqlEndpoint().replace(/\/graphql$/, "");

@@ -63,12 +63,12 @@ impl Config {
     }
 }
 
-/// 上流 aruaru-server の管理 Connect(`POST <root>/open_runo.aruaru.admin.v1.Admin/<Method>`)。
+/// 上流 aruaru-server の管理 Connect(`POST <root>/open_runo.aruaru.admin.Admin/<Method>`)。
 /// `admin_base_url` は従来どおり `http://host:port/admin` 形式の設定値(末尾の `/admin` は無視する)。
 fn upstream_connect_url(admin_base_url: &str, method: &str) -> String {
     let root = admin_base_url.trim_end_matches('/');
     let root = root.strip_suffix("/admin").unwrap_or(root);
-    format!("{root}/open_runo.aruaru.admin.v1.Admin/{method}")
+    format!("{root}/open_runo.aruaru.admin.Admin/{method}")
 }
 
 fn page_html(demo: bool, base_path: &str) -> String {
@@ -115,7 +115,7 @@ async function refreshStatus() {{
   const el = document.getElementById('status');
   el.textContent = '取得中...';
   try {{
-    const res = await fetch(BASE_PATH + '/open_runo.aruaru.web.v1.Demo/Status', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: '{{}}' }});
+    const res = await fetch(BASE_PATH + '/open_runo.aruaru.web.Demo/Status', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }}, body: '{{}}' }});
     const body = await res.text();
     el.textContent = body;
   }} catch (e) {{
@@ -128,7 +128,7 @@ document.getElementById('rebalance').addEventListener('click', async () => {{
   const el = document.getElementById('rebalance-result');
   el.textContent = '実行中...';
   try {{
-    const res = await fetch(BASE_PATH + '/open_runo.aruaru.web.v1.Demo/Rebalance', {{
+    const res = await fetch(BASE_PATH + '/open_runo.aruaru.web.Demo/Rebalance', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json', 'X-Admin-Token': token }},
       body: '{{}}'
@@ -227,8 +227,8 @@ fn main() {
         let app = Route::new()
             .at("/", get(index_handler))
             .at("/demo", get(demo_handler))
-            .at("/open_runo.aruaru.web.v1.Demo/Status", post(status_handler))
-            .at("/open_runo.aruaru.web.v1.Demo/Rebalance", post(rebalance_handler));
+            .at("/open_runo.aruaru.web.Demo/Status", post(status_handler))
+            .at("/open_runo.aruaru.web.Demo/Rebalance", post(rebalance_handler));
 
         let bind_addr: std::net::SocketAddr = std::env::var("ARUARU_WEB_BIND").unwrap_or_else(|_| "127.0.0.1:8098".to_string()).parse().expect("invalid ARUARU_WEB_BIND");
         let (addr, handle) = Server::new(TcpListener::bind(bind_addr)).run(app).await.expect("failed to bind server");

@@ -21,7 +21,7 @@
 // これらサーバ側ハンドラの実装は aruaru-server の次タスク。
 // 本ファイルは「呼び出し規約」を確定させ、フロントを駆動できる状態にする。
 // 【注意】以下の `GET/POST {base}/admin/...` の一覧は旧REST時代の表記で、2026-11-05 に全て削除済み。
-// 現在は `POST {base}/open_runo.aruaru.admin.v1.Admin/<Method>`(Connect)。正は下の `connect()` と CLAUDE.md。
+// 現在は `POST {base}/open_runo.aruaru.admin.Admin/<Method>`(Connect)。正は下の `connect()` と CLAUDE.md。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -39,13 +39,13 @@ fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-/// 管理操作は Connect の単純呼び出し(`POST /open_runo.aruaru.admin.v1.Admin/<Method>`、JSON)。
+/// 管理操作は Connect の単純呼び出し(`POST /open_runo.aruaru.admin.Admin/<Method>`、JSON)。
 /// 認証は環境変数 `ARUARU_DB_ADMIN_TOKEN` の値を `x-admin-token` で送る。
 /// 失敗は `{"code","message"}` を Err にして返す。
 async fn connect(base: &str, method: &str, body: Value) -> Result<Value, String> {
     let client = http_client()?;
     let mut rb = client
-        .post(format!("{base}/open_runo.aruaru.admin.v1.Admin/{method}"))
+        .post(format!("{base}/open_runo.aruaru.admin.Admin/{method}"))
         .json(&body);
     if let Ok(t) = std::env::var("ARUARU_DB_ADMIN_TOKEN") {
         rb = rb.header("x-admin-token", t);
@@ -202,12 +202,12 @@ pub struct DisasterEmailBackupForm {
 
 #[tauri::command]
 async fn set_disaster_email_backup(base_url: String, config: DisasterEmailBackupForm) -> Result<Value, String> {
-    admin_post(&base_url, "/open_runo.aruaru.admin.v1.AdminNode/SetDisasterEmailBackup", serde_json::to_value(config).unwrap()).await
+    admin_post(&base_url, "/open_runo.aruaru.admin.AdminNode/SetDisasterEmailBackup", serde_json::to_value(config).unwrap()).await
 }
 
 #[tauri::command]
 async fn verify_disaster_email_backup(base_url: String) -> Result<Value, String> {
-    admin_post(&base_url, "/open_runo.aruaru.admin.v1.AdminNode/VerifyDisasterEmailBackup", json!({})).await
+    admin_post(&base_url, "/open_runo.aruaru.admin.AdminNode/VerifyDisasterEmailBackup", json!({})).await
 }
 
 // ── ② お引越し (移行 / 移植) ───────────────────────────────────
